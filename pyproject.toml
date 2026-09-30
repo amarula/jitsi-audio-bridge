@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jitsi-audio-bridge"
+description = "Capture per-participant Jitsi audio, then transcribe, summarise and email it"
+readme = "README.md"
+requires-python = ">=3.11"
+dynamic = ["version"]
+keywords = ["jitsi", "jvb", "whisper", "ollama", "transcription", "meeting"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: No Input/Output (Daemon)",
+    "Programming Language :: Python :: 3",
+    "Topic :: Multimedia :: Sound/Audio :: Capture/Recording",
+    "Topic :: Communications :: Conferencing",
+]
+dependencies = [
+    "websockets>=13",
+    "requests>=2.31",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "ruff>=0.6",
+]
+
+[project.scripts]
+jitsi-audio-bridge = "jitsi_audio_bridge.daemon:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "jitsi_audio_bridge.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 99
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "C4"]

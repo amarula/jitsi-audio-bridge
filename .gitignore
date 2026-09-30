@@ -1,0 +1,24 @@
+# Local configuration: may hold an SMTP password. Ship config.ini.example.
+config.ini
+
+# Holds a live API key. Never commit this; rotate the key if it ever was.
+claude.sh
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local recordings and logs
+*.log
+/recordings/

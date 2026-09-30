@@ -1,0 +1,56 @@
+; Configuration for jitsi-audio-bridge.
+;
+; Copy to config.ini and edit. The daemon looks for, in order:
+;   1. --config PATH
+;   2. $JITSI_AUDIO_BRIDGE_CONFIG
+;   3. ./config.ini
+;   4. /etc/jitsi-audio-bridge/config.ini
+; with built-in defaults underneath all of them.
+;
+; Every value can also be set from the environment as
+; JITSI_AUDIO_BRIDGE_<SECTION>_<KEY>, e.g. JITSI_AUDIO_BRIDGE_SMTP_PASSWORD.
+; The environment wins over this file, which is the intended way to pass
+; secrets: keep config.ini at mode 0644 and put the password in a root-owned
+; EnvironmentFile instead.
+;
+; The SMTP password is the only value that is really a secret. config.ini is
+; listed in .gitignore so that a copy holding one is never committed.
+
+[server]
+; Address the WebSocket server binds to. Keep it on loopback unless the JVB
+; reaches this host over the network, and firewall it if it does.
+host = 127.0.0.1
+port = 8080
+
+[storage]
+; Per-meeting directories are created underneath this path, so the user the
+; daemon runs as must be able to write here.
+recordings_dir = /srv/recordings
+
+[whisper]
+; Endpoint accepting {"audio_base64": ..., "filename": ...} and returning
+; {"text": ...}.
+url = https://whisper.internal.domain.com/transcribe-b64
+; Transcribing a long meeting can take minutes.
+timeout = 600
+; Set to false only for an endpoint with a self-signed certificate.
+verify_tls = true
+
+[ollama]
+url = https://ollama.internal.domain.com/api/generate
+model = qwen2.5:14b-instruct
+timeout = 600
+verify_tls = true
+
+[smtp]
+host = 127.0.0.1
+port = 25
+; Leave both blank for a relay that accepts mail without authentication.
+user =
+password =
+sender = no-reply@internal.domain.com
+; Used when the meeting's metadata carries no participant addresses.
+fallback_recipient = admin@internal.domain.com
+; Issue STARTTLS before authenticating. Leave true unless the relay is on
+; loopback and does not offer it.
+use_starttls = true

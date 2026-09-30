@@ -1,0 +1,69 @@
+[Unit]
+Description=Jitsi audio bridge
+Documentation=file:/opt/jitsi-audio-bridge/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=jitsi-bridge
+Group=jitsi-bridge
+
+# ProtectHome=yes below hides /home, so the virtualenv must not live there.
+WorkingDirectory=/opt/jitsi-audio-bridge
+ExecStart=/opt/jitsi-audio-bridge/.venv/bin/jitsi-audio-bridge --config /etc/jitsi-audio-bridge/config.ini
+
+# Optional, and expected to hold the SMTP password as
+# JITSI_AUDIO_BRIDGE_SMTP_PASSWORD. Create it root-owned at mode 0600:
+#   install -m 0600 -o root -g root /dev/null /etc/jitsi-audio-bridge/env
+# The leading '-' means the unit still starts when the file is absent.
+EnvironmentFile=-/etc/jitsi-audio-bridge/env
+
+Restart=on-failure
+RestartSec=5s
+
+# Post-processing (Whisper, then Ollama, then SMTP) runs inside a connection
+# handler, and there can be several queued. The default 90s would SIGKILL the
+# unit mid-transcription, leaving an unfinalised WAV and no email.
+TimeoutStopSec=900
+
+# --- Sandboxing -------------------------------------------------------------
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+UMask=0077
+
+# CPython does not JIT and the ctypes-loaded libopus needs no writable-executable
+# pages, so this is safe here. Drop it first if an unexplained crash appears.
+MemoryDenyWriteExecute=yes
+
+# AF_INET/AF_INET6 carry the HTTPS calls to Whisper and Ollama and the SMTP
+# connection; AF_UNIX is needed for name resolution and the journal; AF_NETLINK
+# looks superfluous but getaddrinfo() uses it on some glibc configurations, and
+# omitting it surfaces as a confusing "Name or service not known".
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+
+# The server binds an unprivileged port and needs no capabilities at all.
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# ProtectSystem=strict makes the filesystem read-only apart from this path.
+# It must match [storage] recordings_dir in config.ini.
+ReadWritePaths=/srv/recordings
+
+[Install]
+WantedBy=multi-user.target
