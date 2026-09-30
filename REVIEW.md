@@ -259,14 +259,39 @@ it to `false` deliberately, or install the CA.
 ### Peak memory during transcription — **Medium**
 
 `transcribe_audio` reads the whole WAV, base64-encodes it, and embeds that in a
-JSON body: roughly 2.3× the file size resident at peak, per request. A one-hour
-16 kHz mono recording is about 115 MB, so ~265 MB transiently. Tolerable for
-short meetings and for one participant at a time, which is what the semaphore
-allows.
+JSON body. Measured with `tracemalloc` against a local endpoint, peak resident
+memory is **about 6.4× the file size**, per request:
 
-*Fix:* stream the upload as `multipart/form-data` and change the Whisper
-contract, or transcode to a compressed format before upload. Both are protocol
-changes and belonged outside a review-and-package pass.
+| WAV | Peak | Ratio |
+|---|---|---|
+| 0.3 MB | 2.4 MB | 7.4× |
+| 1.9 MB | 12.4 MB | 6.5× |
+| 7.7 MB | 48.9 MB | 6.4× |
+
+An earlier revision of this document claimed 2.3×. That was an estimate and it
+was wrong by nearly a factor of three. A one-hour 16 kHz mono recording is
+115 MB on disk, so it costs roughly **735 MB resident**, not the 265 MB
+previously stated.
+
+The multiplier comes from holding several full copies at once: the file bytes,
+the base64 bytes, the base64 text, the serialised JSON, and the encoded request
+body. Only the last two are inherent to the protocol.
+
+**The Whisper contract is fixed**: the endpoint expects base64 in
+`audio_base64`, so moving to `multipart/form-data` is not available, and the
+earlier suggestion to do so was wrong. Work that respects the contract:
+
+- **Drop the redundant copies.** Building the request body as base64 bytes
+  directly, instead of base64 text → dict → JSON text → body, removes two of
+  the five copies and should land near 2.5×. Cheap, no protocol change, and it
+  addresses the largest single factor.
+- **Segment long recordings.** Split anything over a few minutes into chunks,
+  post each separately, and concatenate the transcripts. This bounds peak
+  memory by the chunk size rather than the meeting length, and is the real fix
+  for an hour-long recording.
+
+Neither was done here. The first is a contained change; the second alters what
+Whisper is asked to transcribe and deserves its own testing.
 
 ### No conversational ordering — **Medium, design**
 

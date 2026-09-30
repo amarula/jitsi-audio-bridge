@@ -35,8 +35,11 @@ def transcribe_audio(wav_path: str | Path, endpoint: EndpointConfig) -> str:
     Returns the transcript, or ``""`` if the file could not be read or the
     service failed.
 
-    Note that the whole file is base64-encoded into memory and into the JSON
-    request body; see REVIEW.md for the memory implications on long meetings.
+    The request format is fixed by the service: the audio must be base64 in a
+    JSON field named ``audio_base64``, alongside ``filename``. That rules out
+    ``multipart/form-data`` and means the whole file has to be resident at
+    once. See REVIEW.md for the measured memory cost on long recordings and the
+    ways to reduce it without changing this contract.
     """
     path = Path(wav_path)
     try:
