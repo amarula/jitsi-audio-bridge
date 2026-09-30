@@ -33,6 +33,11 @@ logger = logging.getLogger(__name__)
 #: is the right one for speech transcription.
 _OPUS_APPLICATION_VOIP = 2048
 
+#: libopus status code for success, and the control request used to set a
+#: bitrate through the variadic opus_encoder_ctl.
+OPUS_OK = 0
+_OPUS_SET_BITRATE_REQUEST = 4002
+
 #: An Opus frame is at most 120 ms.  At 48 kHz that is 5760 samples, so a
 #: buffer this large can hold any packet libopus will ever hand back.  A
 #: smaller ``frame_size`` makes ``opus_decode`` return OPUS_BUFFER_TOO_SMALL.
@@ -105,6 +110,31 @@ class _LibOpus:
         lib.opus_decoder_destroy.restype = None
         lib.opus_decoder_destroy.argtypes = [ctypes.c_void_p]
 
+        lib.opus_encoder_create.restype = ctypes.c_void_p
+        lib.opus_encoder_create.argtypes = [
+            ctypes.c_int,  # Fs
+            ctypes.c_int,  # channels
+            ctypes.c_int,  # application
+            ctypes.POINTER(ctypes.c_int),  # error out-param
+        ]
+
+        lib.opus_encode.restype = ctypes.c_int
+        lib.opus_encode.argtypes = [
+            ctypes.c_void_p,  # encoder state
+            ctypes.POINTER(ctypes.c_int16),  # pcm in
+            ctypes.c_int,  # frame_size
+            ctypes.POINTER(ctypes.c_ubyte),  # packet out
+            ctypes.c_int,  # max packet size
+        ]
+
+        lib.opus_encoder_destroy.restype = None
+        lib.opus_encoder_destroy.argtypes = [ctypes.c_void_p]
+
+        # opus_encoder_ctl is variadic: only the two fixed parameters are
+        # declared, and the request's argument is appended at the call site.
+        lib.opus_encoder_ctl.restype = ctypes.c_int
+        lib.opus_encoder_ctl.argtypes = [ctypes.c_void_p, ctypes.c_int]
+
         lib.opus_strerror.restype = ctypes.c_char_p
         lib.opus_strerror.argtypes = [ctypes.c_int]
 
@@ -117,6 +147,28 @@ class _LibOpus:
     def destroy_decoder(self, handle: Any) -> None:
         if handle:
             self._lib.opus_decoder_destroy(handle)
+
+    def create_encoder(self, sample_rate: int, channels: int, application: int) -> tuple[Any, int]:
+        """Create an encoder.  Returns the handle and the libopus status code."""
+        status = ctypes.c_int(0)
+        handle = self._lib.opus_encoder_create(
+            sample_rate, channels, application, ctypes.byref(status)
+        )
+        return handle, status.value
+
+    def destroy_encoder(self, handle: Any) -> None:
+        if handle:
+            self._lib.opus_encoder_destroy(handle)
+
+    def encode(
+        self, handle: Any, source: Any, frame_samples: int, destination: Any, capacity: int
+    ) -> int:
+        """Encode one frame of PCM.  Returns the packet length, or < 0."""
+        return self._lib.opus_encode(handle, source, frame_samples, destination, capacity)
+
+    def set_bitrate(self, handle: Any, bitrate: int) -> int:
+        """Apply OPUS_SET_BITRATE_REQUEST.  Returns the libopus status code."""
+        return self._lib.opus_encoder_ctl(handle, _OPUS_SET_BITRATE_REQUEST, ctypes.c_int(bitrate))
 
     def decode(
         self, handle: Any, source: Any, length: int, destination: Any, capacity: int
@@ -217,6 +269,108 @@ class OpusDecoder:
     def __del__(self) -> None:  # pragma: no cover - best-effort safety net
         # Nothing useful can be done about a failure during interpreter
         # shutdown, so this only exists to release the decoder handle.
+        with contextlib.suppress(Exception):
+            self.close()
+
+
+class OpusEncoder:
+    """A single libopus encoder instance.
+
+    The daemon only ever decodes; this exists so that the test suite and the
+    test environment in ``tools/`` can generate real Opus packets instead of
+    committing audio fixtures.  It shares the binding above rather than
+    declaring a second set of ctypes prototypes.
+    """
+
+    #: Opus will not emit a single frame larger than this; libopus's own
+    #: recommendation for the output buffer.
+    MAX_PACKET_BYTES = 4000
+
+    #: Encoder tuning hints, as libopus names them.
+    APPLICATIONS = {
+        "voip": 2048,
+        "audio": 2049,
+        "restricted_lowdelay": 2051,
+    }
+
+    def __init__(
+        self,
+        sample_rate: int = 48000,
+        channels: int = 1,
+        application: str = "voip",
+        bitrate: int = 24000,
+    ) -> None:
+        if application not in self.APPLICATIONS:
+            known = ", ".join(sorted(self.APPLICATIONS))
+            raise ValueError(f"unknown application {application!r}; expected one of {known}")
+
+        self._lib = _libopus()
+        self.sample_rate = sample_rate
+        self.channels = channels
+        self.application = application
+
+        self._handle, status = self._lib.create_encoder(
+            sample_rate, channels, self.APPLICATIONS[application]
+        )
+        if not self._handle:
+            raise OpusError(
+                f"libopus could not allocate an encoder: {self._lib.error_text(status)}"
+            )
+        if status != 0:
+            self._lib.destroy_encoder(self._handle)
+            self._handle = None
+            raise OpusError(
+                f"libopus rejected an encoder at {sample_rate} Hz / {channels} ch: "
+                f"{self._lib.error_text(status)}"
+            )
+
+        if bitrate:
+            status = self._lib.set_bitrate(self._handle, bitrate)
+            if status != OPUS_OK:
+                self.close()
+                raise OpusError(
+                    f"libopus rejected a bitrate of {bitrate}: {self._lib.error_text(status)}"
+                )
+        self.bitrate = bitrate
+
+    def encode(self, pcm: bytes, frame_samples: int) -> bytes:
+        """Encode interleaved 16-bit PCM into one Opus packet.
+
+        ``frame_samples`` is per channel; the returned bytes are a complete
+        packet, ready to be prefixed with a participant identifier and sent.
+        """
+        if self._handle is None:
+            raise OpusError("encoder has already been closed")
+
+        expected = frame_samples * self.channels * _BYTES_PER_SAMPLE
+        if len(pcm) != expected:
+            raise ValueError(
+                f"expected {expected} bytes of PCM for {frame_samples} samples "
+                f"across {self.channels} channel(s), got {len(pcm)}"
+            )
+
+        source = (ctypes.c_int16 * (frame_samples * self.channels)).from_buffer_copy(pcm)
+        destination = (ctypes.c_ubyte * self.MAX_PACKET_BYTES)()
+        written = self._lib.encode(
+            self._handle, source, frame_samples, destination, self.MAX_PACKET_BYTES
+        )
+        if written < 0:
+            raise OpusError(f"libopus could not encode the frame: {self._lib.error_text(written)}")
+
+        return bytes(destination[:written])
+
+    def close(self) -> None:
+        if self._handle is not None:
+            self._lib.destroy_encoder(self._handle)
+            self._handle = None
+
+    def __enter__(self) -> OpusEncoder:
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.close()
+
+    def __del__(self) -> None:  # pragma: no cover - best-effort safety net
         with contextlib.suppress(Exception):
             self.close()
 

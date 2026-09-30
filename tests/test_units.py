@@ -6,10 +6,9 @@ encoding a tone and decoding it back through the recorder.
 
 from __future__ import annotations
 
-import ctypes
-import ctypes.util
 import json
 import math
+import struct
 import wave
 from pathlib import Path
 
@@ -18,6 +17,7 @@ import pytest
 from jitsi_audio_bridge import config as config_module
 from jitsi_audio_bridge.audio import (
     OpusDecoder,
+    OpusEncoder,
     OpusError,
     OpusParticipantRecorder,
     parse_metadata,
@@ -411,61 +411,27 @@ def test_an_empty_required_value_is_rejected(tmp_path: Path, clean_env: None) ->
 # --------------------------------------------------------------------------
 
 
-def _libopus_or_skip() -> ctypes.CDLL:
-    if not ctypes.util.find_library("opus"):
-        pytest.skip("libopus is not installed")
-    try:
-        return ctypes.CDLL(ctypes.util.find_library("opus"))
-    except OSError as exc:  # pragma: no cover
-        pytest.skip(f"libopus could not be loaded: {exc}")
-
-
-def _encode_tone(frames: int, frame_samples: int = 960, rate: int = 48000) -> list[bytes]:
+def _encode_tone(
+    frames: int, frame_samples: int = 960, rate: int = 48000, channels: int = 1
+) -> list[bytes]:
     """Encode a 440 Hz tone as a list of discrete Opus packets."""
-    lib = _libopus_or_skip()
-    lib.opus_encoder_create.restype = ctypes.c_void_p
-    lib.opus_encoder_create.argtypes = [
-        ctypes.c_int,
-        ctypes.c_int,
-        ctypes.c_int,
-        ctypes.POINTER(ctypes.c_int),
-    ]
-    lib.opus_encode.restype = ctypes.c_int
-    lib.opus_encode.argtypes = [
-        ctypes.c_void_p,
-        ctypes.POINTER(ctypes.c_int16),
-        ctypes.c_int,
-        ctypes.POINTER(ctypes.c_ubyte),
-        ctypes.c_int,
-    ]
-    lib.opus_encoder_destroy.argtypes = [ctypes.c_void_p]
-
-    status = ctypes.c_int(0)
-    encoder = lib.opus_encoder_create(rate, 1, 2048, ctypes.byref(status))
-    assert status.value == 0, "opus_encoder_create failed"
-
+    encoder = OpusEncoder(rate, channels, "audio")
     packets: list[bytes] = []
     try:
         for index in range(frames):
             samples = [
-                int(
-                    12000
-                    * math.sin(2 * math.pi * 440 * (index * frame_samples + i) / rate)
-                )
+                int(12000 * math.sin(2 * math.pi * 440 * (index * frame_samples + i) / rate))
                 for i in range(frame_samples)
             ]
-            source = (ctypes.c_int16 * frame_samples)(*samples)
-            buffer = (ctypes.c_ubyte * 4000)()
-            written = lib.opus_encode(encoder, source, frame_samples, buffer, 4000)
-            assert written > 0, "opus_encode failed"
-            packets.append(bytes(buffer[:written]))
+            interleaved = [value for value in samples for _ in range(channels)]
+            pcm = struct.pack(f"<{len(interleaved)}h", *interleaved)
+            packets.append(encoder.encode(pcm, frame_samples))
     finally:
-        lib.opus_encoder_destroy(encoder)
+        encoder.close()
     return packets
 
 
 def test_decoder_rejects_nonsense_packets_without_raising() -> None:
-    _libopus_or_skip()
     decoder = OpusDecoder(sample_rate=16000, channels=1)
     try:
         # An empty packet is refused outright; a truncated one must either
@@ -566,45 +532,7 @@ def test_stereo_stream_decodes_into_a_mono_recording(tmp_path: Path) -> None:
     this asserts that a sender producing stereo does not silently yield
     nothing.
     """
-    lib = _libopus_or_skip()
-    lib.opus_encoder_create.restype = ctypes.c_void_p
-    lib.opus_encoder_create.argtypes = [
-        ctypes.c_int,
-        ctypes.c_int,
-        ctypes.c_int,
-        ctypes.POINTER(ctypes.c_int),
-    ]
-    lib.opus_encode.restype = ctypes.c_int
-    lib.opus_encode.argtypes = [
-        ctypes.c_void_p,
-        ctypes.POINTER(ctypes.c_int16),
-        ctypes.c_int,
-        ctypes.POINTER(ctypes.c_ubyte),
-        ctypes.c_int,
-    ]
-    lib.opus_encoder_destroy.argtypes = [ctypes.c_void_p]
-
-    frame_samples, rate = 960, 48000
-    status = ctypes.c_int(0)
-    encoder = lib.opus_encoder_create(rate, 2, 2048, ctypes.byref(status))
-    assert status.value == 0
-
-    packets: list[bytes] = []
-    try:
-        for index in range(4):
-            interleaved = []
-            for i in range(frame_samples):
-                value = int(
-                    9000 * math.sin(2 * math.pi * 440 * (index * frame_samples + i) / rate)
-                )
-                interleaved.extend((value, value))
-            source = (ctypes.c_int16 * (frame_samples * 2))(*interleaved)
-            buffer = (ctypes.c_ubyte * 8000)()
-            written = lib.opus_encode(encoder, source, frame_samples, buffer, 8000)
-            assert written > 0
-            packets.append(bytes(buffer[:written]))
-    finally:
-        lib.opus_encoder_destroy(encoder)
+    packets = _encode_tone(frames=4, channels=2)
 
     wav_path = tmp_path / "stereo-source.wav"
     recorder = OpusParticipantRecorder(wav_path, sample_rate=16000, channels=1)

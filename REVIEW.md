@@ -293,21 +293,32 @@ enough that rejecting unknown sections and options outright would be cheap.
 
 ## Verification performed
 
-- 82 unit tests, including an Opus encode/decode round trip against the real
+- 119 unit tests, including an Opus encode/decode round trip against the real
   libopus binding, requiring no audio fixtures.
-- A 26-check end-to-end smoke test driving the real daemon with stub Whisper,
+- A 30-check end-to-end smoke test driving the real daemon with stub Whisper,
   Ollama and SMTP services, asserting on the WAV files, the transcript, the
-  prompts sent to Ollama, and the delivered message.
+  prompts sent to Ollama, the delivered message, and the negative cases.
+- A round trip with real synthesised speech verified by audio level: a 48 kHz
+  source at −15.4 dB mean came back as a 16 kHz recording at −15.0 dB, with
+  each participant's distinct speech still separated. Checking levels rather
+  than frame counts is what rules out a decoder emitting correctly-sized
+  silence.
 - `ruff check`, clean.
 - `systemd-analyze verify`, clean.
 - `MemoryDenyWriteExecute=yes` tested against the ctypes-loaded libopus under a
   transient systemd unit: it loads and decodes. Kept in the unit on that
   evidence.
-- Error paths exercised: missing config, malformed value, and an occupied port
-  each exit with the documented status and a message naming the cause.
+- Error paths exercised: missing config, malformed value, an occupied port, and
+  an unreachable bridge each exit with the documented status and a message
+  naming the cause.
+
+The test environment in `tools/` exists because none of this could be checked
+without a sender, and nothing in the repository spoke the protocol. It also
+means the checks above are repeatable rather than one-off.
 
 **Not verified:** the wire format itself. The sender is not in this repository
 and no Jitsi deployment exists on the development host, so the frame layout,
 the `sessionId` parameter and the control-frame schema remain assumptions taken
-from the original code. They should be confirmed against the real sender before
-this is trusted with a real meeting.
+from the original code. `tools/send_meeting.py` encodes those assumptions rather
+than confirming them — pointing it at a real sender and comparing the two is
+the way to settle it, and that has not been done.

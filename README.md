@@ -41,6 +41,7 @@ and emails the result.
 - [Running](#running)
 - [Wire protocol](#wire-protocol)
 - [Running as a service](#running-as-a-service)
+- [Test environment](#test-environment)
 - [Output layout](#output-layout)
 - [Troubleshooting](#troubleshooting)
 - [Limitations](#limitations)
@@ -272,6 +273,61 @@ to need relaxing, and why:
 | `SystemCallFilter=@system-service` | Add `SystemCallLog=@system-service` temporarily to find a blocked call. |
 | `TimeoutStopSec=900` | Post-processing can run for minutes; the 90 s default would kill it mid-transcription. |
 
+## Test environment
+
+Nothing in this repository speaks the sender half of the protocol, so `tools/`
+provides one, together with stub Whisper, Ollama and SMTP services. That is
+enough to run the whole pipeline on a laptop, with no GPU, no model download
+and no mail relay.
+
+```sh
+# Run a three-person, ten-second meeting and report what came out.
+python3 -m tools.testenv --auto --participants 3 --duration 10
+
+# Or bring the environment up and drive it by hand from another shell.
+python3 -m tools.testenv
+```
+
+`--auto` starts everything, runs a scripted meeting, prints the resulting
+recordings, transcript, prompts and email, then tears it all down. Without it,
+the environment stays up and prints the URL to point the sender at.
+
+| Component | What it does |
+|---|---|
+| `tools.testenv` | Starts the stubs and the real daemon together, wired with a generated `config.ini` |
+| `tools.send_meeting` | The sender simulator: speaks the wire protocol from the [Wire protocol](#wire-protocol) section |
+| `tools.stubs` | Stub Whisper, Ollama and SMTP, each runnable on its own |
+| `tools.sample_audio` | Synthesises speech WAVs with ffmpeg, for the replay path |
+
+### Driving it by hand
+
+```sh
+# Tones: proves framing and decoding, but Whisper correctly returns nothing.
+python3 -m tools.send_meeting --participants 3 --duration 30
+
+# Real speech: exercises transcription and speaker attribution end to end.
+python3 -m tools.sample_audio --outdir /tmp/samples
+python3 -m tools.send_meeting --audio wav \
+    --wav /tmp/samples/alice.wav --wav /tmp/samples/bob.wav --wav /tmp/samples/carol.wav \
+    --participant alice:Alice --participant bob:Bob --participant carol:Carol
+
+# Edge cases worth trying.
+python3 -m tools.send_meeting --audio none        # no audio: nothing should be emailed
+python3 -m tools.send_meeting --no-metadata       # no control frame: no room, no recipients
+python3 -m tools.send_meeting --session-id '../../tmp/escape'   # traversal attempt
+```
+
+The stub SMTP server writes every accepted message to `mail/message-NNN.eml`
+under the work directory, so you can read the summary that was sent rather than
+taking a log line's word for it. The stub Whisper reports the format of the
+audio it was handed, which catches a silent or malformed recording that a
+frame count alone would miss.
+
+Because `tools/send_meeting.py` is the only implementation of the sender side,
+it doubles as the way to settle the open question in
+[Limitations](#limitations): run it against the bridge, then compare what the
+bridge records with what the real sender produces.
+
 ## Output layout
 
 ```
@@ -356,20 +412,23 @@ See [REVIEW.md](REVIEW.md) for the full list of known issues and deferred work.
 ```sh
 python3 -m venv .venv && .venv/bin/pip install -e '.[dev]'
 
-.venv/bin/pytest tests/            # unit tests, no network needed
-python3 tests/smoke_test.py        # end-to-end, starts stub services
-.venv/bin/ruff check src tests     # lint
+.venv/bin/pytest tests/              # unit tests, no network needed
+python3 tests/smoke_test.py          # end-to-end, starts the stub services
+python3 -m tools.testenv --auto      # the same environment, to poke at
+.venv/bin/ruff check src tests tools # lint
 ```
 
 `tests/test_units.py` covers configuration precedence, identifier sanitisation,
-frame splitting, metadata parsing and an Opus encode/decode round trip against
-the real libopus binding. It needs no fixtures: the tests encode their own tone.
+frame splitting and metadata parsing. `tests/test_tools.py` covers the Opus
+encoder and the tooling. Neither needs audio fixtures: the tests encode their
+own tone.
 
-`tests/smoke_test.py` is the end-to-end check. It starts stub Whisper, Ollama
-and SMTP services, runs the real daemon against them, and drives it with a
-WebSocket client that behaves like the sender, asserting on the WAV files, the
-transcript, the prompts sent to Ollama, and the message that lands in the SMTP
-sink. It is the test that would have caught both original blockers.
+`tests/smoke_test.py` is the end-to-end check. It stands up the
+[test environment](#test-environment), drives it with the sender simulator, and
+asserts on the WAV files, the transcript, the prompts sent to Ollama, the
+delivered message, and the negative cases — path traversal, a wrong request
+path, an audio-less session, and a malformed control frame. It is the test that
+would have caught all three original blockers.
 
 Modules are deliberately isolated:
 
@@ -383,3 +442,7 @@ Modules are deliberately isolated:
 
 `config` is the only module that reads the environment or parses a config file;
 a test enforces this.
+
+`tools/` sits outside the package and is not installed: it is the test
+environment described [above](#test-environment), and nothing in `src/` depends
+on it.
