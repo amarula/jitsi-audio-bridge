@@ -124,6 +124,143 @@ def send_junk_then_audio(url: str, session_id: str) -> bool:
     return asyncio.run(attempt())
 
 
+def run_process_dir(config_path: Path, meeting_dir: Path) -> tuple[int, str]:
+    """Run the daemon in batch mode over an existing meeting directory."""
+    import os
+    import subprocess
+
+    from tools import SRC
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "jitsi_audio_bridge.daemon",
+            "--config",
+            str(config_path),
+            "--process-dir",
+            str(meeting_dir),
+        ],
+        env=dict(os.environ, PYTHONPATH=str(SRC)),
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=120,
+    )
+    return result.returncode, result.stdout + result.stderr
+
+
+def _write_meeting_wavs(meeting_dir: Path, speakers: list[str]) -> None:
+    """Write per-speaker WAVs, as Jitsi's own recording would leave behind.
+
+    Named after the address, which is how attribution resolves a speaker when
+    the filename carries no participant id.
+    """
+    from tools.send_meeting import tone_frame
+
+    for index, address in enumerate(speakers):
+        path = meeting_dir / f"{address}_audio.wav"
+        with wave.open(str(path), "wb") as handle:
+            handle.setnchannels(1)
+            handle.setsampwidth(2)
+            handle.setframerate(48000)
+            handle.writeframes(
+                b"".join(tone_frame(440.0 + 110 * index, i, 48000) for i in range(25))
+            )
+
+
+def check_directory_mode(
+    config_path: Path, workdir: Path, smtp: SmtpStub, ollama: OllamaStub
+) -> None:
+    """Exercise the batch path over directories that already exist on disk."""
+    # --- per-speaker recordings, named after the address -------------------
+    jitsi_dir = workdir / "batch-jitsi"
+    jitsi_dir.mkdir(exist_ok=True)
+    _write_meeting_wavs(jitsi_dir, ["ada@example.com", "grace@example.com"])
+    (jitsi_dir / "metadata.json").write_text(
+        json.dumps(
+            {
+                "meeting_url": "https://meet.example.com/Batch-Review",
+                "participants": [
+                    {"user": {"id": "u1", "name": "Ada", "email": "ada@example.com"}},
+                    {"user": {"id": "u2", "name": "Grace", "email": "grace@example.com"}},
+                ],
+            }
+        )
+    )
+
+    before = len(smtp.messages)
+    code, output = run_process_dir(config_path, jitsi_dir)
+    check("--process-dir exits successfully on a Jitsi-shaped directory", code == 0,
+          f"exit {code}")
+    check("a transcript was written", (jitsi_dir / "transcript.txt").is_file())
+    check("a summary was written", (jitsi_dir / "summary.md").is_file())
+    if (jitsi_dir / "transcript.txt").is_file():
+        # Attribution must resolve through the email -> name mapping.
+        body = (jitsi_dir / "transcript.txt").read_text()
+        check("speakers were attributed from the address mapping",
+              "Ada" in body and "Grace" in body, body.strip()[:80])
+    check("directory mode sent an email", len(smtp.messages) == before + 1)
+    check("the room came from meeting_url",
+          ollama.summary_prompts and "Batch-Review" in ollama.summary_prompts[-1])
+
+    # --- a single master recording, needing ffmpeg extraction --------------
+    master_dir = workdir / "batch-master"
+    master_dir.mkdir(exist_ok=True)
+    (master_dir / "metadata.json").write_text(
+        json.dumps({"meeting_url": "https://meet.example.com/Master-Recording"})
+    )
+    extracted = build_master_recording(master_dir)
+    if extracted is None:
+        print("    (ffmpeg or flite unavailable; skipping the master-track check)")
+        return
+
+    before = len(smtp.messages)
+    code, output = run_process_dir(config_path, master_dir)
+    check("--process-dir handles a single master recording", code == 0, f"exit {code}")
+    check("the master track was extracted to 16 kHz",
+          (master_dir / "extracted_audio.wav").is_file())
+    check("a transcript was written from the extracted audio",
+          (master_dir / "transcript.txt").is_file())
+    check("the master-recording session sent an email", len(smtp.messages) == before + 1)
+
+
+def build_master_recording(meeting_dir: Path) -> Path | None:
+    """Put a container file in the directory that only ffmpeg can read.
+
+    Uses Matroska because it accepts PCM directly, so this needs no audio
+    encoder beyond what a stock ffmpeg build has.
+    """
+    import shutil
+    import subprocess
+
+    if not shutil.which("ffmpeg"):
+        return None
+
+    source = meeting_dir / "source.wav"
+    synthesised = subprocess.run(
+        [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "lavfi",
+            "-i", "flite=text='The master recording is being extracted.'",
+            "-ar", "48000", "-ac", "1", "-y", str(source),
+        ],
+        capture_output=True,
+        check=False,
+    )
+    if synthesised.returncode != 0:
+        return None
+
+    master = meeting_dir / "room-recording.mkv"
+    muxed = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", str(source),
+         "-c:a", "copy", "-y", str(master)],
+        capture_output=True,
+        check=False,
+    )
+    source.unlink(missing_ok=True)
+    return master if muxed.returncode == 0 else None
+
+
 def main() -> int:
     whisper, ollama, smtp = WhisperStub(), OllamaStub(), SmtpStub()
     whisper.start()
@@ -210,22 +347,30 @@ def main() -> int:
               f"{len(whisper.requests)} calls")
         check(
             "ollama was asked to detect the language",
-            any("Identify the language" in p for p in ollama.prompts),
+            len(ollama.language_prompts) == 1,
+            f"{len(ollama.language_prompts)} language probe(s)",
         )
         check(
             "the detected language was carried into the summary prompt",
             any("strictly in English" in p for p in ollama.summary_prompts),
         )
+        # The sender emits a meeting_url, so the room name is the URL's last
+        # path segment — this is what the real metadata provides.
         check(
-            "the summary prompt names the room",
-            any("Smoke Test Room" in p for p in ollama.summary_prompts),
+            "the room name was derived from meeting_url",
+            any("Smoke-Test-Room" in p for p in ollama.summary_prompts),
+            "expected 'Smoke-Test-Room' in the prompt",
+        )
+        check(
+            "the summary prompt asks for speaker attribution",
+            any("STRICT RULES FOR SPEAKER ANNOTATION" in p for p in ollama.summary_prompts),
         )
 
         check("exactly one email was sent", len(smtp.messages) == 1,
               f"{len(smtp.messages)} message(s)")
         if smtp.messages:
             mail = smtp.messages[0]
-            check("the subject names the room", "Smoke Test Room" in mail)
+            check("the subject names the room", "Smoke-Test-Room" in mail)
             check(
                 "the mail went to both participants",
                 "alice@example.com" in mail and "bob@example.com" in mail,
@@ -264,11 +409,20 @@ def main() -> int:
         print("\n6. malformed control frames")
         # A junk control frame must not abort the session: the audio that
         # follows it still has to be captured and processed.
+        before_junk = len(smtp.messages)
         check("a malformed control frame does not kill the session",
               send_junk_then_audio(url, "junkframes"))
         junk_session = recordings / "junkframes"
         check("the session survived and recorded its audio",
               bool(list(junk_session.glob("participant-*.wav"))))
+
+        # That session has audio, so it is being post-processed in a worker
+        # thread. Let its email land before counting messages in section 7,
+        # or it arrives mid-check and looks like an extra one.
+        wait_for(lambda: len(smtp.messages) > before_junk, timeout=30)
+
+        print("\n7. directory mode (--process-dir)")
+        check_directory_mode(config_path, workdir, smtp, ollama)
 
     finally:
         bridge.stop()

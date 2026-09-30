@@ -43,14 +43,15 @@ DEFAULTS: dict[str, dict[str, str]] = {
     },
     "storage": {
         "recordings_dir": "/srv/recordings",
+        "cleanup_after_send": "false",
     },
     "whisper": {
-        "url": "https://whisper.internal.domain.com/transcribe-b64",
+        "url": "https://whisper.omnia.amarulasolutions.com/transcribe-b64",
         "timeout": "600",
         "verify_tls": "true",
     },
     "ollama": {
-        "url": "https://ollama.internal.domain.com/api/generate",
+        "url": "https://ollama.omnia.amarulasolutions.com/api/generate",
         "model": "qwen2.5:14b-instruct",
         "timeout": "600",
         "verify_tls": "true",
@@ -60,9 +61,11 @@ DEFAULTS: dict[str, dict[str, str]] = {
         "port": "25",
         "user": "",
         "password": "",
-        "sender": "no-reply@internal.domain.com",
-        "fallback_recipient": "admin@internal.domain.com",
+        "sender": "no-reply@amarulasolutions.com",
+        "fallback_recipient": "admin@omnia.amarulasolutions.com",
         "use_starttls": "true",
+        # Appended to the subject line, e.g. " - Amarula Solutions".
+        "subject_suffix": "",
     },
 }
 
@@ -84,6 +87,10 @@ class StorageConfig:
     """Where per-meeting recordings and transcripts are written."""
 
     recordings_dir: Path
+    #: Delete the audio, transcript and summary once the email has gone out.
+    #: Off by default: deleting a recording is irreversible, so a
+    #: misconfiguration should not be able to destroy a meeting.
+    cleanup_after_send: bool
 
 
 @dataclass(frozen=True)
@@ -113,6 +120,8 @@ class SmtpConfig:
     sender: str
     fallback_recipient: str
     use_starttls: bool
+    #: Optional suffix for the subject line, such as an organisation name.
+    subject_suffix: str
 
 
 @dataclass(frozen=True)
@@ -258,6 +267,7 @@ def load_config(path: str | os.PathLike[str] | None = None) -> Config:
         ),
         storage=StorageConfig(
             recordings_dir=resolver.path("storage", "recordings_dir"),
+            cleanup_after_send=resolver.boolean("storage", "cleanup_after_send"),
         ),
         whisper=EndpointConfig(
             url=resolver.required("whisper", "url"),
@@ -280,6 +290,7 @@ def load_config(path: str | os.PathLike[str] | None = None) -> Config:
             sender=resolver.required("smtp", "sender"),
             fallback_recipient=resolver.text("smtp", "fallback_recipient"),
             use_starttls=resolver.boolean("smtp", "use_starttls"),
+            subject_suffix=resolver.text("smtp", "subject_suffix"),
         ),
         source=source,
     )

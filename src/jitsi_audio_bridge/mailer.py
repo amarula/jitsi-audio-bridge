@@ -25,15 +25,20 @@ _UNSAFE_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9._-]+")
 _MAX_FILENAME_STEM = 80
 
 
-def safe_attachment_name(room_name: str) -> str:
-    """Build an attachment filename that cannot escape a directory or inject.
+def attachment_stem(room_name: str) -> str:
+    """Reduce a room name to something safe to build a filename from.
 
-    ``room_name`` arrives from the JVB's metadata and is therefore not
-    trustworthy: a newline in it could inject additional MIME parameters, and a
-    path separator could direct the write elsewhere.
+    ``room_name`` is derived from metadata the sender controls and is therefore
+    not trustworthy: a newline in it could inject additional MIME parameters,
+    and a path separator could direct an attachment name elsewhere.
     """
-    stem = _UNSAFE_FILENAME_CHARS.sub("_", room_name).strip("._")
-    return f"{(stem or 'meeting')[:_MAX_FILENAME_STEM]}_transcript.txt"
+    stem = _UNSAFE_FILENAME_CHARS.sub("_", str(room_name)).strip("._")
+    return (stem or "meeting")[:_MAX_FILENAME_STEM]
+
+
+def safe_attachment_name(room_name: str) -> str:
+    """The transcript's attachment filename."""
+    return f"{attachment_stem(room_name)}_transcript.txt"
 
 
 def _usable_recipients(addresses: list[str] | None) -> list[str]:
@@ -57,12 +62,30 @@ def _usable_recipients(addresses: list[str] | None) -> list[str]:
     return usable
 
 
-def _subject_for(room_name: str) -> str:
+def _subject_for(room_name: str, suffix: str = "") -> str:
     """Build a subject line with any embedded newlines flattened out."""
-    if not isinstance(room_name, str):
-        room_name = str(room_name)
-    flattened = " ".join(room_name.split())
-    return f"Meeting Summary: {flattened or 'Meeting'}"
+    flattened = " ".join(str(room_name).split()) or "Meeting"
+    subject = f"Meeting Summary & Transcript: {flattened}"
+    # Tolerate a suffix written either as "Amarula" or "- Amarula": the
+    # separator is added here, so a leading one is stripped rather than doubled.
+    cleaned = " ".join(str(suffix).split()).strip("-–—").strip()
+    if cleaned:
+        subject = f"{subject} - {cleaned}"
+    return subject
+
+
+def _attach(message: EmailMessage, path: str | Path | None, filename: str, subtype: str) -> bool:
+    """Attach a file if it exists.  Returns whether it was attached."""
+    if not path:
+        return False
+    source = Path(path)
+    try:
+        data = source.read_bytes()
+    except OSError as exc:
+        logger.error("cannot attach %s: %s", source, exc)
+        return False
+    message.add_attachment(data, maintype="text", subtype=subtype, filename=filename)
+    return True
 
 
 def send_meeting_email(
@@ -70,9 +93,10 @@ def send_meeting_email(
     room_name: str,
     summary_text: str,
     transcript_path: str | Path | None,
+    summary_path: str | Path | None,
     smtp: SmtpConfig,
 ) -> bool:
-    """Email the summary to *recipients*, attaching the transcript file.
+    """Email the summary to *recipients*, attaching the transcript and summary.
 
     Falls back to the configured fallback recipient when the meeting recorded
     no addresses.  Returns whether the message was handed to the relay.
@@ -85,27 +109,32 @@ def send_meeting_email(
         logger.error("no recipients and no usable fallback configured; not sending")
         return False
 
+    stem = attachment_stem(room_name)
+
     try:
         message = EmailMessage()
-        message["Subject"] = _subject_for(room_name)
+        message["Subject"] = _subject_for(room_name, smtp.subject_suffix)
         message["From"] = smtp.sender
         message["To"] = ", ".join(targets)
-        message.set_content(f"Meeting summary for '{room_name}':\n\n{summary_text}")
+        message.set_content(
+            f"Hello,\n\n"
+            f"Please find the automated summary and raw transcript for room "
+            f"'{room_name}' attached below.\n\n"
+            f"{'-' * 50}\n"
+            f"MEETING SUMMARY ({room_name.upper()})\n"
+            f"{'-' * 50}\n\n"
+            f"{summary_text}\n\n"
+            f"Best regards,\n"
+            f"Automated meeting transcription\n"
+        )
 
-        if transcript_path:
-            path = Path(transcript_path)
-            try:
-                data = path.read_bytes()
-            except OSError as exc:
-                # Still worth sending the summary without its attachment.
-                logger.error("cannot attach %s: %s", path, exc)
-            else:
-                message.add_attachment(
-                    data,
-                    maintype="text",
-                    subtype="plain",
-                    filename=safe_attachment_name(room_name),
-                )
+        # Both are attached: the transcript is the record, the summary is what
+        # people actually read, and the summary is also in the body so it is
+        # legible without opening anything.
+        attached = _attach(message, transcript_path, f"{stem}_transcript.txt", "plain")
+        attached |= _attach(message, summary_path, f"{stem}_summary.md", "markdown")
+        if not attached:
+            logger.warning("no files were attached to the summary email")
 
         with smtplib.SMTP(smtp.host, smtp.port, timeout=60) as server:
             if smtp.use_starttls:

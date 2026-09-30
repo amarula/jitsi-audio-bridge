@@ -40,6 +40,7 @@ and emails the result.
 - [Configuration](#configuration)
 - [Running](#running)
 - [Wire protocol](#wire-protocol)
+- [Batch mode](#batch-mode)
 - [Running as a service](#running-as-a-service)
 - [Test environment](#test-environment)
 - [Output layout](#output-layout)
@@ -110,12 +111,17 @@ The environment layer exists so secrets can be supplied by a systemd
 | Option | Type | Default | Environment |
 |---|---|---|---|
 | `recordings_dir` | path | `/srv/recordings` | `JITSI_AUDIO_BRIDGE_STORAGE_RECORDINGS_DIR` |
+| `cleanup_after_send` | boolean | `false` | `JITSI_AUDIO_BRIDGE_STORAGE_CLEANUP_AFTER_SEND` |
+
+`cleanup_after_send` deletes the audio, transcript and summary once the email
+has been sent. It is off by default deliberately: those files are the only copy
+of the meeting, so a mistake here destroys one.
 
 ### `[whisper]`
 
 | Option | Type | Default | Environment |
 |---|---|---|---|
-| `url` | URL | `https://whisper.internal.domain.com/transcribe-b64` | `JITSI_AUDIO_BRIDGE_WHISPER_URL` |
+| `url` | URL | `https://whisper.omnia.amarulasolutions.com/transcribe-b64` | `JITSI_AUDIO_BRIDGE_WHISPER_URL` |
 | `timeout` | seconds | `600` | `JITSI_AUDIO_BRIDGE_WHISPER_TIMEOUT` |
 | `verify_tls` | boolean | `true` | `JITSI_AUDIO_BRIDGE_WHISPER_VERIFY_TLS` |
 
@@ -123,7 +129,7 @@ The environment layer exists so secrets can be supplied by a systemd
 
 | Option | Type | Default | Environment |
 |---|---|---|---|
-| `url` | URL | `https://ollama.internal.domain.com/api/generate` | `JITSI_AUDIO_BRIDGE_OLLAMA_URL` |
+| `url` | URL | `https://ollama.omnia.amarulasolutions.com/api/generate` | `JITSI_AUDIO_BRIDGE_OLLAMA_URL` |
 | `model` | string | `qwen2.5:14b-instruct` | `JITSI_AUDIO_BRIDGE_OLLAMA_MODEL` |
 | `timeout` | seconds | `600` | `JITSI_AUDIO_BRIDGE_OLLAMA_TIMEOUT` |
 | `verify_tls` | boolean | `true` | `JITSI_AUDIO_BRIDGE_OLLAMA_VERIFY_TLS` |
@@ -136,9 +142,10 @@ The environment layer exists so secrets can be supplied by a systemd
 | `port` | 1–65535 | `25` | `JITSI_AUDIO_BRIDGE_SMTP_PORT` |
 | `user` | string | *(empty)* | `JITSI_AUDIO_BRIDGE_SMTP_USER` |
 | `password` | string | *(empty)* | `JITSI_AUDIO_BRIDGE_SMTP_PASSWORD` |
-| `sender` | address | `no-reply@internal.domain.com` | `JITSI_AUDIO_BRIDGE_SMTP_SENDER` |
-| `fallback_recipient` | address | `admin@internal.domain.com` | `JITSI_AUDIO_BRIDGE_SMTP_FALLBACK_RECIPIENT` |
+| `sender` | address | `no-reply@amarulasolutions.com` | `JITSI_AUDIO_BRIDGE_SMTP_SENDER` |
+| `fallback_recipient` | address | `admin@omnia.amarulasolutions.com` | `JITSI_AUDIO_BRIDGE_SMTP_FALLBACK_RECIPIENT` |
 | `use_starttls` | boolean | `true` | `JITSI_AUDIO_BRIDGE_SMTP_USE_STARTTLS` |
+| `subject_suffix` | string | *(empty)* | `JITSI_AUDIO_BRIDGE_SMTP_SUBJECT_SUFFIX` |
 
 Booleans accept `true/false`, `yes/no`, `on/off` and `1/0`. Values are validated
 at startup and a bad one names the exact setting and where it came from:
@@ -170,6 +177,7 @@ trusted network; it makes the transcript path interceptable.
 | Flag | Meaning |
 |---|---|
 | `--config PATH` | Configuration file to read |
+| `--process-dir PATH` | Process an existing meeting directory and exit, instead of serving — see [Batch mode](#batch-mode) |
 | `--log-level LEVEL` | `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` (default `INFO`) |
 | `--version` | Print the version and exit |
 
@@ -208,17 +216,27 @@ frame is the one that counts**.
 
 ```json
 {
-  "room_name": "Weekly Planning",
+  "meeting_url": "https://meet.example.com/Weekly-Planning",
   "participants": [
-    {"id": "a1b2c3", "name": "Alice", "email": "alice@example.com"},
+    {"user": {"id": "a1b2c3", "name": "Alice", "email": "alice@example.com"}},
     {"user": {"id": "d4e5f6", "name": "Bob", "email": "bob@example.com"}}
   ]
 }
 ```
 
-Both the flat and the nested `user` shape are accepted. `id` is what links a
-participant to their audio; unnamed or id-less entries are ignored. If no
-addresses are found, the summary goes to `fallback_recipient`.
+There is **no `room_name` field**. The room is the last path segment of
+`meeting_url` — here `Weekly-Planning` — which is how Jitsi identifies a
+meeting. A literal `room_name` is still honoured if a sender provides one.
+
+Participants are read from either the nested `user` object or the flat level,
+and both spellings of each field are accepted: `email` or `mail`, `name` or
+`display_name`. An address that looks like an address is used as a recipient,
+and the same participant is mapped for attribution by *both* their `id` and
+their address, because a recording may be named after either.
+
+If nothing structured yields an address, the raw document is swept for
+anything shaped like one before falling back to `fallback_recipient` — an
+address buried in an unexpected field is still better than mailing the admin.
 
 ### Binary frames — audio
 
@@ -235,6 +253,9 @@ UTF-8 with trailing NULs removed, then sanitised exactly like `sessionId`, and
 must match a participant `id` from the control frame for the speaker's name to
 appear in the transcript.
 
+The identifier is matched against participant ids and addresses to attribute
+each recording to a speaker; if nothing matches, the filename is used.
+
 The sender must forward the **raw Opus payload** with RTP headers already
 stripped. This bridge does not de-RED: if redundancy encapsulation is enabled,
 payloads will not decode as Opus and the affected participant's recording will
@@ -243,6 +264,34 @@ session end, which is the signal to look for.
 
 Each packet is decoded straight to 16 kHz mono. A packet that libopus rejects is
 counted and skipped — it never aborts the recording.
+
+## Batch mode
+
+The same pipeline also runs over a meeting directory that already exists on
+disk, for recordings produced by something other than this bridge:
+
+```sh
+jitsi-audio-bridge --config config.ini --process-dir /srv/recordings/Weekly-Planning
+```
+
+It transcribes, summarises and emails, then exits: `0` if a summary was sent,
+`1` if it was not, `2` for a bad directory or configuration. Nothing is served
+and the recordings directory is not required.
+
+Two directory shapes are handled, because both occur in practice:
+
+| Shape | Files | Handling |
+|---|---|---|
+| One file per participant | `participant-<id>.wav`, `<address>_audio.wav` | Each transcribed separately and attributed to its speaker |
+| A single master recording | any `.wav`, `.mp4`, `.m4a`, `.mkv` | Extracted to mono 16 kHz with ffmpeg, then transcribed as one speaker |
+
+Participant files win if both are present, and `extracted_audio.wav` is never
+treated as a source — it is this program's own output.
+
+This is the batch counterpart to the WebSocket server, not a replacement: the
+capture path handles live meetings, and this handles recordings that were
+already written to disk. Both share the same transcribe, summarise and email
+code, so a fix to one applies to the other.
 
 ## Running as a service
 
@@ -334,7 +383,9 @@ bridge records with what the real sender produces.
 <srv/recordings>/<sessionId>/
 ├── metadata.json            # last control frame received
 ├── participant-<id>.wav     # 16 kHz, mono, 16-bit PCM, one per participant
-└── transcript.txt           # written once post-processing succeeds
+├── extracted_audio.wav      # only when a master recording had to be extracted
+├── transcript.txt           # written once post-processing succeeds
+└── summary.md               # the LLM summary, likewise
 ```
 
 `transcript.txt` is the transcript, one block per participant, attributed by
@@ -389,11 +440,13 @@ daemon closes every file in a `finally`, so this needs a hard kill; see
 
 ## Limitations
 
-- **The wire format is unverified.** The sending side is not in this repository
-  and could not be inspected. Stock Jitsi Videobridge Colibri WebSockets carry
-  JSON control messages for Jicofo, not per-participant Opus media, so this
-  format is specific to a custom sender. Confirm it against that sender before
-  relying on any of it.
+- **The binary frame format is unverified.** The metadata shape is known from a
+  working reference implementation, but the `[16-byte id][Opus]` framing is not:
+  the sending side is not in this repository, and stock Jitsi Videobridge
+  Colibri WebSockets carry JSON control messages for Jicofo rather than
+  per-participant Opus media. So this framing is specific to a custom sender and
+  should be confirmed against it. `tools/send_meeting.py` encodes the assumption
+  rather than validating it.
 - **No conversational ordering.** No timestamps are recorded, so the transcript
   is one block per participant in filesystem order, not interleaved by time.
   This is the single largest quality limitation; recovering it means recording

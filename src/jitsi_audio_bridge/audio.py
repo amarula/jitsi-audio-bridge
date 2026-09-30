@@ -23,11 +23,30 @@ import ctypes
 import ctypes.util
 import json
 import logging
+import re
+import shutil
+import subprocess
 import wave
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
+
+#: The control frame's payload, inside a meeting directory.
+METADATA_FILENAME = "metadata.json"
+
+#: Audio produced by live capture, one file per participant.
+PARTICIPANT_GLOB = "participant-*.wav"
+
+#: Audio written by Jitsi's own recording, typically named after the speaker.
+PARTICIPANT_AUDIO_GLOB = "*_audio.wav"
+
+#: The file ffmpeg extracts a single master track into.
+EXTRACTED_AUDIO_NAME = "extracted_audio.wav"
+
+#: Containers a master recording may arrive in, in preference order.
+MASTER_MEDIA_SUFFIXES = (".wav", ".mp4", ".m4a", ".mkv")
 
 #: libopus needs an application hint when a decoder is created.  Voice-over-IP
 #: is the right one for speech transcription.
@@ -452,18 +471,53 @@ class OpusParticipantRecorder:
         self.close()
 
 
+#: Matches an email address anywhere in a blob of text. Used only as a last
+#: resort, when the structured fields yielded nothing.
+_EMAIL_IN_TEXT = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
+
+
+def room_name_from_metadata(meta: dict[str, Any]) -> str | None:
+    """Work out the room name from an explicit field, or from ``meeting_url``.
+
+    Jitsi's metadata does not carry a ``room_name``: the meeting is identified
+    by a URL such as ``https://meet.example.com/Weekly-Planning``, whose last
+    path segment is the room. An explicit ``room_name`` is honoured first so
+    that senders which do provide one keep working.
+    """
+    explicit = meta.get("room_name")
+    if isinstance(explicit, str) and explicit.strip():
+        return explicit.strip()
+
+    meeting_url = meta.get("meeting_url")
+    if isinstance(meeting_url, str) and meeting_url.strip():
+        segments = [segment for segment in urlparse(meeting_url).path.split("/") if segment]
+        if segments:
+            return segments[-1]
+    return None
+
+
 def parse_metadata(meeting_dir: str | Path) -> dict[str, Any]:
-    """Parse room name, participants and email addresses from metadata.json.
+    """Parse the room name, participants and recipients from ``metadata.json``.
 
     Always returns a usable mapping.  A missing or malformed file degrades to
     defaults rather than raising, so a broken control frame cannot cost a
     meeting its transcript.
+
+    Returns a dict with ``room_name``, ``recipients`` (sorted, de-duplicated),
+    ``participants`` (human-readable ``"Name <email>"`` strings) and
+    ``id_to_name``, which maps both participant ids and email addresses to a
+    display name so that a recording can be attributed by either.
     """
-    metadata_path = Path(meeting_dir) / "metadata.json"
-    info: dict[str, Any] = {"room_name": "General Meeting", "recipients": [], "id_to_name": {}}
+    metadata_path = Path(meeting_dir) / METADATA_FILENAME
+    info: dict[str, Any] = {
+        "room_name": "General Meeting",
+        "recipients": [],
+        "participants": [],
+        "id_to_name": {},
+    }
 
     if not metadata_path.exists():
-        logger.warning("no metadata.json in %s; using defaults", meeting_dir)
+        logger.warning("no %s in %s; using defaults", METADATA_FILENAME, meeting_dir)
         return info
 
     try:
@@ -474,29 +528,135 @@ def parse_metadata(meeting_dir: str | Path) -> dict[str, Any]:
         return info
 
     if not isinstance(meta, dict):
-        logger.warning("metadata.json is not a JSON object; using defaults")
+        logger.warning("%s is not a JSON object; using defaults", METADATA_FILENAME)
         return info
 
-    info["room_name"] = meta.get("room_name") or info["room_name"]
+    info["room_name"] = room_name_from_metadata(meta) or info["room_name"]
 
-    recipients: set[str] = set()
+    recipients: list[str] = []
+    id_to_name: dict[str, str] = {}
+
     for participant in meta.get("participants", []) or []:
         if not isinstance(participant, dict):
             continue
-        # Jitsi has emitted both flat and nested participant records, so both
-        # shapes are accepted.
-        nested = participant.get("user") or {}
+
+        # Jitsi has emitted both flat and nested participant records, and the
+        # field names have varied, so every known spelling is accepted.
+        nested = participant.get("user")
         if not isinstance(nested, dict):
             nested = {}
 
-        email = participant.get("email") or nested.get("email")
-        name = participant.get("name") or nested.get("name")
+        email = participant.get("email") or participant.get("mail") or nested.get("email")
+        name = participant.get("name") or participant.get("display_name") or nested.get("name")
+        name = name if isinstance(name, str) else ""
         participant_id = participant.get("id") or nested.get("id")
 
-        if email:
-            recipients.add(email)
-        if participant_id and name:
-            info["id_to_name"][participant_id] = name
+        if isinstance(email, str) and "@" in email:
+            clean = email.strip()
+            if clean and clean not in recipients:
+                recipients.append(clean)
+            # Attribute by email too: a recording is often named after the
+            # address rather than the opaque participant id.
+            if name:
+                id_to_name[clean] = name
+            info["participants"].append(f"{name} ({clean})" if name else clean)
+
+        if isinstance(participant_id, str) and participant_id and name:
+            id_to_name[participant_id] = name
+
+    if not recipients:
+        # Nothing structured, but an address may still be buried somewhere in
+        # the document. Better to find it than to silently fall back.
+        found = _EMAIL_IN_TEXT.findall(json.dumps(meta))
+        if found:
+            logger.info("no structured recipients; recovered %d from the raw metadata", len(found))
+            recipients = list(dict.fromkeys(address.strip() for address in found))
+            info["participants"] = list(recipients)
 
     info["recipients"] = sorted(recipients)
+    info["id_to_name"] = id_to_name
     return info
+
+
+def discover_audio(meeting_dir: str | Path) -> tuple[list[Path], Path | None]:
+    """Find the audio belonging to a finished meeting.
+
+    Two shapes are supported, because both occur in practice: one file per
+    participant (what live capture produces, and what per-speaker recording
+    produces), or a single master recording of the whole room.
+
+    Returns ``(participant_files, master_file)``. Exactly one of the two is
+    non-empty; ``([], None)`` means there was nothing to process.
+    """
+    directory = Path(meeting_dir)
+
+    participant_files = {
+        path
+        for pattern in (PARTICIPANT_GLOB, PARTICIPANT_AUDIO_GLOB)
+        for path in directory.glob(pattern)
+    }
+    participant_files.discard(directory / EXTRACTED_AUDIO_NAME)
+    if participant_files:
+        return sorted(participant_files), None
+
+    for suffix in MASTER_MEDIA_SUFFIXES:
+        candidates = sorted(
+            path
+            for path in directory.glob(f"*{suffix}")
+            if path.name != EXTRACTED_AUDIO_NAME and path.is_file()
+        )
+        if candidates:
+            return [], candidates[0]
+    return [], None
+
+
+def extract_audio_track(source: str | Path, destination: str | Path) -> Path:
+    """Extract a mono 16 kHz PCM track from a master recording.
+
+    ffmpeg is used only here. Unlike raw Opus packets, a real container (mp4,
+    mkv, m4a) is something ffmpeg reads natively, so this is the case it is
+    genuinely the right tool for.
+
+    Raises:
+        OpusError: if ffmpeg is missing or fails.
+    """
+    source, destination = Path(source), Path(destination)
+    if not shutil.which("ffmpeg"):
+        raise OpusError(
+            f"ffmpeg is needed to extract audio from {source.name}, but was not found on PATH"
+        )
+
+    command = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(source),
+        "-vn",
+        "-acodec",
+        "pcm_s16le",
+        "-ar",
+        "16000",
+        "-ac",
+        "1",
+        str(destination),
+    ]
+    result = subprocess.run(command, capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        tail = (result.stderr or "").strip().splitlines()[-1:] or ["no output"]
+        raise OpusError(f"ffmpeg could not extract audio from {source.name}: {tail[0]}")
+    logger.info("extracted %s from %s", destination.name, source.name)
+    return destination
+
+
+def attribute_speaker(audio_path: str | Path, id_to_name: dict[str, str]) -> str:
+    """Name the speaker a recording belongs to.
+
+    ``id_to_name`` keys are matched as substrings of the path, because a
+    recording is named ``participant-<id>.wav`` or ``<email>_audio.wav`` and the
+    key may be either. Falls back to the file's stem.
+    """
+    path = str(audio_path)
+    for identifier, name in id_to_name.items():
+        if identifier and identifier in path:
+            return name
+    return Path(path).stem

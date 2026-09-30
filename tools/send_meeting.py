@@ -30,6 +30,7 @@ import asyncio
 import contextlib
 import json
 import math
+import re
 import struct
 import sys
 import wave
@@ -237,6 +238,41 @@ async def run(args: argparse.Namespace) -> int:
     return 0
 
 
+def build_control_frame(
+    participants: list[Participant], room_name: str, style: str
+) -> dict[str, object]:
+    """Build the JSON control frame the bridge parses.
+
+    Two shapes are worth being able to produce. ``jitsi`` is what the real
+    sender emits: no room name at all, the meeting identified by a URL whose
+    last path segment is the room, and participants nested under ``user``.
+    ``simple`` is the flat shape this simulator used before the real metadata
+    was known, kept so the bridge's tolerance of both stays covered.
+    """
+    if style == "simple":
+        return {
+            "room_name": room_name,
+            "participants": [
+                {"id": p.identifier, "name": p.name, "email": p.email} for p in participants
+            ],
+        }
+
+    slug = _slugify(room_name)
+    return {
+        "meeting_url": f"https://meet.example.com/{slug}",
+        "participants": [
+            {"user": {"id": p.identifier, "name": p.name, "email": p.email}}
+            for p in participants
+        ],
+    }
+
+
+def _slugify(name: str) -> str:
+    """Turn a room name into the URL segment the real metadata would carry."""
+    slug = re.sub(r"[^A-Za-z0-9]+", "-", name).strip("-")
+    return slug or "Meeting"
+
+
 async def exchange(
     websocket: object,
     args: argparse.Namespace,
@@ -245,14 +281,12 @@ async def exchange(
 ) -> None:
     """Send the control frame and the audio, then let the connection close."""
     if args.metadata:
-        control = {
-            "room_name": args.room_name,
-            "participants": [
-                {"id": p.identifier, "name": p.name, "email": p.email} for p in participants
-            ],
-        }
+        control = build_control_frame(participants, args.room_name, args.metadata_style)
         await websocket.send(json.dumps(control))
-        print(f"sent control frame: {len(participants)} participant(s)")
+        print(
+            f"sent control frame: {len(participants)} participant(s), "
+            f"{args.metadata_style} shape"
+        )
     else:
         print("skipping the control frame (--no-metadata)")
 
@@ -361,6 +395,15 @@ def build_parser() -> argparse.ArgumentParser:
         dest="realtime",
         action="store_false",
         help="send as fast as possible instead of pacing at 20 ms per frame",
+    )
+    parser.add_argument(
+        "--metadata-style",
+        choices=["jitsi", "simple"],
+        default="jitsi",
+        help=(
+            "jitsi sends meeting_url plus nested user records, matching the real "
+            "sender; simple sends a flat room_name (default: jitsi)"
+        ),
     )
     parser.add_argument(
         "--no-metadata",

@@ -178,6 +178,82 @@ file once that is done.
 The value is deliberately not reproduced anywhere in this repository, including
 in this document.
 
+## Corrected against a working reference
+
+A working implementation of the post-processing half was supplied after the
+first pass, and contradicted several things this code had assumed. These are
+corrections, not preferences: the reference is what actually runs.
+
+### The metadata format was wrong — **High** — Fixed
+
+`parse_metadata` looked for `meta["room_name"]`. **There is no such field.**
+The room is the last path segment of `meeting_url`, which is how Jitsi
+identifies a meeting. Every real meeting would therefore have been summarised
+and emailed as "General Meeting", with a subject line naming the wrong room —
+a silent, plausible-looking failure rather than an error.
+
+Also unhandled: participants arrive nested under `user`, and the field names
+have varied in the wild — `mail` as well as `email`, `display_name` as well as
+`name`. Attribution was mapped only by participant id, but recordings are also
+named after addresses, so those participants would have been attributed to a
+filename. And when nothing structured yielded an address, the code fell
+straight through to the admin fallback rather than looking any further.
+
+All four are now handled, and attribution resolves by id *or* address with the
+filename as a last resort.
+
+### The summary prompt was markedly weaker — **Medium** — Fixed
+
+The original prompt asked for three sections and nothing more. The reference
+carries two rules that do real work:
+
+- a speaker-attribution rule, without which the model flattens the `[Name]:`
+  tags into unattributed prose — the difference between minutes and a wall of
+  text;
+- a language rule repeated against every section heading, because models
+  otherwise translate the body and leave the headings in English.
+
+Adopted verbatim, and a test asserts the generated prompt is byte-identical to
+the reference, so the wording cannot drift by accident. The prompt is now built
+from explicit `\n` rather than a triple-quoted block purely so no source line
+has to be unreasonably long; the text sent is unchanged.
+
+### Two calls to one endpoint were indistinguishable in tests — **Low** — Fixed
+
+The stub Ollama service told the language probe from the summary request by
+matching a phrase in the prompt. Changing the prompt to the reference's wording
+silently broke that: the stub began answering the language question with the
+summary text, which then became the language the summary was requested in. The
+discriminator is now a phrase unique to the language prompt, with a comment
+saying why it has to be one.
+
+### Behaviour the reference had and this did not — **Medium** — Fixed
+
+- **A single master recording.** The reference falls back to any `.wav`,
+  `.mp4`, `.m4a` or `.mkv` in the directory and extracts a 16 kHz mono track
+  with ffmpeg. Without it, a meeting recorded as one file was unprocessable.
+  ffmpeg is genuinely the right tool here — unlike raw Opus packets, a real
+  container is something it reads natively.
+- **`summary.md` was not written or attached.** Only the transcript was. Both
+  are attached now; the summary is also in the message body so it is legible
+  without opening anything.
+- **Batch mode.** The reference is invoked as `process_meeting.py <dir>` over a
+  directory of already-recorded audio. That path now exists here too, as
+  `--process-dir`, sharing the identical pipeline rather than duplicating it.
+
+### Adopted differently
+
+**Cleanup.** The reference deletes the audio, transcript and summary once the
+email is sent. That is implemented, but behind `cleanup_after_send` and **off
+by default**: those files are the only copy of the meeting, and a
+misconfiguration that destroys one is not recoverable. It also runs only after
+a *confirmed* send.
+
+**TLS.** The reference passes `verify=False` to every request. That is now
+`verify_tls` per endpoint, defaulting to enabled. If the internal endpoints use
+a self-signed certificate, this will fail where the reference succeeded — set
+it to `false` deliberately, or install the CA.
+
 ## Deferred
 
 ### Peak memory during transcription — **Medium**
@@ -293,11 +369,15 @@ enough that rejecting unknown sections and options outright would be cheap.
 
 ## Verification performed
 
-- 119 unit tests, including an Opus encode/decode round trip against the real
+- 140 unit tests, including an Opus encode/decode round trip against the real
   libopus binding, requiring no audio fixtures.
-- A 30-check end-to-end smoke test driving the real daemon with stub Whisper,
+- A 41-check end-to-end smoke test driving the real daemon with stub Whisper,
   Ollama and SMTP services, asserting on the WAV files, the transcript, the
-  prompts sent to Ollama, the delivered message, and the negative cases.
+  prompts sent to Ollama, the delivered message, and the negative cases. It
+  covers both the live capture path and batch mode, including a master
+  recording that only ffmpeg can read.
+- The generated summary prompt is asserted byte-identical to the working
+  reference's, so its wording cannot drift.
 - A round trip with real synthesised speech verified by audio level: a 48 kHz
   source at −15.4 dB mean came back as a 16 kHz recording at −15.0 dB, with
   each participant's distinct speech still separated. Checking levels rather
@@ -316,9 +396,14 @@ The test environment in `tools/` exists because none of this could be checked
 without a sender, and nothing in the repository spoke the protocol. It also
 means the checks above are repeatable rather than one-off.
 
-**Not verified:** the wire format itself. The sender is not in this repository
-and no Jitsi deployment exists on the development host, so the frame layout,
-the `sessionId` parameter and the control-frame schema remain assumptions taken
-from the original code. `tools/send_meeting.py` encodes those assumptions rather
-than confirming them — pointing it at a real sender and comparing the two is
-the way to settle it, and that has not been done.
+**Not verified:** the binary frame format. The metadata schema is now known
+from the working reference, but the `[16-byte participant id][Opus packet]`
+framing is not — the sender is not in this repository and no Jitsi deployment
+exists on the development host. `tools/send_meeting.py` encodes that assumption
+rather than confirming it; pointing it at a real sender and comparing the two
+is the way to settle it, and that has not been done.
+
+Worth noting that the reference does not receive Opus at all: it reads WAV and
+container files that something else has already written. So the frame format is
+not something the reference can vouch for, and the live-capture half remains
+the unproven part of this project.

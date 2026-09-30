@@ -26,18 +26,22 @@ port = 8080
 ; Per-meeting directories are created underneath this path, so the user the
 ; daemon runs as must be able to write here.
 recordings_dir = /srv/recordings
+; Delete the audio, transcript and summary once the email has been sent.
+; Off by default: these files are the only copy of the meeting, so a
+; misconfiguration should not be able to destroy one.
+cleanup_after_send = false
 
 [whisper]
 ; Endpoint accepting {"audio_base64": ..., "filename": ...} and returning
 ; {"text": ...}.
-url = https://whisper.internal.domain.com/transcribe-b64
+url = https://whisper.omnia.amarulasolutions.com/transcribe-b64
 ; Transcribing a long meeting can take minutes.
 timeout = 600
 ; Set to false only for an endpoint with a self-signed certificate.
 verify_tls = true
 
 [ollama]
-url = https://ollama.internal.domain.com/api/generate
+url = https://ollama.omnia.amarulasolutions.com/api/generate
 model = qwen2.5:14b-instruct
 timeout = 600
 verify_tls = true
@@ -48,9 +52,12 @@ port = 25
 ; Leave both blank for a relay that accepts mail without authentication.
 user =
 password =
-sender = no-reply@internal.domain.com
+sender = no-reply@amarulasolutions.com
 ; Used when the meeting's metadata carries no participant addresses.
-fallback_recipient = admin@internal.domain.com
+fallback_recipient = admin@omnia.amarulasolutions.com
 ; Issue STARTTLS before authenticating. Leave true unless the relay is on
 ; loopback and does not offer it.
 use_starttls = true
+; Appended to the subject line. Either spelling works: "Amarula Solutions" or
+; "- Amarula Solutions".
+subject_suffix = Amarula Solutions

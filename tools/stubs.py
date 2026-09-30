@@ -36,6 +36,12 @@ logger = logging.getLogger("tools.stubs")
 #: Ollama leg ran.
 DEFAULT_SUMMARY = "STUB SUMMARY: the meeting covered the agenda items."
 
+#: Distinguishes the bridge's two Ollama calls. The bridge asks the language
+#: question and the summary question of the same endpoint, so the stub has to
+#: tell them apart; keying on a phrase unique to the language prompt is more
+#: robust than matching on wording that both prompts share.
+LANGUAGE_PROBE_MARKER = "Return ONLY the English name of the language"
+
 
 def free_port() -> int:
     """Ask the OS for a port nobody is using."""
@@ -157,9 +163,8 @@ class OllamaStub:
                 outer.prompts.append(prompt)
 
                 # The bridge asks the same endpoint two different questions.
-                response = (
-                    outer.language if "Identify the language" in prompt else outer.summary
-                )
+                is_language_probe = LANGUAGE_PROBE_MARKER in prompt
+                response = outer.language if is_language_probe else outer.summary
                 WhisperStub._reply(self, 200, {"response": response})
 
         self._server = HTTPServer(("127.0.0.1", self.port), Handler)
@@ -180,8 +185,13 @@ class OllamaStub:
 
     @property
     def summary_prompts(self) -> list[str]:
-        """Only the prompts that were asked for a summary, not the language probe."""
-        return [p for p in self.prompts if "Identify the language" not in p]
+        """Only the prompts that asked for a summary, not the language probe."""
+        return [p for p in self.prompts if LANGUAGE_PROBE_MARKER not in p]
+
+    @property
+    def language_prompts(self) -> list[str]:
+        """Only the prompts that asked which language the transcript is in."""
+        return [p for p in self.prompts if LANGUAGE_PROBE_MARKER in p]
 
 
 class SmtpStub:

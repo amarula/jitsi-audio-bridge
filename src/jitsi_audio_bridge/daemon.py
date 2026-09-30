@@ -22,6 +22,7 @@ import os
 import re
 import signal
 import tempfile
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -30,7 +31,16 @@ import websockets
 
 from . import __version__
 from .ai_client import generate_summary, transcribe_audio
-from .audio import OpusError, OpusParticipantRecorder, parse_metadata
+from .audio import (
+    EXTRACTED_AUDIO_NAME,
+    METADATA_FILENAME,
+    OpusError,
+    OpusParticipantRecorder,
+    attribute_speaker,
+    discover_audio,
+    extract_audio_track,
+    parse_metadata,
+)
 from .config import Config, ConfigError, load_config
 from .mailer import send_meeting_email
 
@@ -47,9 +57,6 @@ MAX_IDENTIFIER_LENGTH = 64
 
 #: Used when a connection carries no usable ``sessionId``.
 DEFAULT_SESSION_ID = "session_default"
-
-#: Filename of the control frame's payload, inside the meeting directory.
-METADATA_FILENAME = "metadata.json"
 
 #: How many meetings may be transcribed and summarised at once.  Whisper and
 #: Ollama are the bottleneck; unbounded fan-out would just queue inside them.
@@ -160,25 +167,48 @@ def _semaphore() -> asyncio.Semaphore:
     return _PROCESSING_SEMAPHORE
 
 
-def process_completed_session(meeting_dir: Path, config: Config) -> None:
+def _cleanup(paths: Iterable[Path]) -> None:
+    """Delete processed files.  Only ever called when explicitly enabled."""
+    for path in paths:
+        try:
+            path.unlink()
+            logger.info("removed %s", path.name)
+        except OSError as exc:
+            logger.warning("could not remove %s: %s", path, exc)
+
+
+def process_completed_session(meeting_dir: Path, config: Config) -> bool:
     """Transcribe, summarise and email one finished meeting.
+
+    Works on either shape of meeting directory: one recording per participant,
+    or a single master track that gets extracted with ffmpeg first.
 
     Blocking: transcription and summary generation take minutes.  Always call
     this through :func:`asyncio.to_thread`, never directly from a coroutine.
+
+    Returns whether a summary email was sent.
     """
     logger.info("post-processing %s", meeting_dir)
+    meeting_dir = Path(meeting_dir)
     metadata = parse_metadata(meeting_dir)
 
-    recordings = sorted(meeting_dir.glob("participant-*.wav"))
-    if not recordings:
-        logger.info("no participant recordings in %s; nothing to do", meeting_dir)
-        return
+    participant_files, master_file = discover_audio(meeting_dir)
+    extracted: Path | None = None
+    if not participant_files and master_file is not None:
+        try:
+            extracted = extract_audio_track(master_file, meeting_dir / EXTRACTED_AUDIO_NAME)
+        except OpusError as exc:
+            logger.error("%s", exc)
+            return False
+        participant_files = [extracted]
+    elif not participant_files:
+        logger.info("no audio in %s; nothing to do", meeting_dir)
+        return False
 
+    logger.info("transcribing %d audio file(s)", len(participant_files))
     transcript_lines: list[str] = []
-    for recording in recordings:
-        participant_id = recording.stem.removeprefix("participant-")
-        speaker = metadata["id_to_name"].get(participant_id, participant_id)
-
+    for recording in participant_files:
+        speaker = attribute_speaker(recording, metadata["id_to_name"])
         text = transcribe_audio(recording, config.whisper)
         if text:
             transcript_lines.append(f"[{speaker}]: {text}")
@@ -187,17 +217,61 @@ def process_completed_session(meeting_dir: Path, config: Config) -> None:
 
     if not transcript_lines:
         logger.warning("nothing was transcribed for %s; skipping the email", meeting_dir)
-        return
+        return False
 
     transcript = "\n\n".join(transcript_lines)
     transcript_path = meeting_dir / "transcript.txt"
     transcript_path.write_text(transcript, encoding="utf-8")
-    logger.info("wrote %s (%d participants)", transcript_path, len(transcript_lines))
+    logger.info("wrote %s (%d speakers)", transcript_path.name, len(transcript_lines))
 
-    summary = generate_summary(transcript, metadata["room_name"], config.ollama)
-    send_meeting_email(
-        metadata["recipients"], metadata["room_name"], summary, transcript_path, config.smtp
+    summary = generate_summary(
+        transcript,
+        metadata["room_name"],
+        metadata["participants"],
+        config.ollama,
     )
+    if not summary:
+        logger.warning("no summary was produced for %s; the transcript is kept", meeting_dir)
+        return False
+
+    summary_path = meeting_dir / "summary.md"
+    summary_path.write_text(summary, encoding="utf-8")
+    logger.info("wrote %s", summary_path.name)
+
+    sent = send_meeting_email(
+        metadata["recipients"],
+        metadata["room_name"],
+        summary,
+        transcript_path,
+        summary_path,
+        config.smtp,
+    )
+
+    if sent and config.storage.cleanup_after_send:
+        # Only after a confirmed send, and only when asked for: these files are
+        # the only copy of the meeting.
+        logger.info("cleanup_after_send is enabled; removing the processed files")
+        _cleanup([*participant_files, extracted, transcript_path, summary_path])
+
+    return sent
+
+
+def process_directory(meeting_dir: Path, config: Config) -> int:
+    """Process one meeting directory that already exists on disk.
+
+    The batch counterpart to the WebSocket server, for recordings produced by
+    something else. Returns a process exit status.
+    """
+    if not meeting_dir.is_dir():
+        logger.error("not a directory: %s", meeting_dir)
+        return 2
+
+    try:
+        sent = process_completed_session(meeting_dir, config)
+    except Exception:
+        logger.exception("processing failed for %s", meeting_dir)
+        return 1
+    return 0 if sent else 1
 
 
 async def _run_post_processing(meeting_dir: Path, config: Config) -> None:
@@ -366,6 +440,15 @@ def build_argument_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--process-dir",
+        metavar="PATH",
+        help=(
+            "process an existing meeting directory and exit, instead of serving. "
+            "The directory may hold one recording per participant, or a single "
+            "master recording to extract audio from."
+        ),
+    )
+    parser.add_argument(
         "--log-level",
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
@@ -386,10 +469,16 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         config = load_config(args.config)
-        check_storage(config)
+        # Directory mode is handed an existing directory, so the recordings
+        # directory is only required when serving.
+        if args.process_dir is None:
+            check_storage(config)
     except ConfigError as exc:
         logger.error("%s", exc)
         return 2
+
+    if args.process_dir is not None:
+        return process_directory(Path(args.process_dir), config)
 
     try:
         asyncio.run(serve(config))

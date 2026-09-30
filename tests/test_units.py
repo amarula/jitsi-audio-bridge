@@ -16,11 +16,15 @@ import pytest
 
 from jitsi_audio_bridge import config as config_module
 from jitsi_audio_bridge.audio import (
+    EXTRACTED_AUDIO_NAME,
     OpusDecoder,
     OpusEncoder,
     OpusError,
     OpusParticipantRecorder,
+    attribute_speaker,
+    discover_audio,
     parse_metadata,
+    room_name_from_metadata,
 )
 from jitsi_audio_bridge.config import ConfigError, load_config
 from jitsi_audio_bridge.daemon import (
@@ -179,8 +183,15 @@ def test_parse_metadata_reads_flat_participants(tmp_path: Path) -> None:
     )
     meta = parse_metadata(tmp_path)
     assert meta["room_name"] == "Planning"
-    assert meta["id_to_name"] == {"p1": "Ada", "p2": "Grace"}
+    # Mapped by both id and address: a recording may be named after either.
+    assert meta["id_to_name"] == {
+        "p1": "Ada",
+        "ada@example.com": "Ada",
+        "p2": "Grace",
+        "grace@example.com": "Grace",
+    }
     assert meta["recipients"] == ["ada@example.com", "grace@example.com"]
+    assert meta["participants"] == ["Ada (ada@example.com)", "Grace (grace@example.com)"]
 
 
 def test_parse_metadata_reads_nested_user_objects(tmp_path: Path) -> None:
@@ -195,7 +206,7 @@ def test_parse_metadata_reads_nested_user_objects(tmp_path: Path) -> None:
         )
     )
     meta = parse_metadata(tmp_path)
-    assert meta["id_to_name"] == {"u1": "Alan"}
+    assert meta["id_to_name"] == {"u1": "Alan", "alan@example.com": "Alan"}
     assert meta["recipients"] == ["alan@example.com"]
 
 
@@ -211,6 +222,78 @@ def test_parse_metadata_deduplicates_recipients(tmp_path: Path) -> None:
         )
     )
     assert parse_metadata(tmp_path)["recipients"] == ["same@example.com"]
+
+
+# --- the shapes the real sender actually produces -------------------------
+
+
+def test_room_name_comes_from_the_meeting_url(tmp_path: Path) -> None:
+    """Jitsi's metadata has no room_name; the room is the URL's last segment."""
+    (tmp_path / "metadata.json").write_text(
+        json.dumps(
+            {
+                "meeting_url": "https://meet.example.com/Weekly-Planning",
+                "participants": [{"user": {"id": "u1", "name": "Ada"}}],
+            }
+        )
+    )
+    assert parse_metadata(tmp_path)["room_name"] == "Weekly-Planning"
+
+
+def test_room_name_from_a_url_with_a_trailing_slash() -> None:
+    assert room_name_from_metadata({"meeting_url": "https://m.example.com/Room/"}) == "Room"
+
+
+def test_an_explicit_room_name_beats_the_url() -> None:
+    meta = {"room_name": "Explicit", "meeting_url": "https://m.example.com/FromUrl"}
+    assert room_name_from_metadata(meta) == "Explicit"
+
+
+def test_room_name_is_absent_when_nothing_says_otherwise() -> None:
+    assert room_name_from_metadata({}) is None
+    assert room_name_from_metadata({"meeting_url": ""}) is None
+    assert room_name_from_metadata({"meeting_url": "https://m.example.com"}) is None
+
+
+def test_a_url_of_only_separators_yields_nothing() -> None:
+    assert room_name_from_metadata({"meeting_url": "https://m.example.com///"}) is None
+
+
+def test_parse_metadata_accepts_the_alternate_field_spellings(tmp_path: Path) -> None:
+    """``mail`` and ``display_name`` appear in the wild alongside email/name."""
+    (tmp_path / "metadata.json").write_text(
+        json.dumps(
+            {
+                "meeting_url": "https://meet.example.com/Standup",
+                "participants": [{"id": "p1", "display_name": "Ada", "mail": "ada@example.com"}],
+            }
+        )
+    )
+    meta = parse_metadata(tmp_path)
+    assert meta["recipients"] == ["ada@example.com"]
+    assert meta["id_to_name"]["ada@example.com"] == "Ada"
+
+
+def test_parse_metadata_recovers_addresses_from_unstructured_metadata(tmp_path: Path) -> None:
+    """When no structured recipient exists, an address buried in the document is
+    still better than silently falling back to the admin."""
+    (tmp_path / "metadata.json").write_text(
+        json.dumps(
+            {
+                "meeting_url": "https://meet.example.com/Standup",
+                "note": "contact grace@example.com for the minutes",
+            }
+        )
+    )
+    meta = parse_metadata(tmp_path)
+    assert meta["recipients"] == ["grace@example.com"]
+
+
+def test_parse_metadata_ignores_things_that_are_not_addresses(tmp_path: Path) -> None:
+    (tmp_path / "metadata.json").write_text(
+        json.dumps({"participants": [{"id": "p1", "name": "Ada", "email": "not-an-address"}]})
+    )
+    assert parse_metadata(tmp_path)["recipients"] == []
 
 
 def test_parse_metadata_survives_a_missing_file(tmp_path: Path) -> None:
@@ -230,6 +313,85 @@ def test_parse_metadata_skips_junk_participants(tmp_path: Path) -> None:
         json.dumps({"participants": [None, "string", 42, {"id": "p1", "name": "Ada"}]})
     )
     assert parse_metadata(tmp_path)["id_to_name"] == {"p1": "Ada"}
+
+
+# --------------------------------------------------------------------------
+# Speaker attribution and audio discovery
+# --------------------------------------------------------------------------
+
+
+def test_attribute_speaker_matches_a_participant_id(tmp_path: Path) -> None:
+    path = tmp_path / "participant-abc123.wav"
+    assert attribute_speaker(path, {"abc123": "Ada"}) == "Ada"
+
+
+def test_attribute_speaker_matches_an_email_address(tmp_path: Path) -> None:
+    path = tmp_path / "ada@example.com_audio.wav"
+    assert attribute_speaker(path, {"ada@example.com": "Ada"}) == "Ada"
+
+
+def test_attribute_speaker_falls_back_to_the_filename(tmp_path: Path) -> None:
+    path = tmp_path / "participant-unknown.wav"
+    assert attribute_speaker(path, {"abc123": "Ada"}) == "participant-unknown"
+
+
+def test_attribute_speaker_without_any_mapping(tmp_path: Path) -> None:
+    path = tmp_path / "participant-abc.wav"
+    assert attribute_speaker(path, {}) == "participant-abc"
+
+
+def _touch(path: Path) -> Path:
+    path.write_bytes(b"")
+    return path
+
+
+def test_discover_audio_finds_live_capture_recordings(tmp_path: Path) -> None:
+    _touch(tmp_path / "participant-alice.wav")
+    _touch(tmp_path / "participant-bob.wav")
+    participants, master = discover_audio(tmp_path)
+    assert [p.name for p in participants] == ["participant-alice.wav", "participant-bob.wav"]
+    assert master is None
+
+
+def test_discover_audio_finds_per_speaker_recordings(tmp_path: Path) -> None:
+    _touch(tmp_path / "alice@example.com_audio.wav")
+    participants, master = discover_audio(tmp_path)
+    assert [p.name for p in participants] == ["alice@example.com_audio.wav"]
+    assert master is None
+
+
+def test_discover_audio_prefers_participant_files_over_a_master(tmp_path: Path) -> None:
+    _touch(tmp_path / "participant-alice.wav")
+    _touch(tmp_path / "room.mp4")
+    participants, master = discover_audio(tmp_path)
+    assert len(participants) == 1
+    assert master is None
+
+
+def test_discover_audio_falls_back_to_a_master_recording(tmp_path: Path) -> None:
+    _touch(tmp_path / "room-recording.mp4")
+    participants, master = discover_audio(tmp_path)
+    assert participants == []
+    assert master is not None and master.name == "room-recording.mp4"
+
+
+def test_discover_audio_never_returns_its_own_extraction(tmp_path: Path) -> None:
+    """extracted_audio.wav is derived, so it must not be picked up as a source."""
+    _touch(tmp_path / EXTRACTED_AUDIO_NAME)
+    participants, master = discover_audio(tmp_path)
+    assert participants == []
+    assert master is None
+
+
+def test_discover_audio_on_an_empty_directory(tmp_path: Path) -> None:
+    assert discover_audio(tmp_path) == ([], None)
+
+
+def test_master_media_is_chosen_by_container_preference(tmp_path: Path) -> None:
+    _touch(tmp_path / "recording.mkv")
+    _touch(tmp_path / "recording.wav")
+    _, master = discover_audio(tmp_path)
+    assert master is not None and master.suffix == ".wav"
 
 
 # --------------------------------------------------------------------------
@@ -264,7 +426,17 @@ def test_subject_flattens_embedded_newlines() -> None:
 
 
 def test_subject_falls_back_for_an_empty_room_name() -> None:
-    assert _subject_for("") == "Meeting Summary: Meeting"
+    assert _subject_for("") == "Meeting Summary & Transcript: Meeting"
+
+
+def test_subject_appends_a_configured_suffix() -> None:
+    subject = _subject_for("Standup", "- Amarula Solutions")
+    assert subject == "Meeting Summary & Transcript: Standup - Amarula Solutions"
+
+
+def test_subject_suffix_is_flattened_and_optional() -> None:
+    assert _subject_for("Standup", "") == "Meeting Summary & Transcript: Standup"
+    assert "\n" not in _subject_for("Standup", "x\r\ny")
 
 
 @pytest.mark.parametrize(
