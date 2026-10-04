@@ -1,6 +1,6 @@
 """Check a Jitsi deployment against docs/jitsi-integration.md.
 
-Read-only. Three sections, selected with ``--only``:
+Read-only unless ``--fix`` is given.  Four sections, selected with ``--only``:
 
 ``config``
     Parse the effective Jicofo, Prosody and jitsi-meet files and check each
@@ -14,6 +14,12 @@ Read-only. Three sections, selected with ``--only``:
 ``logs``
     Scan recent ``jitsi-videobridge2`` and ``jicofo`` journal entries for the
     connect lifecycle, or the failure modes, after a test meeting.
+``fix``
+    With ``--fix``, write ``<file>.new`` proposals for the failed checks that
+    have a mechanical remedy — the Jicofo transcription block (needs
+    ``--bridge-url``), the Prosody module and its enablement, and the client
+    configuration.  Originals are never modified; review a proposal, then move
+    it into place as the printed commands describe.
 
 Run it from the checkout root as a module, or straight from the file (which
 also works from any directory, and is what the Debian package's
@@ -34,6 +40,7 @@ import argparse
 import asyncio
 import contextlib
 import json
+import os
 import re
 import shutil
 import socket
@@ -111,6 +118,8 @@ class Status(Enum):
     FAIL = "FAIL"
     WARN = "WARN"
     SKIP = "SKIP"
+    #: A fix was proposed as ``<file>.new``; nothing was applied.
+    PROPOSED = "PROPOSED"
 
 
 @dataclass(frozen=True)
@@ -128,6 +137,8 @@ class Check:
 class Section:
     name: str
     checks: list[Check] = field(default_factory=list)
+    #: Free-standing lines printed after the checks (used by the fix section).
+    notes: list[str] = field(default_factory=list)
 
 
 # --------------------------------------------------------------------------
@@ -217,14 +228,37 @@ def match_brace(text: str, start: int) -> int | None:
     return None
 
 
-def find_js_object(text: str, key: str) -> str | None:
-    """Return the body of the first ``key: { ... }`` object in *text*."""
+def find_js_object_span(text: str, key: str) -> tuple[int, int] | None:
+    """Return ``(body start, closing brace)`` of the first ``key: { ... }``."""
     pattern = re.compile(rf"[\"']?{re.escape(key)}[\"']?\s*:\s*\{{")
     for found in pattern.finditer(text):
         end = match_brace(text, found.end() - 1)
         if end is not None:
-            return text[found.end() : end]
+            return found.end(), end
     return None
+
+
+def find_js_object(text: str, key: str) -> str | None:
+    """Return the body of the first ``key: { ... }`` object in *text*."""
+    span = find_js_object_span(text, key)
+    return text[span[0] : span[1]] if span else None
+
+
+def find_js_var_object_span(text: str, name: str = "config") -> tuple[int, int] | None:
+    """Return the span of the one ``var config = { ... }`` in *text*.
+
+    The top-level client config is an assignment, not a property, so
+    :func:`find_js_object_span` cannot see it.  ``None`` when there is not
+    exactly one candidate: with several, the effective one cannot be known
+    statically and an inserted setting could land in the wrong object.
+    """
+    pattern = re.compile(rf"\b(?:var|const|let)\s+{re.escape(name)}\s*=\s*\{{")
+    spans = []
+    for found in pattern.finditer(text):
+        end = match_brace(text, found.end() - 1)
+        if end is not None:
+            spans.append((found.end(), end))
+    return spans[0] if len(spans) == 1 else None
 
 
 def js_boolean(body: str, name: str) -> bool | None:
@@ -458,6 +492,11 @@ class LuaBlock:
     type: str | None
     body: str
     line: int
+    #: Absolute offsets of the body in the text that was parsed.  Comment
+    #: blanking preserves offsets, so these index into the raw file too, which
+    #: is what lets the fixer splice text without disturbing comments.
+    start: int = 0
+    end: int = 0
 
 
 _LUA_BLOCK = re.compile(
@@ -518,23 +557,53 @@ def find_lua_blocks(text: str) -> list[LuaBlock]:
                 type=match.group(3),
                 body=text[match.end() : end],
                 line=text.count("\n", 0, match.start()) + 1,
+                start=match.end(),
+                end=end,
             )
         )
     return blocks
 
 
-def lua_table(text: str, key: str) -> str | None:
-    """Return the inner text of the last ``key = { ... }`` assignment.
+def lua_table_span(text: str, key: str) -> tuple[int, int] | None:
+    """Return ``(inner start, closing brace)`` of the last ``key = { ... }``.
 
     The last one wins because that is what Lua does, and Prosody configs are
     full of assignments an admin has replaced further down the file.
     """
-    body: str | None = None
+    span: tuple[int, int] | None = None
     for found in re.finditer(rf"(?<![\w.]){re.escape(key)}\s*=\s*\{{", text):
         end = match_brace(text, found.end() - 1)
         if end is not None:
-            body = text[found.end() : end]
-    return body
+            span = (found.end(), end)
+    return span
+
+
+def lua_table(text: str, key: str) -> str | None:
+    """Return the inner text of the last ``key = { ... }`` assignment."""
+    span = lua_table_span(text, key)
+    return text[span[0] : span[1]] if span else None
+
+
+def find_main_muc(blocks: Sequence[LuaBlock], domain: str | None) -> LuaBlock | None:
+    """Pick the conference's main MUC out of a parsed Prosody config.
+
+    Shared by the checks and the fixer so both always agree on which component
+    is meant.
+    """
+    mucs = [block for block in blocks if block.kind == "Component" and block.type == "muc"]
+    main_muc_name: str | None = None
+    for host in blocks:
+        if host.kind == "VirtualHost" and (domain is None or host.name == domain):
+            main_muc_name = lua_scalar(host.body, "main_muc") or main_muc_name
+            if domain is not None:
+                break
+    return next(
+        (block for block in mucs if block.name == main_muc_name),
+        next(
+            (block for block in mucs if block.name == f"conference.{domain}"),
+            mucs[0] if len(mucs) == 1 else None,
+        ),
+    )
 
 
 def lua_string_list(table: str | None) -> list[str]:
@@ -890,6 +959,48 @@ def check_jicofo(deployment: Deployment, meeting_id: str, custom_conf: Path) -> 
     return checks
 
 
+def module_files_for(
+    modules: Sequence[str],
+    plugin_dirs: Sequence[Path],
+    read_module: Callable[[Path], str | None],
+) -> tuple[list[tuple[str, Path]], list[str]]:
+    """Split *modules* into those with a file that sets asyncTranscription, and
+    those with no file anywhere.  Shared by the check and the fixer."""
+    forcing: list[tuple[str, Path]] = []
+    missing: list[str] = []
+    for name in modules:
+        path = next(
+            (
+                candidate
+                for directory in plugin_dirs
+                for candidate in (directory / f"mod_{name}.lua", directory / f"{name}.lua")
+                if candidate.is_file()
+            ),
+            None,
+        )
+        if path is None:
+            missing.append(name)
+        elif lua_sets_async_transcription(read_module(path) or ""):
+            forcing.append((name, path))
+    return forcing, missing
+
+
+def forcing_candidates(
+    plugin_dirs: Sequence[Path],
+    read_module: Callable[[Path], str | None],
+) -> list[tuple[str, Path]]:
+    """Modules present in the plugin paths that set asyncTranscription."""
+    found: list[tuple[str, Path]] = []
+    for directory in plugin_dirs:
+        if not directory.is_dir():
+            continue
+        for path in sorted(directory.glob("*.lua")):
+            if lua_sets_async_transcription(read_module(path) or ""):
+                name = path.stem.removeprefix("mod_")
+                found.append((name, path))
+    return found
+
+
 def check_prosody(
     deployment: Deployment,
     domain: str | None,
@@ -921,20 +1032,8 @@ def check_prosody(
 
     blocks = find_lua_blocks(body)
     virtual_hosts = [block for block in blocks if block.kind == "VirtualHost"]
-    mucs = [block for block in blocks if block.kind == "Component" and block.type == "muc"]
 
-    main_muc_name: str | None = None
-    for host in virtual_hosts:
-        if domain is None or host.name == domain:
-            main_muc_name = lua_scalar(host.body, "main_muc") or main_muc_name
-            if domain is not None and host.name == domain:
-                break
-    main_muc = next((block for block in mucs if block.name == main_muc_name), None)
-    if main_muc is None:
-        main_muc = next(
-            (block for block in mucs if block.name == f"conference.{domain}"),
-            mucs[0] if len(mucs) == 1 else None,
-        )
+    main_muc = find_main_muc(blocks, domain)
     if main_muc is None:
         return [*checks, Check(
             "prosody.muc", Status.FAIL,
@@ -980,39 +1079,18 @@ def check_prosody(
                 "room_metadata entries in the site config",
         ))
 
-    forcing: list[str] = []
-    missing: list[str] = []
-    for name in modules:
-        path = next(
-            (
-                candidate
-                for directory in plugin_dirs
-                for candidate in (directory / f"mod_{name}.lua", directory / f"{name}.lua")
-                if candidate.is_file()
-            ),
-            None,
-        )
-        if path is None:
-            missing.append(name)
-            continue
-        if lua_sets_async_transcription(read_module(path) or ""):
-            forcing.append(f"{name} ({path})")
+    forcing, missing = module_files_for(modules, plugin_dirs, read_module)
     if forcing:
         checks.append(Check("prosody.force_async_transcription", Status.PASS,
-                            "set by " + ", ".join(forcing)))
+                            "set by " + ", ".join(f"{name} ({path})" for name, path in forcing)))
     else:
-        available = [
-            f"{path.name} ({directory})"
-            for directory in plugin_dirs
-            if directory.is_dir()
-            for path in sorted(directory.glob("*.lua"))
-            if lua_sets_async_transcription(read_module(path) or "")
-        ]
+        available = forcing_candidates(plugin_dirs, read_module)
         if available:
             checks.append(Check(
                 "prosody.force_async_transcription", Status.WARN,
                 "nothing enabled on the main MUC sets asyncTranscription, but "
-                "an unenabled module does: " + ", ".join(available),
+                "an unenabled module does: "
+                + ", ".join(f"{name} ({path})" for name, path in available),
                 fix='add that module name to modules_enabled on "'
                     f'{main_muc.name}"',
             ))
@@ -1090,6 +1168,427 @@ def check_jvb(deployment: Deployment) -> list[Check]:
         )]
     return [Check("jvb.exporter", Status.PASS, "no problematic exporter overrides "
                                                "(the JVB needs no configuration)")]
+
+
+# --------------------------------------------------------------------------
+# Fixes: proposals written as <file>.new
+# --------------------------------------------------------------------------
+
+#: Written beside a target, in the spirit of Debian's conffile handling.
+PROPOSAL_SUFFIX = ".new"
+PROPOSAL_BANNER = "Proposal written by jitsi-audio-bridge-verify --fix."
+PROSODY_MODULE_NAME = "force_async_transcription"
+
+#: The bookkeeping module, verbatim from docs/jitsi-integration.md §2; a test
+#: compares the two so they cannot drift apart.
+PROSODY_MODULE_LUA = """\
+-- mod_force_async_transcription.lua
+-- Forces asyncTranscription=true on every room's metadata.
+-- Enable on the main MUC component (e.g. conference.<domain>).
+
+local util = module:require 'util';
+local is_healthcheck_room = util.is_healthcheck_room;
+
+module:hook('muc-room-created', function(event)
+    local room = event.room;
+
+    if is_healthcheck_room(room.jid) then
+        return;
+    end
+
+    -- mod_room_metadata_component initializes this table at priority -1,
+    -- so run after it.
+    if not room.jitsiMetadata then
+        room.jitsiMetadata = {};
+    end
+
+    room.jitsiMetadata.asyncTranscription = true;
+
+    module:log('info', 'Forced asyncTranscription=true for room %s', room.jid);
+end, -2); -- priority -2: after room_metadata_component (-1)
+"""
+
+
+@dataclass(frozen=True)
+class Proposal:
+    """A ``<target>.new`` file that remedies one check, or why none can be made."""
+
+    check_id: str
+    summary: str
+    target: Path | None = None
+    new_text: str = ""
+    reason: str = ""
+    #: Unit to restart once the proposal is installed ("jicofo", "prosody", "").
+    unit: str = ""
+    notes: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class WriteResult:
+    proposal: Proposal
+    path: Path | None = None
+    error: str = ""
+
+
+def normalize_bridge_url(value: str) -> tuple[str | None, str]:
+    """Turn ``--bridge-url`` into a Jicofo template, or explain why it cannot.
+
+    A bare origin gains the route and the ``sessionId`` parameter; a value that
+    already carries ``{{MEETING_ID}}`` is kept verbatim.
+    """
+    value = value.strip()
+    if not value:
+        return None, "empty value"
+    if "{{MEETING_ID}}" in value:
+        template = value
+    elif value.startswith(("ws://", "wss://")):
+        base = value.rstrip("/")
+        route = "" if base.endswith(WEBSOCKET_PATH) else WEBSOCKET_PATH
+        template = f"{base}{route}?sessionId={{{{MEETING_ID}}}}"
+    else:
+        return None, (
+            "must be a ws:// or wss:// URL, or a full template containing {{MEETING_ID}}"
+        )
+    report = analyze_template(template, DEFAULT_SESSION_ID)
+    if report.errors:
+        return None, "; ".join(report.errors)
+    return template, ""
+
+
+def hocon_transcription_block(template: str) -> str:
+    """The jicofo.conf snippet that configures the transcriber connect."""
+    return (
+        f"// {PROPOSAL_BANNER}\n"
+        "// Review, then install it with the commands printed by the tool.\n"
+        "jicofo {\n"
+        "  transcription {\n"
+        f'    url-template = "{template}"\n'
+        "    ping {\n"
+        "      enabled = true\n"
+        "      interval = 10 seconds\n"
+        "      timeout = 3 seconds\n"
+        "    }\n"
+        "  }\n"
+        "}\n"
+    )
+
+
+def append_to_file_text(original: str, addition: str) -> str:
+    """Append *addition* to *original*, separated by a blank line."""
+    if not original:
+        return addition
+    if original.endswith("\n"):
+        return f"{original}\n{addition}"
+    return f"{original}\n\n{addition}"
+
+
+def _line_indent(text: str, index: int) -> str:
+    """The leading whitespace of the line containing *index*."""
+    line_start = text.rfind("\n", 0, index) + 1
+    line = text[line_start:index]
+    return line[: len(line) - len(line.lstrip())]
+
+
+def add_lua_modules(text: str, span: tuple[int, int], names: Sequence[str]) -> str:
+    """Insert ``"name";`` entries before the closing brace of a Lua table.
+
+    Lua accepts ``,`` and ``;`` interchangeably, so the new entries always use
+    ``;``; a missing separator on the previous entry is repaired so the table
+    stays valid.  Nothing is deleted, so comments in the table survive.
+    """
+    start, end = span
+    closing_indent = _line_indent(text, end)
+    insert_at = end
+    while insert_at > start and text[insert_at - 1] in " \t\r\n":
+        insert_at -= 1
+    separator = ";" if insert_at > start and text[insert_at - 1] not in ",;{" else ""
+    indent = closing_indent + "    "
+    entries = "".join(f'\n{indent}"{name}";' for name in names)
+    # The text between the insertion point and the brace is whitespace only
+    # (that is how the insertion point was found), so dropping it just puts the
+    # closing brace back on its own line.
+    return text[:insert_at] + separator + entries + f"\n{closing_indent}" + text[end:]
+
+
+def add_js_property(text: str, span: tuple[int, int], snippet: str) -> str:
+    """Insert *snippet* as the last property of the object at *span*."""
+    start, end = span
+    closing_indent = _line_indent(text, end)
+    insert_at = end
+    while insert_at > start and text[insert_at - 1] in " \t\r\n":
+        insert_at -= 1
+    separator = "," if insert_at > start and text[insert_at - 1] not in "{,;" else ""
+    indent = closing_indent + "    "
+    return (
+        text[:insert_at] + separator + f"\n{indent}{snippet}" + f"\n{closing_indent}" + text[end:]
+    )
+
+
+def prosody_module_source() -> str:
+    """The module file to install, prefixed with a review banner."""
+    banner = "\n".join(f"-- {line}" for line in (PROPOSAL_BANNER, "Review, then install it."))
+    return f"{banner}\n\n{PROSODY_MODULE_LUA}"
+
+
+def propose_jicofo_fix(
+    deployment: Deployment,
+    custom_conf: Path,
+    *,
+    bridge_url: str | None,
+    read: Callable[[Path], str | None] = _read,
+) -> list[Proposal]:
+    """Propose the transcription block when Jicofo has no usable template."""
+    if deployment.jicofo_conf is None:
+        return []
+    template = hocon_str(deployment.hocon, "jicofo.transcription.url-template")
+    if template and not analyze_template(template, DEFAULT_SESSION_ID).errors:
+        return []
+    if template and "${" in template:
+        return [Proposal(
+            "jicofo.url-template", "the url-template is built from an environment substitution",
+            reason="its value is resolved when Jicofo starts, so the tool will not rewrite it; "
+                   "check it by hand or with --only probe",
+        )]
+    if not bridge_url:
+        return [Proposal(
+            "jicofo.url-template", "no usable jicofo.transcription.url-template",
+            reason="pass --bridge-url ws://<bridge-host>:<port> to have the template proposed",
+        )]
+    normalized, problem = normalize_bridge_url(bridge_url)
+    if normalized is None:
+        return [Proposal(
+            "jicofo.url-template", "the --bridge-url value is unusable",
+            reason=f"--bridge-url: {problem}",
+        )]
+
+    jicofo_text = read(deployment.jicofo_conf) or ""
+    includes = parse_hocon(jicofo_text, deployment.jicofo_conf)[1]
+    includes_custom = any(Path(target).name == custom_conf.name for target in includes)
+    custom_text = read(custom_conf) or ""
+    already = hocon_str(
+        HoconDocument(values=parse_hocon(custom_text, custom_conf)[0]),
+        "jicofo.transcription.url-template",
+    )
+    proposals: list[Proposal] = []
+    if not already:
+        custom_new = append_to_file_text(custom_text, hocon_transcription_block(normalized))
+        resolved = hocon_str(
+            HoconDocument(values=parse_hocon(custom_new, custom_conf)[0]),
+            "jicofo.transcription.url-template",
+        )
+        if resolved != normalized:
+            return [Proposal(
+                "jicofo.url-template", "the proposed block would not take effect",
+                reason=f"{custom_conf} already ends with a value that wins over the appended "
+                       "block; edit it by hand",
+            )]
+        proposals.append(Proposal(
+            "jicofo.url-template",
+            f"add the transcription block to {custom_conf.name}",
+            target=custom_conf, new_text=custom_new, unit="jicofo",
+            notes=(f"url-template = {normalized}",),
+        ))
+    if not includes_custom:
+        proposals.append(Proposal(
+            "jicofo.url-template",
+            f'include {custom_conf.name} from {deployment.jicofo_conf.name}',
+            target=deployment.jicofo_conf,
+            new_text=append_to_file_text(jicofo_text, f'include "{custom_conf.name}"\n'),
+            unit="jicofo",
+            notes=(
+                f"{custom_conf} already defines a template; it is kept as it is"
+                if already
+                else "HOCON ignores a plain include of a missing file, so the line is safe "
+                     "to add even before the custom file exists",
+            ),
+        ))
+    return proposals
+
+
+def propose_prosody_fixes(
+    deployment: Deployment,
+    plugin_dirs: Sequence[Path],
+    *,
+    read: Callable[[Path], str | None] = _read,
+) -> list[Proposal]:
+    """Propose enabling the module that forces asyncTranscription."""
+    text = deployment.prosody_text
+    if text is None:
+        return []
+    body = lua_uncomment(text)
+    blocks = find_lua_blocks(body)
+    main_muc = find_main_muc(blocks, deployment.domain)
+    if main_muc is None:
+        return []
+
+    modules = lua_module_names(main_muc.body)
+    forcing, _ = module_files_for(modules, plugin_dirs, read)
+    proposals: list[Proposal] = []
+    enable: list[str] = []
+    if not forcing:
+        available = forcing_candidates(plugin_dirs, read)
+        if available:
+            name, path = available[0]
+            enable.append(name)
+            module_note = (
+                f"{path} already sets asyncTranscription; enabling it avoids a second module"
+            )
+        else:
+            enable.append(PROSODY_MODULE_NAME)
+            module_note = (
+                f"the module goes in {plugin_dirs[0] if plugin_dirs else 'a plugin path'}"
+            )
+            writable = next(
+                (directory for directory in plugin_dirs
+                 if directory.is_dir() and os.access(directory, os.W_OK)),
+                next((directory for directory in plugin_dirs if directory.is_dir()),
+                     plugin_dirs[0] if plugin_dirs else Path(".")),
+            )
+            proposals.append(Proposal(
+                "prosody.force_async_transcription",
+                f"install mod_{PROSODY_MODULE_NAME}.lua",
+                target=writable / f"mod_{PROSODY_MODULE_NAME}.lua",
+                new_text=prosody_module_source(), unit="prosody",
+                notes=(module_note,),
+            ))
+    if "muc_meeting_id" not in modules:
+        enable.append("muc_meeting_id")
+    if not enable:
+        return proposals
+
+    span = lua_table_span(main_muc.body, "modules_enabled")
+    if span is None:
+        proposals.append(Proposal(
+            "prosody.modules_enabled", f'cannot add {", ".join(enable)} automatically',
+            reason=f'"{main_muc.name}" has no modules_enabled table, and creating one would '
+                   "replace Prosody's global module list rather than extend it; add the "
+                   "module names by hand",
+        ))
+        return proposals
+    absolute = (main_muc.start + span[0], main_muc.start + span[1])
+    proposals.append(Proposal(
+        "prosody.modules_enabled",
+        f'enable {", ".join(enable)} on "{main_muc.name}"',
+        target=deployment.prosody_config,
+        new_text=add_lua_modules(text, absolute, enable),
+        unit="prosody",
+        notes=(module_note,),
+    ))
+    return proposals
+
+
+def propose_meet_fix(deployment: Deployment) -> list[Proposal]:
+    """Propose enabling transcription in the jitsi-meet client config."""
+    text = deployment.meet_text
+    if text is None:
+        return []
+    stripped = strip_js_comments(text)
+    object_span = find_js_object_span(stripped, "transcription")
+    if object_span is not None:
+        body = stripped[object_span[0] : object_span[1]]
+        value = js_boolean(body, "enabled")
+        if value is True:
+            return []
+        if value is False:
+            found = re.search(r"[\"']?enabled[\"']?\s*:\s*false\b", body)
+            if found is None:  # pragma: no cover - js_boolean found it
+                return []
+            at = object_span[0] + found.end() - len("false")
+            return [Proposal(
+                "meet.transcription.enabled", "set transcription.enabled to true",
+                target=deployment.meet_config,
+                new_text=text[:at] + "true" + text[at + len("false") :],
+                notes=("the existing value is flipped in place, so no duplicate key appears",),
+            )]
+        if re.search(r"[\"']?enabled[\"']?\s*:", body):
+            return [Proposal(
+                "meet.transcription.enabled", "transcription.enabled is not a literal value",
+                reason="enabled is computed at run time, so the tool will not rewrite it",
+            )]
+        return [Proposal(
+            "meet.transcription.enabled", "add enabled: true to the transcription object",
+            target=deployment.meet_config,
+            new_text=add_js_property(text, object_span, "enabled: true,"),
+            notes=("the transcription object already exists; the key is added to it",),
+        )]
+
+    config_span = find_js_var_object_span(stripped, "config")
+    if config_span is None:
+        return [Proposal(
+            "meet.transcription.enabled", "no unique `var config = { … }` object",
+            reason="the tool cannot find exactly one top-level config object; add "
+                   "`transcription: { enabled: true },` by hand",
+        )]
+    notes = ()
+    if find_js_object(text, "transcription") is not None:
+        notes = ("the shipped transcription block is commented out; a fresh live block is "
+                 "inserted instead of uncommenting it, so the commented text is untouched",)
+    return [Proposal(
+        "meet.transcription.enabled", "insert `transcription: { enabled: true },`",
+        target=deployment.meet_config,
+        new_text=add_js_property(text, config_span, "transcription: { enabled: true },"),
+        notes=notes,
+    )]
+
+
+def write_proposal(
+    proposal: Proposal, *, output_dir: Path | None = None, force: bool = False
+) -> WriteResult:
+    """Write ``<target>.new``; the target itself is only ever read."""
+    if proposal.target is None or not proposal.new_text:
+        return WriteResult(proposal, error=proposal.reason or "nothing to propose")
+    try:
+        target = proposal.target.resolve()
+    except OSError:
+        target = proposal.target
+
+    if output_dir is not None:
+        try:
+            output_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            return WriteResult(proposal, error=f"cannot create {output_dir}: {exc}")
+        destination = output_dir / (target.name + PROPOSAL_SUFFIX)
+        counter = 1
+        while destination.exists():
+            counter += 1
+            destination = output_dir / f"{target.name}.{counter}{PROPOSAL_SUFFIX}"
+    else:
+        destination = target.with_name(target.name + PROPOSAL_SUFFIX)
+
+    flags = os.O_WRONLY | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    flags |= os.O_TRUNC if force else os.O_EXCL
+    try:
+        handle_fd = os.open(destination, flags, 0o600)
+    except FileExistsError:
+        return WriteResult(proposal, error=f"{destination} already exists — review it, remove "
+                                           "it, or pass --force-fix")
+    except OSError as exc:
+        hint = ""
+        if exc.errno in (getattr(os, "EACCES", 13), getattr(os, "EPERM", 1)):
+            hint = " — rerun with sudo, or pass --output-dir to stage it elsewhere"
+        return WriteResult(proposal, error=f"cannot write {destination}: {exc}{hint}")
+    try:
+        with os.fdopen(handle_fd, "w", encoding="utf-8") as handle:
+            handle.write(proposal.new_text)
+        mode = target.stat().st_mode & 0o777 if target.exists() else 0o644
+        os.chmod(destination, mode)
+    except OSError as exc:
+        return WriteResult(proposal, error=f"cannot write {destination}: {exc}")
+    return WriteResult(proposal, path=destination)
+
+
+def apply_commands(proposal: Proposal, new_path: Path) -> list[str]:
+    """The follow-up commands for one written proposal."""
+    target = proposal.target
+    commands = []
+    if target is not None and target.exists():
+        commands.append(f"diff -u {target} {new_path}")
+    else:
+        commands.append(f"less {new_path}")
+    commands.append(f"sudo mv {new_path} {target}")
+    if proposal.unit:
+        commands.append(f"sudo systemctl restart {proposal.unit}")
+    return commands
 
 
 # --------------------------------------------------------------------------
@@ -1391,22 +1890,77 @@ def plugin_dirs_for(args: argparse.Namespace, prosody_text: str | None) -> list[
     return unique
 
 
+def custom_jicofo_path(deployment: Deployment) -> Path:
+    """Where an admin's Jicofo overrides live.
+
+    A relative include resolves against the including file, so the custom file
+    sits beside the config that includes it.
+    """
+    if deployment.jicofo_conf is not None:
+        return deployment.jicofo_conf.parent / "custom-jicofo.conf"
+    return DEFAULT_CUSTOM_JICOFO_CONF
+
+
 def run_config_section(deployment: Deployment, args: argparse.Namespace) -> Section:
     section = Section("config")
     plugin_dirs = plugin_dirs_for(args, deployment.prosody_text)
-    # A relative include resolves against the including file, so that is where
-    # the custom file an admin would edit lives.
-    custom_conf = (
-        deployment.jicofo_conf.parent / "custom-jicofo.conf"
-        if deployment.jicofo_conf
-        else DEFAULT_CUSTOM_JICOFO_CONF
+    section.checks.extend(
+        check_jicofo(deployment, args.session_id, custom_jicofo_path(deployment))
     )
-    section.checks.extend(check_jicofo(deployment, args.session_id, custom_conf))
     section.checks.extend(
         check_prosody(deployment, deployment.domain, plugin_dirs, _read)
     )
     section.checks.extend(check_meet_config(deployment))
     section.checks.extend(check_jvb(deployment))
+    return section
+
+
+def run_fix_section(
+    deployment: Deployment, args: argparse.Namespace, config_checks: Sequence[Check]
+) -> Section:
+    """Write ``<file>.new`` proposals for the failed, fixable checks."""
+    section = Section("fix")
+    actionable = {
+        check.id for check in config_checks if check.status in (Status.FAIL, Status.WARN)
+    }
+    plugin_dirs = plugin_dirs_for(args, deployment.prosody_text)
+    proposals: list[Proposal] = []
+    if "jicofo.url-template" in actionable or "jicofo.custom-conf" in actionable:
+        proposals.extend(propose_jicofo_fix(
+            deployment, custom_jicofo_path(deployment), bridge_url=args.bridge_url
+        ))
+    if actionable & {"prosody.force_async_transcription", "prosody.muc_meeting_id"}:
+        proposals.extend(propose_prosody_fixes(deployment, plugin_dirs))
+    if "meet.transcription.enabled" in actionable:
+        proposals.extend(propose_meet_fix(deployment))
+
+    if not proposals:
+        section.checks.append(Check(
+            "fix", Status.PASS, "nothing to propose: every fixable check passed"
+        ))
+        return section
+
+    output_dir = Path(args.output_dir) if args.output_dir else None
+    wrote = False
+    for proposal in proposals:
+        result = write_proposal(proposal, output_dir=output_dir, force=args.force_fix)
+        if result.path is None:
+            section.checks.append(Check(
+                proposal.check_id, Status.SKIP, result.error,
+                detail="\n".join(proposal.notes),
+            ))
+            continue
+        wrote = True
+        section.checks.append(Check(
+            proposal.check_id, Status.PROPOSED, f"{proposal.summary} — {result.path}",
+            detail="\n".join(proposal.notes),
+            fix="\n".join(apply_commands(proposal, result.path)),
+        ))
+    if wrote:
+        section.notes.append(
+            "the originals are untouched and the deployment is still broken until the "
+            ".new files are installed"
+        )
     return section
 
 
@@ -1523,17 +2077,22 @@ def render(sections: Sequence[Section]) -> None:
             if check.detail:
                 for line in check.detail.splitlines():
                     print(f"          {line}")
-            if check.fix and check.status in (Status.FAIL, Status.WARN):
+            if check.fix and check.status in (Status.FAIL, Status.WARN, Status.PROPOSED):
                 for index, line in enumerate(check.fix.splitlines()):
                     prefix = "          fix: " if index == 0 else "               "
                     print(f"{prefix}{line}")
+        for note in section.notes:
+            print(f"  note: {note}")
         counts: dict[Status, int] = dict.fromkeys(Status, 0)
         for check in section.checks:
             counts[check.status] += 1
-        print(
+        summary = (
             f"  {counts[Status.PASS]} passed, {counts[Status.FAIL]} failed, "
             f"{counts[Status.WARN]} warning(s), {counts[Status.SKIP]} skipped"
         )
+        if counts[Status.PROPOSED]:
+            summary += f", {counts[Status.PROPOSED]} proposed"
+        print(summary)
 
 
 def exit_code(sections: Sequence[Section]) -> int:
@@ -1550,8 +2109,30 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--only",
         action="append",
-        choices=["config", "probe", "logs", "all"],
+        choices=["config", "fix", "probe", "logs", "all"],
         help="section(s) to run; repeatable (default: config)",
+    )
+    parser.add_argument(
+        "--fix",
+        action="store_true",
+        help="write <file>.new proposals for the fixable failed checks; nothing is applied",
+    )
+    parser.add_argument(
+        "--bridge-url",
+        metavar="URL",
+        help="the bridge origin (ws://host:port) or a full template containing "
+             "{{MEETING_ID}}, used by --fix to build the Jicofo template",
+    )
+    parser.add_argument(
+        "--output-dir",
+        metavar="PATH",
+        help="write the .new proposals here instead of beside their targets "
+             "(implies --fix)",
+    )
+    parser.add_argument(
+        "--force-fix",
+        action="store_true",
+        help="overwrite an existing .new proposal",
     )
     parser.add_argument("--domain", help="the Jitsi domain, when several are configured")
     parser.add_argument("--jicofo-conf", metavar="PATH")
@@ -1582,6 +2163,17 @@ def main(argv: list[str] | None = None) -> int:
     sections_wanted = args.only or ["config"]
     if "all" in sections_wanted:
         sections_wanted = ["config", "probe", "logs"]
+    if (args.fix or args.output_dir or args.force_fix) and "fix" not in sections_wanted:
+        sections_wanted.append("fix")
+    if "fix" in sections_wanted and "config" not in sections_wanted:
+        sections_wanted.insert(0, "config")
+
+    if args.bridge_url is not None:
+        normalized, problem = normalize_bridge_url(args.bridge_url)
+        if normalized is None:
+            print(f"error: --bridge-url: {problem}", file=sys.stderr)
+            return 2
+        args.bridge_url = normalized
 
     try:
         deployment = load_deployment(args, require_files="config" in sections_wanted)
@@ -1602,8 +2194,13 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  note: {note}")
 
     sections: list[Section] = []
+    config_checks: list[Check] = []
     if "config" in sections_wanted:
-        sections.append(run_config_section(deployment, args))
+        config_section = run_config_section(deployment, args)
+        config_checks = config_section.checks
+        sections.append(config_section)
+    if "fix" in sections_wanted:
+        sections.append(run_fix_section(deployment, args, config_checks))
     if "probe" in sections_wanted:
         sections.append(run_probe_section(deployment, args))
     if "logs" in sections_wanted:

@@ -20,13 +20,17 @@ import pytest
 
 from tools import verify_jitsi
 from tools.verify_jitsi import (
+    PROSODY_MODULE_LUA,
     Check,
     Deployment,
     DiscoveryError,
     HoconDocument,
     Section,
     Status,
+    add_js_property,
+    add_lua_modules,
     analyze_template,
+    append_to_file_text,
     check_jicofo,
     check_meet_config,
     check_prosody,
@@ -34,18 +38,28 @@ from tools.verify_jitsi import (
     classify_jvb,
     exit_code,
     find_js_object,
+    find_js_var_object_span,
     find_lua_blocks,
     hocon_bool,
     hocon_duration,
     hocon_str,
+    hocon_transcription_block,
     js_boolean,
     load_deployment,
+    load_hocon,
     lua_module_names,
     lua_sets_async_transcription,
+    lua_string_list,
     lua_table,
+    lua_table_span,
     lua_uncomment,
+    normalize_bridge_url,
     parse_hocon,
+    propose_jicofo_fix,
+    propose_meet_fix,
+    propose_prosody_fixes,
     strip_js_comments,
+    write_proposal,
 )
 
 # --------------------------------------------------------------------------
@@ -312,10 +326,11 @@ def test_template_requires_the_meeting_id_placeholder() -> None:
 
 
 def _deployment(*, prosody_text: str | None = None, meet_text: str | None = None,
-                hocon: HoconDocument | None = None) -> Deployment:
+                hocon: HoconDocument | None = None,
+                jicofo_conf: Path | None = Path("jicofo.conf")) -> Deployment:
     return Deployment(
         domain="meet.example.com",
-        jicofo_conf=Path("jicofo.conf"),
+        jicofo_conf=jicofo_conf,
         prosody_config=Path("meet.example.com.cfg.lua"),
         meet_config=Path("meet.example.com-config.js"),
         jvb_conf=None,
@@ -540,3 +555,440 @@ def test_script_runs_from_any_directory(tmp_path: Path) -> None:
     )
     assert result.returncode == 0, result.stderr
     assert "--only" in result.stdout
+
+
+# --------------------------------------------------------------------------
+# Fix proposals: text surgery
+# --------------------------------------------------------------------------
+
+
+def test_normalize_bridge_url_builds_the_documented_template() -> None:
+    template, problem = normalize_bridge_url("ws://bridge.example.com:8080")
+    assert problem == ""
+    assert template == "ws://bridge.example.com:8080/transcribe?sessionId={{MEETING_ID}}"
+    # A trailing slash, or the route already given, must not double up.
+    assert normalize_bridge_url("ws://h:1/")[0] == "ws://h:1/transcribe?sessionId={{MEETING_ID}}"
+    assert normalize_bridge_url("ws://h:1/transcribe")[0] == (
+        "ws://h:1/transcribe?sessionId={{MEETING_ID}}"
+    )
+    # A full template is kept verbatim.
+    full = "wss://h/transcribe?sessionId={{MEETING_ID}}&x=1"
+    assert normalize_bridge_url(full) == (full, "")
+
+
+@pytest.mark.parametrize("value", ["", "bridge.example.com:8080", "http://h/transcribe"])
+def test_normalize_bridge_url_rejects_unusable_values(value: str) -> None:
+    template, problem = normalize_bridge_url(value)
+    assert template is None and problem
+
+
+def test_hocon_block_parses_back_to_the_intended_settings() -> None:
+    block = hocon_transcription_block("ws://bridge/transcribe?sessionId={{MEETING_ID}}")
+    document = _document(block)
+    assert hocon_str(document, "jicofo.transcription.url-template") == (
+        "ws://bridge/transcribe?sessionId={{MEETING_ID}}"
+    )
+    assert hocon_bool(document, "jicofo.transcription.ping.enabled") is True
+    assert hocon_duration(document, "jicofo.transcription.ping.interval") == 10.0
+
+
+def test_append_to_file_text_keeps_one_separating_blank_line() -> None:
+    assert append_to_file_text("", "x\n") == "x\n"
+    assert append_to_file_text("a\n", "x\n") == "a\n\nx\n"
+    assert append_to_file_text("a", "x\n") == "a\n\nx\n"
+
+
+def test_add_lua_modules_rewrites_an_inline_table_legibly() -> None:
+    original = 'Component "conference.meet.example.com" "muc"\n    modules_enabled = { "a"; }\n'
+    span = lua_table_span(original, "modules_enabled")
+    assert span is not None
+    result = add_lua_modules(original, span, ["b"])
+    assert result == (
+        'Component "conference.meet.example.com" "muc"\n'
+        '    modules_enabled = { "a";\n        "b";\n    }\n'
+    )
+    table = lua_table(result.split("\n", 1)[1], "modules_enabled")
+    assert lua_string_list(table) == ["a", "b"]
+
+
+def test_add_lua_modules_repairs_a_missing_separator_and_keeps_comments() -> None:
+    original = 'x = {\n    "a" -- keep me\n}\n'
+    span = lua_table_span(original, "x")
+    assert span is not None
+    result = add_lua_modules(original, span, ["b"])
+    assert '"a";' in result or '"a" -- keep me' in result
+    assert "-- keep me" in result
+    assert '"b";' in result
+
+
+def test_add_js_property_handles_multiline_empty_and_missing_comma() -> None:
+    multiline = "var config = {\n    url: 'x',\n};\n"
+    span = find_js_var_object_span(strip_js_comments(multiline))
+    assert span is not None
+    assert add_js_property(multiline, span, "transcription: { enabled: true },") == (
+        "var config = {\n    url: 'x',\n    transcription: { enabled: true },\n};\n"
+    )
+
+    empty = "var config = {};\n"
+    span = find_js_var_object_span(strip_js_comments(empty))
+    assert span is not None
+    assert add_js_property(empty, span, "a: 1,") == "var config = {\n    a: 1,\n};\n"
+
+    no_comma = "var config = { url: 'x' };\n"
+    span = find_js_var_object_span(strip_js_comments(no_comma))
+    assert span is not None
+    assert add_js_property(no_comma, span, "a: 1,") == (
+        "var config = { url: 'x',\n    a: 1,\n};\n"
+    )
+
+
+def test_find_js_var_object_span_requires_exactly_one_candidate() -> None:
+    assert find_js_var_object_span("var config = { a: 1 };") is not None
+    assert find_js_var_object_span("var other = { a: 1 };") is None
+    assert find_js_var_object_span("var config = { a: 1 }; var config = { b: 2 };") is None
+
+
+def test_module_source_matches_the_documented_module() -> None:
+    docs = (Path(__file__).resolve().parent.parent / "docs" / "jitsi-integration.md").read_text()
+    marker = "Create `mod_force_async_transcription.lua`"
+    fence = docs.split(marker, 1)[1].split("```lua", 1)[1].split("```", 1)[0]
+    assert fence.strip() == PROSODY_MODULE_LUA.strip()
+
+
+# --------------------------------------------------------------------------
+# Fix proposals: the builders
+# --------------------------------------------------------------------------
+
+
+def _reader(files: dict[Path, str]):
+    return lambda path: files.get(Path(path))
+
+
+def test_propose_jicofo_needs_a_bridge_url() -> None:
+    (proposal,) = propose_jicofo_fix(
+        _deployment(), Path("/nonexistent/custom-jicofo.conf"), bridge_url=None
+    )
+    assert proposal.target is None
+    assert "--bridge-url" in proposal.reason
+
+
+def test_propose_jicofo_appends_to_the_included_custom_file() -> None:
+    jicofo = 'jicofo {\n  conference { x = 1 }\n}\ninclude "custom-jicofo.conf"\n'
+    custom = Path("/etc/jitsi/jicofo/custom-jicofo.conf")
+    deployment = _deployment(hocon=_document(jicofo, Path("/etc/jitsi/jicofo/jicofo.conf")))
+    proposals = propose_jicofo_fix(
+        deployment, custom, bridge_url="ws://bridge:8080",
+        read=_reader({Path("jicofo.conf"): jicofo}),
+    )
+    (proposal,) = proposals
+    assert proposal.target == custom
+    assert proposal.unit == "jicofo"
+    merged = parse_hocon(proposal.new_text, custom)[0]
+    assert hocon_str(HoconDocument(values=merged), "jicofo.transcription.url-template") == (
+        "ws://bridge:8080/transcribe?sessionId={{MEETING_ID}}"
+    )
+
+
+def test_propose_jicofo_adds_the_include_when_it_is_missing() -> None:
+    jicofo = "jicofo {\n  conference { x = 1 }\n}\n"
+    jicofo_path = Path("/etc/jitsi/jicofo/jicofo.conf")
+    custom = Path("/etc/jitsi/jicofo/custom-jicofo.conf")
+    deployment = _deployment(hocon=_document(jicofo, jicofo_path), jicofo_conf=jicofo_path)
+    proposals = propose_jicofo_fix(
+        deployment, custom, bridge_url="ws://bridge:8080",
+        read=_reader({jicofo_path: jicofo, custom: ""}),
+    )
+    assert [p.target for p in proposals] == [custom, jicofo_path]
+    assert 'include "custom-jicofo.conf"' in proposals[1].new_text
+
+
+def test_propose_jicofo_is_silent_when_a_live_template_exists() -> None:
+    document = _document(
+        'jicofo { transcription { url-template = "ws://bridge/transcribe?sessionId='
+        '{{MEETING_ID}}" } }'
+    )
+    assert propose_jicofo_fix(
+        _deployment(hocon=document), Path("/nonexistent"), bridge_url="ws://x:1"
+    ) == []
+
+
+def test_propose_jicofo_keeps_an_existing_custom_template(tmp_path: Path) -> None:
+    custom = tmp_path / "custom-jicofo.conf"
+    custom.write_text('jicofo.transcription.url-template = "ws://already/t?sessionId=x"\n')
+    jicofo_path = tmp_path / "jicofo.conf"
+    jicofo_path.write_text("jicofo { conference { x = 1 } }\n")
+    deployment = _deployment(hocon=load_hocon(jicofo_path), jicofo_conf=jicofo_path)
+    proposals = propose_jicofo_fix(deployment, custom, bridge_url="ws://bridge:8080")
+    assert [p.target for p in proposals] == [jicofo_path]
+    assert "already" in proposals[0].notes[0]
+
+
+def test_propose_prosody_writes_the_module_and_the_site_config(tmp_path: Path) -> None:
+    plugin_dir = tmp_path / "plugins"
+    plugin_dir.mkdir()
+    deployment = _deployment(prosody_text=PROSODY)
+    proposals = propose_prosody_fixes(deployment, [plugin_dir], read=_reader({}))
+    by_name = {p.target.name: p for p in proposals}
+    assert set(by_name) == {"mod_force_async_transcription.lua", "meet.example.com.cfg.lua"}
+    module = by_name["mod_force_async_transcription.lua"]
+    assert PROSODY_MODULE_LUA.splitlines()[1] in module.new_text
+    site = by_name["meet.example.com.cfg.lua"]
+    assert '"force_async_transcription";' in site.new_text
+    assert site.unit == "prosody"
+
+
+def test_propose_prosody_enables_an_existing_module_instead_of_adding_one(
+    tmp_path: Path,
+) -> None:
+    plugin_dir = tmp_path / "plugins"
+    plugin_dir.mkdir()
+    existing = plugin_dir / "mod_our_own.lua"
+    existing.write_text("room.jitsiMetadata.asyncTranscription = true;\n")
+    deployment = _deployment(prosody_text=PROSODY)
+    proposals = propose_prosody_fixes(
+        deployment, [plugin_dir], read=_reader({existing: existing.read_text()})
+    )
+    (proposal,) = proposals
+    assert proposal.target.name == "meet.example.com.cfg.lua"
+    assert '"our_own";' in proposal.new_text
+    assert "mod_force_async_transcription" not in proposal.new_text
+
+
+def test_propose_prosody_is_blocked_without_a_modules_enabled_table() -> None:
+    text = (
+        'VirtualHost "meet.example.com"\n'
+        'Component "conference.meet.example.com" "muc"\n'
+        "    main_muc = \"conference.meet.example.com\"\n"
+    )
+    proposals = propose_prosody_fixes(_deployment(prosody_text=text), [Path("/nonexistent")])
+    blocked = [p for p in proposals if p.target is None]
+    assert blocked, "the site config cannot be edited without a modules_enabled table"
+    assert "global module list" in blocked[0].reason
+    # The module file itself can still be proposed; only the splice is blocked.
+    assert any(p.target is not None for p in proposals)
+
+
+def test_propose_meet_inserts_into_the_config_object() -> None:
+    (proposal,) = propose_meet_fix(_deployment(meet_text=COMMENTED_CLIENT))
+    assert proposal.target is not None
+    assert "commented out" in proposal.notes[0]
+    assert js_boolean(
+        find_js_object(strip_js_comments(proposal.new_text), "transcription"), "enabled"
+    ) is True
+    # The commented sample is still there, untouched.
+    assert "//     enabled: false," in proposal.new_text
+
+
+def test_propose_meet_flips_a_live_false_without_duplicating_the_key() -> None:
+    text = "var config = {\n    transcription: { enabled: false },\n};\n"
+    (proposal,) = propose_meet_fix(_deployment(meet_text=text))
+    assert proposal.new_text.count("transcription:") == 1
+    assert "enabled: true" in proposal.new_text
+
+
+def test_propose_meet_is_silent_when_enabled_and_blocked_when_ambiguous() -> None:
+    assert propose_meet_fix(_deployment(meet_text=LIVE_CLIENT)) == []
+    (proposal,) = propose_meet_fix(_deployment(meet_text="var notAConfig = {};\n"))
+    assert proposal.target is None and proposal.reason
+
+
+# --------------------------------------------------------------------------
+# Fix proposals: idempotency and "the proposal fixes the check"
+# --------------------------------------------------------------------------
+
+
+def test_proposals_satisfy_the_checks_they_address(tmp_path: Path) -> None:
+    plugin_dir = tmp_path / "plugins"
+    plugin_dir.mkdir()
+    (plugin_dir / "mod_force_async_transcription.lua").write_text(PROSODY_MODULE_LUA)
+
+    prosody_proposals = propose_prosody_fixes(
+        _deployment(prosody_text=PROSODY), [plugin_dir], read=_reader({})
+    )
+    site = next(p for p in prosody_proposals if p.target and p.target.suffix == ".lua"
+                and not p.target.name.startswith("mod_"))
+    checks = check_prosody(
+        _deployment(prosody_text=site.new_text), "meet.example.com", [plugin_dir],
+        _reader({plugin_dir / "mod_force_async_transcription.lua": PROSODY_MODULE_LUA}),
+    )
+    assert _status(checks, "prosody.force_async_transcription") is Status.PASS
+
+    meet_proposal = propose_meet_fix(_deployment(meet_text=COMMENTED_CLIENT))[0]
+    checks = check_meet_config(_deployment(meet_text=meet_proposal.new_text))
+    assert _status(checks, "meet.transcription.enabled") is Status.PASS
+
+
+def test_running_the_builders_on_their_own_output_proposes_nothing(tmp_path: Path) -> None:
+    meet_proposal = propose_meet_fix(_deployment(meet_text=COMMENTED_CLIENT))[0]
+    assert propose_meet_fix(_deployment(meet_text=meet_proposal.new_text)) == []
+
+    # Once the site config enables a module that really exists in the plugin
+    # path, the Prosody builder has nothing left to propose either.
+    plugin_dir = tmp_path / "plugins"
+    plugin_dir.mkdir()
+    module = plugin_dir / "mod_force_async_transcription.lua"
+    module.write_text(PROSODY_MODULE_LUA)
+    reader = _reader({module: PROSODY_MODULE_LUA})
+    without = PROSODY.replace('        "force_async_transcription";\n', "")
+    (site_proposal,) = propose_prosody_fixes(
+        _deployment(prosody_text=without), [plugin_dir], read=reader
+    )
+    assert '"force_async_transcription";' in site_proposal.new_text
+    assert propose_prosody_fixes(
+        _deployment(prosody_text=site_proposal.new_text), [plugin_dir], read=reader
+    ) == []
+
+
+# --------------------------------------------------------------------------
+# Fix proposals: the writer
+# --------------------------------------------------------------------------
+
+
+def _proposal_for(target: Path, text: str = "new content\n") -> verify_jitsi.Proposal:
+    return verify_jitsi.Proposal(
+        check_id="test", summary="test", target=target, new_text=text
+    )
+
+
+def test_writer_writes_beside_the_original_and_leaves_it_alone(tmp_path: Path) -> None:
+    target = tmp_path / "jicofo.conf"
+    target.write_text("original\n")
+    target.chmod(0o640)
+    before = (target.read_bytes(), target.stat().st_mtime_ns)
+
+    result = write_proposal(_proposal_for(target))
+    assert result.path == tmp_path / "jicofo.conf.new"
+    assert result.path.read_text() == "new content\n"
+    assert result.path.stat().st_mode & 0o777 == 0o640
+    assert (target.read_bytes(), target.stat().st_mtime_ns) == before
+
+
+def test_writer_refuses_to_clobber_without_force(tmp_path: Path) -> None:
+    target = tmp_path / "jicofo.conf"
+    target.write_text("original\n")
+    (tmp_path / "jicofo.conf.new").write_text("earlier proposal\n")
+
+    result = write_proposal(_proposal_for(target))
+    assert result.path is None
+    assert "--force-fix" in result.error
+    assert (tmp_path / "jicofo.conf.new").read_text() == "earlier proposal\n"
+
+    result = write_proposal(_proposal_for(target), force=True)
+    assert result.path is not None
+    assert result.path.read_text() == "new content\n"
+
+
+def test_writer_follows_a_symlink_to_the_file_being_edited(tmp_path: Path) -> None:
+    conf_avail = tmp_path / "conf.avail"
+    conf_d = tmp_path / "conf.d"
+    conf_avail.mkdir()
+    conf_d.mkdir()
+    real = conf_avail / "meet.example.com.cfg.lua"
+    real.write_text("VirtualHost ...\n")
+    link = conf_d / "meet.example.com.cfg.lua"
+    link.symlink_to(real)
+
+    result = write_proposal(_proposal_for(link))
+    assert result.path == conf_avail / "meet.example.com.cfg.lua.new"
+    assert not (conf_d / "meet.example.com.cfg.lua.new").exists()
+
+
+def test_writer_uses_the_output_dir_and_reports_an_unwritable_one(tmp_path: Path) -> None:
+    target = tmp_path / "jicofo.conf"
+    target.write_text("original\n")
+    staging = tmp_path / "staging"
+    result = write_proposal(_proposal_for(target), output_dir=staging)
+    assert result.path == staging / "jicofo.conf.new"
+
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    locked.chmod(0o500)
+    try:
+        result = write_proposal(_proposal_for(target), output_dir=locked)
+        assert result.path is None
+        assert "sudo" in result.error or "output-dir" in result.error
+    finally:
+        locked.chmod(0o700)
+
+
+def test_writer_reports_a_blocked_proposal() -> None:
+    blocked = verify_jitsi.Proposal("x", "summary", reason="nothing to do")
+    result = write_proposal(blocked)
+    assert result.path is None and "nothing to do" in result.error
+
+
+# --------------------------------------------------------------------------
+# Fix proposals: the command line
+# --------------------------------------------------------------------------
+
+
+def _broken_tree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Path]:
+    meet = tmp_path / "meet"
+    conf_avail = tmp_path / "conf.avail"
+    plugins = tmp_path / "plugins"
+    for directory in (meet, conf_avail, plugins):
+        directory.mkdir()
+    jicofo = tmp_path / "jicofo.conf"
+    jicofo.write_text("jicofo {\n  transcription {\n    // url-template = \"ws://old/\"\n  }\n}\n")
+    prosody = conf_avail / "meet.example.com.cfg.lua"
+    prosody.write_text(
+        'VirtualHost "meet.example.com"\n'
+        '    modules_enabled = { "room_metadata"; }\n'
+        'Component "conference.meet.example.com" "muc"\n'
+        '    main_muc = "conference.meet.example.com"\n'
+        '    modules_enabled = { "muc_meeting_id"; }\n'
+        'Component "metadata.meet.example.com" "room_metadata_component"\n'
+    )
+    meet_config = meet / "meet.example.com-config.js"
+    meet_config.write_text("var config = {\n    url: 'x',\n};\n")
+    monkeypatch.setattr(verify_jitsi, "DEFAULT_MEET_DIR", meet)
+    monkeypatch.setattr(verify_jitsi, "DEFAULT_PROSODY_CONF_AVAIL", conf_avail)
+    monkeypatch.setattr(verify_jitsi, "DEFAULT_JICOFO_CONF", jicofo)
+    monkeypatch.setattr(verify_jitsi, "DEFAULT_JVB_CONF", tmp_path / "jvb.conf")
+    monkeypatch.setattr(verify_jitsi, "DEFAULT_PROSODY_MAIN", tmp_path / "prosody.cfg.lua")
+    monkeypatch.setattr(verify_jitsi, "DEFAULT_PROSODY_CONF_D", tmp_path / "conf.d")
+    return {"jicofo": jicofo, "prosody": prosody, "meet": meet_config, "plugins": plugins}
+
+
+def test_main_fix_stages_proposals_and_keeps_the_exit_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    tree = _broken_tree(tmp_path, monkeypatch)
+    staging = tmp_path / "staging"
+    code = verify_jitsi.main([
+        "--only", "fix", "--domain", "meet.example.com",
+        "--bridge-url", "ws://bridge.example.com:8080",
+        "--plugin-dir", str(tree["plugins"]),
+        "--output-dir", str(staging),
+    ])
+    out = capsys.readouterr().out
+    assert code == 1, "the deployment is still broken, so the exit status must stay 1"
+    assert "config" in out and "fix" in out, "--only fix must also run the config checks"
+    staged = {path.name for path in staging.iterdir()}
+    assert "jicofo.conf.new" in staged
+    assert "custom-jicofo.conf.new" in staged
+    assert "meet.example.com.cfg.lua.new" in staged
+    assert "mod_force_async_transcription.lua.new" in staged
+    assert "meet.example.com-config.js.new" in staged
+    assert "PROPOSED" in out
+    # The originals are untouched.
+    assert tree["jicofo"].read_text().count("url-template") == 1  # the comment only
+
+
+def test_main_rejects_an_invalid_bridge_url(capsys: pytest.CaptureFixture[str]) -> None:
+    code = verify_jitsi.main(["--only", "config", "--bridge-url", "http://bridge/transcribe"])
+    assert code == 2
+    assert "error: --bridge-url" in capsys.readouterr().err
+
+
+def test_main_without_fix_proposes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    tree = _broken_tree(tmp_path, monkeypatch)
+    code = verify_jitsi.main(
+        ["--domain", "meet.example.com", "--plugin-dir", str(tree["plugins"])]
+    )
+    out = capsys.readouterr().out
+    assert code == 1
+    assert "PROPOSED" not in out
+    assert not list(tmp_path.rglob("*.new"))

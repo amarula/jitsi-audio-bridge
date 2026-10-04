@@ -343,12 +343,19 @@ the framing carries no participant names or addresses (mail falls back to
 `fallback_recipient`), and a reconnecting JVB reuses its `sessionId`.
 
 `python3 -m tools.verify_jitsi` checks a deployment against that document and
-is read-only: `--only config` parses the Jicofo, Prosody and client files
-(finding, for example, a `transcription` block that is still commented out),
-`--only probe` connects to the configured URL as the JVB would and requires the
-pong, and `--only logs` scans recent `jitsi-videobridge2`/`jicofo` journal
-entries for the connect lifecycle. Every failure prints the fix; exit status is
-1 if any check failed.
+is read-only by default: `--only config` parses the Jicofo, Prosody and client
+files (finding, for example, a `transcription` block that is still commented
+out), `--only probe` connects to the configured URL as the JVB would and
+requires the pong, and `--only logs` scans recent
+`jitsi-videobridge2`/`jicofo` journal entries for the connect lifecycle. Every
+failure prints the fix; exit status is 1 if any check failed.
+
+`--fix --bridge-url ws://bridge.example.com:8080` goes further and writes the
+remedy as `<file>.new` beside the file it would change — Jicofo's
+transcription block, the Prosody module and its enablement, the client
+configuration — leaving the originals untouched, with the diff/move/restart
+commands printed for each. `--output-dir` stages them elsewhere when `/etc` is
+not writable.
 
 ## Batch mode
 

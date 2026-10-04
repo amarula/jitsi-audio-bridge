@@ -323,7 +323,7 @@ at session end is the signal).
 ### Run the checker first
 
 `tools/verify_jitsi.py` automates most of this and prints a fix per failure.
-Run it on the Jitsi host; it is read-only. From a checkout it is
+Run it on the Jitsi host; it is read-only by default. From a checkout it is
 `python3 -m tools.verify_jitsi` (from the repository root) or
 `python3 /path/to/tools/verify_jitsi.py` (from anywhere). If the bridge was
 installed from the Debian package (`make deb`), the same tool is on the PATH as
@@ -347,6 +347,43 @@ enabled, then sends `session-end`; it transmits no audio, so nothing is emailed.
 `logs` classifies the JVB exporter lifecycle and Jicofo's transcription errors
 from journald (or `--jvb-log`/`--jicofo-log` files). Exit status is 1 if
 anything failed.
+
+### Proposing the fixes
+
+For the failures with a mechanical remedy the same tool can write the change
+the way Debian handles conffiles: never touch the original, write `<file>.new`
+beside it, and print how to review and install it.
+
+```sh
+sudo jitsi-audio-bridge-verify --fix --bridge-url ws://bridge.example.com:8080
+```
+
+It proposes, each only when its check failed:
+
+- **Jicofo** — the `transcription` block, appended to `custom-jicofo.conf.new`
+  (or, when `jicofo.conf` does not include it yet, that file plus a one-line
+  `include` in `jicofo.conf.new`). The bridge address cannot be inferred, so
+  `--bridge-url` is required for this one; a bare `ws://host:port` is expanded
+  to `…/transcribe?sessionId={{MEETING_ID}}`.
+- **Prosody** — `mod_force_async_transcription.lua.new` (or the name of a
+  module already present that does the job) and the site config with that name
+  and `muc_meeting_id` added to the MUC's `modules_enabled`.
+- **jitsi-meet** — the client config with `transcription: { enabled: true }`
+  inserted; a commented-out sample block is left as it is and a live one added.
+
+Each entry prints the commands that follow:
+
+```sh
+diff -u /etc/jitsi/jicofo/custom-jicofo.conf /etc/jitsi/jicofo/custom-jicofo.conf.new
+sudo mv /etc/jitsi/jicofo/custom-jicofo.conf.new /etc/jitsi/jicofo/custom-jicofo.conf
+sudo systemctl restart jicofo
+```
+
+Nothing is applied, and the exit status is unchanged. Without write access to
+`/etc`, pass `--output-dir /tmp/fix` to stage the proposals elsewhere; they are
+written beside the file being *edited* (the `conf.avail` file, not the `conf.d`
+symlink that points at it), keep the original's mode, and are never overwritten
+unless `--force-fix` is given.
 
 From the bridge's side, in order of what proves what:
 
