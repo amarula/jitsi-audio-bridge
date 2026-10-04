@@ -1266,6 +1266,18 @@ def normalize_bridge_url(value: str) -> tuple[str | None, str]:
     return template, ""
 
 
+def _loopback_notes(template: str) -> tuple[str, ...]:
+    """Warn when the bridge address only works if the JVB shares its host."""
+    hostname = urlsplit(template).hostname or ""
+    if hostname in ("127.0.0.1", "::1", "localhost") or hostname.startswith("127."):
+        return (
+            f"{hostname} is a loopback address: the JVB can only reach it if it runs "
+            "on the bridge host itself. Use the bridge's address on the network the "
+            "JVB is on.",
+        )
+    return ()
+
+
 def hocon_transcription_block(template: str) -> str:
     """The jicofo.conf snippet that configures the transcriber connect."""
     return (
@@ -1380,6 +1392,9 @@ def propose_jicofo_fix(
         HoconDocument(values=parse_hocon(custom_text, custom_conf)[0]),
         "jicofo.transcription.url-template",
     )
+    # Wherever the address comes from, a loopback one only works for a JVB on
+    # the bridge's own host, which is worth saying out loud.
+    loopback = _loopback_notes(already or normalized)
     proposals: list[Proposal] = []
     if not already:
         custom_new = append_to_file_text(custom_text, hocon_transcription_block(normalized))
@@ -1397,7 +1412,7 @@ def propose_jicofo_fix(
             "jicofo.url-template",
             f"add the transcription block to {custom_conf.name}",
             target=custom_conf, new_text=custom_new, unit="jicofo",
-            notes=(f"url-template = {normalized}",),
+            notes=(f"url-template = {normalized}", *loopback),
         ))
     if not includes_custom:
         proposals.append(Proposal(
@@ -1407,10 +1422,13 @@ def propose_jicofo_fix(
             new_text=append_to_file_text(jicofo_text, f'include "{custom_conf.name}"\n'),
             unit="jicofo",
             notes=(
-                f"{custom_conf} already defines a template; it is kept as it is"
-                if already
-                else "HOCON ignores a plain include of a missing file, so the line is safe "
-                     "to add even before the custom file exists",
+                (
+                    f"{custom_conf} already defines a template; it is kept as it is"
+                    if already
+                    else "HOCON ignores a plain include of a missing file, so the line is "
+                         "safe to add even before the custom file exists"
+                ),
+                *loopback,
             ),
         ))
     return proposals

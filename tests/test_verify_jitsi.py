@@ -719,6 +719,23 @@ def test_propose_jicofo_is_silent_when_a_live_template_exists() -> None:
     ) == []
 
 
+def test_propose_jicofo_warns_about_a_loopback_address() -> None:
+    jicofo_path = Path("/etc/jitsi/jicofo/jicofo.conf")
+    custom = Path("/etc/jitsi/jicofo/custom-jicofo.conf")
+    deployment = _deployment(hocon=HoconDocument(), jicofo_conf=jicofo_path)
+    (proposal,) = propose_jicofo_fix(
+        deployment, custom, bridge_url="127.0.0.1:9000",
+        read=_reader({jicofo_path: 'include "custom-jicofo.conf"\n', custom: ""}),
+    )
+    assert any("loopback" in note for note in proposal.notes)
+
+    (proposal,) = propose_jicofo_fix(
+        deployment, custom, bridge_url="bridge.example.com",
+        read=_reader({jicofo_path: 'include "custom-jicofo.conf"\n', custom: ""}),
+    )
+    assert not any("loopback" in note for note in proposal.notes)
+
+
 def test_propose_jicofo_keeps_an_existing_custom_template(tmp_path: Path) -> None:
     custom = tmp_path / "custom-jicofo.conf"
     custom.write_text('jicofo.transcription.url-template = "ws://already/t?sessionId=x"\n')
