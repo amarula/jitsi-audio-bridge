@@ -12,6 +12,8 @@ The two fixtures that matter most are the traps the tool exists to catch: a
 from __future__ import annotations
 
 import argparse
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -524,3 +526,17 @@ def test_exit_code_only_fails_on_failures() -> None:
     assert exit_code([Section("x", [Check("a", Status.WARN, "")])]) == 0
     assert exit_code([Section("x", [Check("a", Status.SKIP, "")])]) == 0
     assert exit_code([Section("x", [Check("a", Status.FAIL, "")])]) == 1
+
+
+def test_script_runs_from_any_directory(tmp_path: Path) -> None:
+    """``python3 /path/to/tools/verify_jitsi.py`` must not need the repo as cwd."""
+    script = Path(verify_jitsi.__file__)
+    result = subprocess.run(
+        [sys.executable, str(script), "--help"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "--only" in result.stdout

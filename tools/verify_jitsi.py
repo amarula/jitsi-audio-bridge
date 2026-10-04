@@ -15,11 +15,13 @@ Read-only. Three sections, selected with ``--only``:
     Scan recent ``jitsi-videobridge2`` and ``jicofo`` journal entries for the
     connect lifecycle, or the failure modes, after a test meeting.
 
-Examples:
+Run it from the checkout root as a module, or straight from the file (which
+also works from any directory, and is what the Debian package's
+``jitsi-audio-bridge-verify`` launcher does):
 
     python3 -m tools.verify_jitsi                       # the config files only
     python3 -m tools.verify_jitsi --only config,probe   # also reach the bridge
-    python3 -m tools.verify_jitsi --only logs --since "10 min ago"
+    python3 tools/verify_jitsi.py --only logs --since "10 min ago"
 
 Exit status is 0 when nothing failed, 1 when a check failed, and 2 for a usage
 or discovery problem (a named file that does not exist, several domains to
@@ -45,6 +47,15 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
+
+# The tools package is resolved from the checkout root, which is only on
+# sys.path when this is run as ``python3 -m tools.verify_jitsi`` from there.
+# Put it there explicitly so ``python3 /path/to/tools/verify_jitsi.py`` works
+# from any directory; when installed in a virtualenv this is already on the
+# path and the insert is a no-op.
+_CHECKOUT_ROOT = Path(__file__).resolve().parent.parent
+if str(_CHECKOUT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_CHECKOUT_ROOT))
 
 #: The one route the bridge serves; anything else is closed with 1008.
 WEBSOCKET_PATH = "/transcribe"

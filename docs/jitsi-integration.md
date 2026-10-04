@@ -324,8 +324,9 @@ at session end is the signal).
 
 `tools/verify_jitsi.py` automates most of this and prints a fix per failure.
 Run it on the Jitsi host; it is read-only. From a checkout it is
-`python3 -m tools.verify_jitsi`; if the bridge was installed from the Debian
-package (`make deb`), the same tool is on the PATH as
+`python3 -m tools.verify_jitsi` (from the repository root) or
+`python3 /path/to/tools/verify_jitsi.py` (from anywhere). If the bridge was
+installed from the Debian package (`make deb`), the same tool is on the PATH as
 `jitsi-audio-bridge-verify`.
 
 ```sh
