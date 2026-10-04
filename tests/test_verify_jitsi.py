@@ -1016,3 +1016,86 @@ def test_main_without_fix_proposes_nothing(
     assert code == 1
     assert "PROPOSED" not in out
     assert not list(tmp_path.rglob("*.new"))
+
+
+# --------------------------------------------------------------------------
+# Fix proposals: room metadata
+# --------------------------------------------------------------------------
+
+NO_ROOM_METADATA = (
+    'plugin_paths = { "/plugins" }\n'
+    'VirtualHost "meet.example.com"\n'
+    '    modules_enabled = { "muc_meeting_id"; }\n'
+    "\n"
+    'Component "conference.meet.example.com" "muc"\n'
+    '    main_muc = "conference.meet.example.com"\n'
+    '    modules_enabled = { }\n'
+)
+
+
+def _plugin_reader(plugin_dir: Path) -> object:
+    return _reader({
+        plugin_dir / "mod_room_metadata.lua": "-- room metadata\n",
+        plugin_dir / "mod_room_metadata_component.lua": "-- component\n",
+    })
+
+
+def test_lua_block_offsets_start_right_after_the_header() -> None:
+    """The fixer splices at these offsets; swallowing the newline broke it."""
+    text = 'VirtualHost "meet.example.com"\n    modules_enabled = { }\n'
+    (block,) = find_lua_blocks(text)
+    assert text[block.start :].startswith("\n    modules_enabled")
+
+
+def test_propose_prosody_adds_the_room_metadata_plumbing(tmp_path: Path) -> None:
+    plugin_dir = tmp_path / "plugins"
+    plugin_dir.mkdir()
+    proposals = propose_prosody_fixes(
+        _deployment(prosody_text=NO_ROOM_METADATA), [plugin_dir],
+        read=_plugin_reader(plugin_dir),
+    )
+    by_id = {p.check_id: p for p in proposals}
+    site = by_id["prosody.room_metadata"]
+    assert site.target is not None
+    assert '"room_metadata";' in site.new_text
+    assert 'room_metadata_component = "metadata.meet.example.com"' in site.new_text
+    assert 'Component "metadata.meet.example.com" "room_metadata_component"' in site.new_text
+    assert 'muc_component = "conference.meet.example.com"' in site.new_text
+    # The VirtualHost keeps its own table; the module goes there, not on the MUC.
+    assert '"room_metadata";\n    }' in site.new_text
+
+    # Installing it must satisfy the check it addresses.
+    checks = check_prosody(
+        _deployment(prosody_text=site.new_text), "meet.example.com", [plugin_dir],
+        _plugin_reader(plugin_dir),
+    )
+    assert _status(checks, "prosody.room_metadata") is Status.PASS
+
+
+def test_propose_prosody_refuses_a_component_whose_module_is_missing(tmp_path: Path) -> None:
+    plugin_dir = tmp_path / "plugins"
+    plugin_dir.mkdir()  # readable, but the room metadata plugins are not installed
+    proposals = propose_prosody_fixes(
+        _deployment(prosody_text=NO_ROOM_METADATA), [plugin_dir], read=_reader({})
+    )
+    blocked = next(p for p in proposals if p.check_id == "prosody.room_metadata")
+    assert blocked.target is None
+    assert "jitsi-meet-prosody" in blocked.reason
+    # Nothing that would stop Prosody from starting was proposed.
+    edits = [p for p in proposals if p.target is not None]
+    assert all('Component "metadata.' not in p.new_text for p in edits)
+    assert all('room_metadata_component = "' not in p.new_text for p in edits)
+
+
+def test_propose_prosody_skips_room_metadata_work_when_it_is_present(tmp_path: Path) -> None:
+    plugin_dir = tmp_path / "plugins"
+    plugin_dir.mkdir()
+    proposals = propose_prosody_fixes(
+        _deployment(prosody_text=PROSODY), [plugin_dir], read=_plugin_reader(plugin_dir)
+    )
+    site = next(p for p in proposals if p.check_id == "prosody.modules_enabled")
+    # The fixture already has the module and the component, so the edit must
+    # neither add a second component nor an option that was not there.
+    assert site.new_text.count('Component "metadata.') == 1
+    assert 'room_metadata_component = "' not in site.new_text
+    assert site.new_text.count('"room_metadata";') == 1

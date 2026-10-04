@@ -350,9 +350,9 @@ requires the pong, and `--only logs` scans recent
 `jitsi-videobridge2`/`jicofo` journal entries for the connect lifecycle. Every
 failure prints the fix; exit status is 1 if any check failed.
 
-`--fix --bridge-url ws://bridge.example.com:8080` goes further and writes the
-remedy as `<file>.new` beside the file it would change — Jicofo's
-transcription block, the Prosody module and its enablement, the client
+`--fix --bridge-url bridge.example.com` goes further and writes the remedy as
+`<file>.new` beside the file it would change — Jicofo's transcription block,
+the Prosody module, its enablement and the room-metadata plumbing, the client
 configuration — leaving the originals untouched, with the diff/move/restart
 commands printed for each. `--output-dir` stages them elsewhere when `/etc` is
 not writable.

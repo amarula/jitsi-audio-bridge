@@ -499,8 +499,13 @@ class LuaBlock:
     end: int = 0
 
 
+#: Note the ``[ \t]`` rather than ``\s`` before the optional type: with ``\s``
+#: the match would swallow the newline and indentation after a bare
+#: ``VirtualHost "x"`` header, and the block's offsets would start on the
+#: following line — which matters to the fixer, that splices at those offsets.
 _LUA_BLOCK = re.compile(
-    r"^[ \t]*(VirtualHost|Component)\s+[\"']([^\"']+)[\"']\s*(?:[\"']([^\"']+)[\"'])?",
+    r"^[ \t]*(VirtualHost|Component)[ \t]+[\"']([^\"']+)[\"'][ \t]*"
+    r"(?:[\"']([^\"']+)[\"'])?",
     re.MULTILINE,
 )
 
@@ -1434,39 +1439,75 @@ def propose_jicofo_fix(
     return proposals
 
 
+ROOM_METADATA_PLUGINS = ("mod_room_metadata.lua", "mod_room_metadata_component.lua")
+
+
+def missing_room_metadata_plugins(
+    plugin_dirs: Sequence[Path], read: Callable[[Path], str | None]
+) -> str | None:
+    """The first room-metadata plugin file absent from every readable plugin dir.
+
+    ``None`` when they are all there, or when no plugin directory is readable —
+    in that case the tool cannot tell and says so rather than guessing.  A
+    component whose module is missing stops Prosody from starting, so this
+    gates the proposal.
+    """
+    readable = [directory for directory in plugin_dirs if directory.is_dir()]
+    if not readable:
+        return None
+    for name in ROOM_METADATA_PLUGINS:
+        if not any(read(directory / name) is not None for directory in readable):
+            return name
+    return None
+
+
 def propose_prosody_fixes(
     deployment: Deployment,
     plugin_dirs: Sequence[Path],
     *,
     read: Callable[[Path], str | None] = _read,
 ) -> list[Proposal]:
-    """Propose enabling the module that forces asyncTranscription."""
+    """Propose the Prosody changes: the forcing module, and room metadata."""
     text = deployment.prosody_text
     if text is None:
         return []
+    domain = deployment.domain
     body = lua_uncomment(text)
     blocks = find_lua_blocks(body)
-    main_muc = find_main_muc(blocks, deployment.domain)
+    main_muc = find_main_muc(blocks, domain)
     if main_muc is None:
         return []
+    virtual_host = next(
+        (block for block in blocks
+         if block.kind == "VirtualHost" and (domain is None or block.name == domain)),
+        None,
+    )
+
+    proposals: list[Proposal] = []
+    notes: list[str] = []
+    # (offset, transform) pairs, applied highest offset first so every span
+    # computed against the original text stays valid.
+    edits: list[tuple[int, Callable[[str], str]]] = []
+
+    def insert_at(offset: int, addition: str) -> Callable[[str], str]:
+        return lambda current: current[:offset] + addition + current[offset:]
 
     modules = lua_module_names(main_muc.body)
-    forcing, _ = module_files_for(modules, plugin_dirs, read)
-    proposals: list[Proposal] = []
+    vhost_modules = lua_module_names(virtual_host.body) if virtual_host else []
     enable: list[str] = []
+
+    # --- the module that forces asyncTranscription -------------------------
+    forcing, _ = module_files_for(modules, plugin_dirs, read)
     if not forcing:
         available = forcing_candidates(plugin_dirs, read)
         if available:
             name, path = available[0]
             enable.append(name)
-            module_note = (
+            notes.append(
                 f"{path} already sets asyncTranscription; enabling it avoids a second module"
             )
         else:
             enable.append(PROSODY_MODULE_NAME)
-            module_note = (
-                f"the module goes in {plugin_dirs[0] if plugin_dirs else 'a plugin path'}"
-            )
             writable = next(
                 (directory for directory in plugin_dirs
                  if directory.is_dir() and os.access(directory, os.W_OK)),
@@ -1478,30 +1519,95 @@ def propose_prosody_fixes(
                 f"install mod_{PROSODY_MODULE_NAME}.lua",
                 target=writable / f"mod_{PROSODY_MODULE_NAME}.lua",
                 new_text=prosody_module_source(), unit="prosody",
-                notes=(module_note,),
+                notes=(f"the module goes in {writable}",),
             ))
     if "muc_meeting_id" not in modules:
         enable.append("muc_meeting_id")
-    if not enable:
-        return proposals
 
-    span = lua_table_span(main_muc.body, "modules_enabled")
-    if span is None:
-        proposals.append(Proposal(
-            "prosody.modules_enabled", f'cannot add {", ".join(enable)} automatically',
-            reason=f'"{main_muc.name}" has no modules_enabled table, and creating one would '
-                   "replace Prosody's global module list rather than extend it; add the "
-                   "module names by hand",
-        ))
+    # --- the room metadata plumbing ----------------------------------------
+    has_module = "room_metadata" in modules or "room_metadata" in vhost_modules
+    has_component = any(
+        block.kind == "Component" and block.type == "room_metadata_component" for block in blocks
+    )
+    component_name = f"metadata.{domain}" if domain else "metadata.<domain>"
+    adding_component = not has_component or not has_module
+    if adding_component:
+        absent = missing_room_metadata_plugins(plugin_dirs, read)
+        if absent is not None:
+            adding_component = False
+            proposals.append(Proposal(
+                "prosody.room_metadata", "cannot enable the room metadata plumbing",
+                reason=f"{absent} is not installed in the Prosody plugin paths; a component "
+                       "whose module is missing stops Prosody from starting. Upgrade the "
+                       "package (apt install --only-upgrade jitsi-meet-prosody) and rerun "
+                       "--fix",
+            ))
+        else:
+            if not has_module:
+                span = (
+                    lua_table_span(virtual_host.body, "modules_enabled")
+                    if virtual_host
+                    else None
+                )
+                if span is not None:
+                    absolute = (virtual_host.start + span[0], virtual_host.start + span[1])
+                    edits.append((absolute[1], lambda current, at=absolute: add_lua_modules(
+                        current, at, ["room_metadata"]
+                    )))
+                    notes.append('"room_metadata" is enabled on the VirtualHost, as the stock '
+                                 "configuration does")
+                else:
+                    enable.append("room_metadata")
+                    notes.append('"room_metadata" is enabled on the MUC (no VirtualHost module '
+                                 "table was found)")
+            if virtual_host is not None and "room_metadata_component" not in virtual_host.body:
+                # The block's start is immediately after the header, so the
+                # addition ends where the original newline continues it.
+                addition = f'\n    room_metadata_component = "{component_name}"'
+                edits.append((virtual_host.start, insert_at(virtual_host.start, addition)))
+                notes.append(f'the VirtualHost points at {component_name}')
+            if not has_component:
+                block_lua = (
+                    f'Component "{component_name}" "room_metadata_component"\n'
+                    f'    muc_component = "{main_muc.name}"\n'
+                )
+                edits.append((len(text), lambda current, block=block_lua:
+                              append_to_file_text(current, block)))
+                notes.append(f'Component "{component_name}" is appended to the file')
+            if not any(directory.is_dir() for directory in plugin_dirs):
+                notes.append("verify mod_room_metadata_component.lua is installed before "
+                             "restarting Prosody")
+
+    # --- the module names on the MUC ---------------------------------------
+    if enable:
+        span = lua_table_span(main_muc.body, "modules_enabled")
+        if span is None:
+            proposals.append(Proposal(
+                "prosody.modules_enabled", f'cannot add {", ".join(enable)} automatically',
+                reason=f'"{main_muc.name}" has no modules_enabled table, and creating one '
+                       "would replace Prosody's global module list rather than extend it; "
+                       "add the module names by hand",
+            ))
+        else:
+            absolute = (main_muc.start + span[0], main_muc.start + span[1])
+            edits.append((absolute[1], lambda current, at=absolute, names=tuple(enable):
+                          add_lua_modules(current, at, names)))
+            notes.append(f'{", ".join(enable)} on "{main_muc.name}"')
+
+    if not edits:
         return proposals
-    absolute = (main_muc.start + span[0], main_muc.start + span[1])
+    edits.sort(key=lambda edit: edit[0], reverse=True)
+    new_text = text
+    for _, transform in edits:
+        new_text = transform(new_text)
+    check_id = "prosody.room_metadata" if adding_component else "prosody.modules_enabled"
     proposals.append(Proposal(
-        "prosody.modules_enabled",
-        f'enable {", ".join(enable)} on "{main_muc.name}"',
+        check_id,
+        f"edit {deployment.prosody_config.name}: " + ", ".join(notes),
         target=deployment.prosody_config,
-        new_text=add_lua_modules(text, absolute, enable),
+        new_text=new_text,
         unit="prosody",
-        notes=(module_note,),
+        notes=tuple(notes),
     ))
     return proposals
 
