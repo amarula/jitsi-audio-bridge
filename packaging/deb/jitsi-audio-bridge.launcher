@@ -10,6 +10,21 @@ set -e
 
 self="$(readlink -f "$0")"
 prefix="$(dirname "$(dirname "$self")")"
+venv="$prefix/lib/jitsi-audio-bridge/venv"
+
+# A package built on a different distribution carries a virtualenv for that
+# distribution's python3, which cannot import anything here. Fail with the
+# reason instead of a traceback; the unit treats 78 as permanent.
+built="$(cat "$venv/BUILT-FOR" 2>/dev/null || true)"
+if [ -n "$built" ]; then
+    running="$("$venv/bin/python" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || echo unknown)"
+    if [ "$running" != "$built" ]; then
+        echo "$(basename "$self"): this package was built for python3 $built, but python3 here is $running." >&2
+        echo "Its bundled virtualenv cannot run. Build the package on this machine:" >&2
+        echo "    sudo apt install dpkg-dev python3-venv && make deb && sudo dpkg -i dist/*.deb" >&2
+        exit 78
+    fi
+fi
 
 case "$(basename "$self")" in
     jitsi-audio-bridge)         module=jitsi_audio_bridge ;;
@@ -21,4 +36,4 @@ case "$(basename "$self")" in
         ;;
 esac
 
-exec "$prefix/lib/jitsi-audio-bridge/venv/bin/python" -m "$module" "$@"
+exec "$venv/bin/python" -m "$module" "$@"

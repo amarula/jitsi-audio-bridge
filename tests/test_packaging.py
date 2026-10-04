@@ -20,16 +20,27 @@ LAUNCHER = ROOT / "packaging" / "deb" / "jitsi-audio-bridge.launcher"
 UNIT = ROOT / "systemd" / "jitsi-audio-bridge.service"
 
 
-def _installed_launcher(tmp_path: Path, name: str) -> Path:
-    """Install the launcher under *name* beside a stub venv python."""
+def _installed_launcher(tmp_path: Path, name: str, *, built_for: str = "3.14",
+                        running: str = "3.14") -> Path:
+    """Install the launcher under *name* beside a stub venv python.
+
+    The stub answers the launcher's ``-c`` version probe with *running* and
+    otherwise echoes its arguments, so both the guard and the module mapping
+    are observable without a real interpreter.
+    """
     binary = tmp_path / "usr" / "bin" / name
     binary.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy(LAUNCHER, binary)
     binary.chmod(binary.stat().st_mode | stat.S_IXUSR)
 
-    venv_python = tmp_path / "usr" / "lib" / "jitsi-audio-bridge" / "venv" / "bin" / "python"
-    venv_python.parent.mkdir(parents=True, exist_ok=True)
-    venv_python.write_text('#!/bin/sh\necho "$@"\n', encoding="utf-8")
+    venv = tmp_path / "usr" / "lib" / "jitsi-audio-bridge" / "venv"
+    (venv / "bin").mkdir(parents=True, exist_ok=True)
+    (venv / "BUILT-FOR").write_text(f"{built_for}\n", encoding="utf-8")
+    venv_python = venv / "bin" / "python"
+    venv_python.write_text(
+        f'#!/bin/sh\nif [ "$1" = "-c" ]; then echo "{running}"; exit 0; fi\necho "$@"\n',
+        encoding="utf-8",
+    )
     venv_python.chmod(0o755)
     return binary
 
@@ -51,6 +62,17 @@ def test_launcher_maps_its_name_to_a_module(tmp_path: Path, name: str, module: s
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == f"-m {module} --version"
+
+
+def test_launcher_refuses_a_mismatched_python_with_the_reason(tmp_path: Path) -> None:
+    """A package built for another python3 must say so, not traceback."""
+    binary = _installed_launcher(
+        tmp_path, "jitsi-audio-bridge", built_for="3.12", running="3.14"
+    )
+    result = subprocess.run([str(binary)], capture_output=True, text=True, check=False)
+    assert result.returncode == 78
+    assert "built for python3 3.12" in result.stderr
+    assert "make deb" in result.stderr
 
 
 def test_unit_has_the_lines_the_builder_rewrites() -> None:

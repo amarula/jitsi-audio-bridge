@@ -22,6 +22,10 @@ EnvironmentFile=-/etc/jitsi-audio-bridge/env
 Restart=on-failure
 RestartSec=5s
 
+# The launcher exits 78 when the package was built for a different python3 than
+# this host's — retrying cannot help, so do not loop on it.
+RestartPreventExitStatus=78
+
 # Post-processing (Whisper, then Ollama, then SMTP) runs inside a connection
 # handler, and there can be several queued. The default 90s would SIGKILL the
 # unit mid-transcription, leaving an unfinalised WAV and no email.

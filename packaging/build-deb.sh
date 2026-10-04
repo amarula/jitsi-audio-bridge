@@ -50,6 +50,9 @@ install -d "$PKGROOT/DEBIAN" "$PKGROOT/usr/bin" "$PKGROOT/usr/lib/$PKG" \
 echo "==> creating the bundled virtualenv (python3 $PYTHON_MINOR, $ARCH)"
 python3 -m venv "$VENV"
 "$VENV/bin/pip" install --quiet --no-cache-dir "$ROOT"
+# Stamped so the launcher can explain itself when the package is installed on
+# a host whose python3 differs from the one it was built for.
+printf '%s\n' "$PYTHON_MINOR" > "$VENV/BUILT-FOR"
 
 # The venv is a runtime, not a development environment: drop the caches and
 # the installer, then prove the payload still imports.
