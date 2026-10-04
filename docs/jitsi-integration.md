@@ -363,8 +363,11 @@ It proposes, each only when its check failed:
 - **Jicofo** — the `transcription` block, appended to `custom-jicofo.conf.new`
   (or, when `jicofo.conf` does not include it yet, that file plus a one-line
   `include` in `jicofo.conf.new`). The bridge address cannot be inferred, so
-  `--bridge-url` is required for this one; a bare `ws://host:port` is expanded
-  to `…/transcribe?sessionId={{MEETING_ID}}`.
+  `--bridge-url` is required for this one; a host, a `host:port`, or a
+  `ws://`/`wss://` URL is expanded to `…/transcribe?sessionId={{MEETING_ID}}`
+  (a bare host takes port 8080). The address must be one the **JVB** can reach,
+  so it is usually the bridge host's name, not `127.0.0.1` — nothing in the
+  Jitsi configuration records where the bridge is, so it cannot be inferred.
 - **Prosody** — `mod_force_async_transcription.lua.new` (or the name of a
   module already present that does the job) and the site config with that name
   and `muc_meeting_id` added to the MUC's `modules_enabled`.

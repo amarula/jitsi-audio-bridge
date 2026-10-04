@@ -1241,14 +1241,25 @@ def normalize_bridge_url(value: str) -> tuple[str | None, str]:
         return None, "empty value"
     if "{{MEETING_ID}}" in value:
         template = value
-    elif value.startswith(("ws://", "wss://")):
-        base = value.rstrip("/")
+    else:
+        if "://" in value:
+            if not value.startswith(("ws://", "wss://")):
+                return None, "the scheme must be ws:// or wss:// (or pass a bare host[:port])"
+            if any(char.isspace() for char in value):
+                return None, "a URL cannot contain whitespace"
+            base = value.rstrip("/")
+        elif not any(char in value for char in " /?#"):
+            # A bare host is taken as the bridge's usual listener.
+            base = f"ws://{value}"
+            if ":" not in value:
+                base += ":8080"
+        else:
+            return None, (
+                "pass the bridge as a host, host:port, ws:// URL, or a full template "
+                "containing {{MEETING_ID}}"
+            )
         route = "" if base.endswith(WEBSOCKET_PATH) else WEBSOCKET_PATH
         template = f"{base}{route}?sessionId={{{{MEETING_ID}}}}"
-    else:
-        return None, (
-            "must be a ws:// or wss:// URL, or a full template containing {{MEETING_ID}}"
-        )
     report = analyze_template(template, DEFAULT_SESSION_ID)
     if report.errors:
         return None, "; ".join(report.errors)
@@ -2120,8 +2131,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--bridge-url",
         metavar="URL",
-        help="the bridge origin (ws://host:port) or a full template containing "
-             "{{MEETING_ID}}, used by --fix to build the Jicofo template",
+        help="where the JVB reaches the bridge: a host, host:port, ws:// URL, or a "
+             "full template containing {{MEETING_ID}}; used by --fix for the "
+             "Jicofo template",
     )
     parser.add_argument(
         "--output-dir",

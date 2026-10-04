@@ -571,12 +571,19 @@ def test_normalize_bridge_url_builds_the_documented_template() -> None:
     assert normalize_bridge_url("ws://h:1/transcribe")[0] == (
         "ws://h:1/transcribe?sessionId={{MEETING_ID}}"
     )
+    # A bare host takes the bridge's usual listener; a bare host:port keeps its port.
+    assert normalize_bridge_url("bridge.example.com")[0] == (
+        "ws://bridge.example.com:8080/transcribe?sessionId={{MEETING_ID}}"
+    )
+    assert normalize_bridge_url("bridge.example.com:9000")[0] == (
+        "ws://bridge.example.com:9000/transcribe?sessionId={{MEETING_ID}}"
+    )
     # A full template is kept verbatim.
     full = "wss://h/transcribe?sessionId={{MEETING_ID}}&x=1"
     assert normalize_bridge_url(full) == (full, "")
 
 
-@pytest.mark.parametrize("value", ["", "bridge.example.com:8080", "http://h/transcribe"])
+@pytest.mark.parametrize("value", ["", "two words", "http://h/transcribe", "ws://h/a b"])
 def test_normalize_bridge_url_rejects_unusable_values(value: str) -> None:
     template, problem = normalize_bridge_url(value)
     assert template is None and problem
