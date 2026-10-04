@@ -6,6 +6,7 @@ encoding a tone and decoding it back through the recorder.
 
 from __future__ import annotations
 
+import base64
 import json
 import math
 import struct
@@ -30,7 +31,11 @@ from jitsi_audio_bridge.config import ConfigError, load_config
 from jitsi_audio_bridge.daemon import (
     DEFAULT_SESSION_ID,
     StreamError,
+    build_media_json_pong,
+    describe_media_json_start,
+    extract_media_json_media,
     extract_session_id,
+    parse_media_json_event,
     sanitize_identifier,
     split_frame,
     write_metadata,
@@ -137,6 +142,136 @@ def test_split_frame_sanitizes_a_hostile_identifier() -> None:
 
 
 # --------------------------------------------------------------------------
+# Media-json framing (stock Jitsi's JVB)
+# --------------------------------------------------------------------------
+
+
+def _media_event(tag: str = "alice-audio", payload: bytes = b"\x01\x02\x03") -> str:
+    return json.dumps(
+        {
+            "event": "media",
+            "sequenceNumber": "2",
+            "media": {
+                "tag": tag,
+                "chunk": "42",
+                "timestamp": "1234567",
+                "payload": base64.b64encode(payload).decode("ascii"),
+            },
+        }
+    )
+
+
+@pytest.mark.parametrize("kind", ["info", "start", "media", "ping", "session-end", "sources"])
+def test_parse_media_json_event_accepts_documented_events(kind: str) -> None:
+    assert parse_media_json_event(json.dumps({"event": kind})) == {"event": kind}
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "not json",
+        "[1, 2, 3]",
+        '"a string"',
+        "42",
+        "null",
+        "{}",
+        json.dumps({"meeting_url": "https://meet.example.com/Room"}),
+    ],
+)
+def test_parse_media_json_event_passes_other_frames_through(raw: str) -> None:
+    assert parse_media_json_event(raw) is None
+
+
+def test_parse_media_json_event_claims_a_non_string_event_name() -> None:
+    # ``event`` is the discriminator: a frame carrying it must never fall
+    # through to the control-frame path and overwrite metadata.json.
+    assert parse_media_json_event('{"event": 5}') == {"event": 5}
+
+
+def test_extract_media_json_media_round_trips() -> None:
+    participant_id, raw_tag, packet = extract_media_json_media(
+        json.loads(_media_event(payload=b"\xff\xfe"))
+    )
+    assert participant_id == "alice-audio"
+    assert raw_tag == "alice-audio"
+    assert packet == b"\xff\xfe"
+
+
+def test_extract_media_json_media_returns_the_raw_tag_beside_the_safe_one() -> None:
+    participant_id, raw_tag, _ = extract_media_json_media(json.loads(_media_event(tag="../evil")))
+    assert "/" not in participant_id
+    assert raw_tag == "../evil"
+
+
+@pytest.mark.parametrize(
+    "media",
+    [
+        None,
+        "not an object",
+        {},
+        {"tag": ""},
+        {"tag": "   "},
+        {"tag": 7},
+        {"tag": "...", "payload": "AA=="},
+        {"tag": "alice-audio"},
+        {"tag": "alice-audio", "payload": 7},
+        {"tag": "alice-audio", "payload": "!!!"},
+        {"tag": "alice-audio", "payload": "abc"},
+        {"tag": "alice-audio", "payload": ""},
+    ],
+)
+def test_extract_media_json_media_rejects_unusable_events(media: object) -> None:
+    with pytest.raises(StreamError):
+        extract_media_json_media({"event": "media", "media": media})
+
+
+def test_build_media_json_pong_echoes_the_id() -> None:
+    assert json.loads(build_media_json_pong({"event": "ping", "id": 7})) == {
+        "event": "pong",
+        "id": 7,
+    }
+
+
+def test_build_media_json_pong_accepts_zero() -> None:
+    assert json.loads(build_media_json_pong({"event": "ping", "id": 0}))["id"] == 0
+
+
+def test_build_media_json_pong_refuses_a_missing_id() -> None:
+    assert build_media_json_pong({"event": "ping"}) is None
+
+
+@pytest.mark.parametrize("ping_id", [None, "1", 1.5, True, False])
+def test_build_media_json_pong_refuses_an_unusable_id(ping_id: object) -> None:
+    # bool is excluded deliberately: JSON true is an int in Python and would
+    # otherwise be echoed as 1.
+    assert build_media_json_pong({"event": "ping", "id": ping_id}) is None
+
+
+def test_describe_media_json_start_summarises_a_full_event() -> None:
+    description = describe_media_json_start(
+        {
+            "event": "start",
+            "start": {
+                "tag": "alice-audio",
+                "mediaFormat": {"encoding": "opus", "sampleRate": 48000, "channels": 2},
+                "customParameters": {"endpointId": "endpoint-alice"},
+            },
+        }
+    )
+    assert "alice-audio" in description
+    assert "endpoint-alice" in description
+    assert "opus" in description
+
+
+@pytest.mark.parametrize(
+    "event",
+    [{"event": "start"}, {"event": "start", "start": 5}, {"event": "start", "start": {}}],
+)
+def test_describe_media_json_start_tolerates_a_sparse_event(event: dict[str, object]) -> None:
+    assert "?" in describe_media_json_start(event)
+
+
+# --------------------------------------------------------------------------
 # Control frames
 # --------------------------------------------------------------------------
 
@@ -162,6 +297,12 @@ def test_write_metadata_rejects_non_objects(tmp_path: Path, raw: str) -> None:
 def test_write_metadata_leaves_no_temporary_files(tmp_path: Path) -> None:
     write_metadata(tmp_path, json.dumps({"room_name": "Standup"}))
     assert [p.name for p in tmp_path.iterdir()] == ["metadata.json"]
+
+
+def test_write_metadata_reports_a_missing_directory(tmp_path: Path) -> None:
+    # Must not raise: an unwritable directory is a failed write, not a reason
+    # to take the connection down.
+    assert not write_metadata(tmp_path / "missing", json.dumps({"room_name": "Standup"}))
 
 
 # --------------------------------------------------------------------------

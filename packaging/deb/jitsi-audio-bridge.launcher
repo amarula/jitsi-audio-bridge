@@ -1,0 +1,24 @@
+#!/bin/sh
+# Run the bridge, or one of the bundled tools, from the package's private
+# virtualenv. The name this script is invoked under selects the module, so one
+# file serves all three commands.
+#
+# The virtualenv path is derived from this script's location rather than
+# hard-coded, so the tree also runs straight out of an extracted package; the
+# venv's own bin/ scripts are not used, which keeps it relocatable.
+set -e
+
+self="$(readlink -f "$0")"
+prefix="$(dirname "$(dirname "$self")")"
+
+case "$(basename "$self")" in
+    jitsi-audio-bridge)         module=jitsi_audio_bridge ;;
+    jitsi-audio-bridge-verify)  module=tools.verify_jitsi ;;
+    jitsi-audio-bridge-send)    module=tools.send_meeting ;;
+    *)
+        echo "$(basename "$self"): unknown command" >&2
+        exit 2
+        ;;
+esac
+
+exec "$prefix/lib/jitsi-audio-bridge/venv/bin/python" -m "$module" "$@"

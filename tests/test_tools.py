@@ -7,6 +7,7 @@ guarantee in one place. Nothing in this file touches the network.
 
 from __future__ import annotations
 
+import base64
 import struct
 import wave
 from pathlib import Path
@@ -23,6 +24,11 @@ from tools.send_meeting import (
     build_participants,
     frame_samples,
     load_wav_frames,
+    media_json_info,
+    media_json_media,
+    media_json_ping,
+    media_json_session_end,
+    media_json_start,
     tone_frame,
 )
 
@@ -238,3 +244,61 @@ def test_realtime_is_the_default_and_fast_opts_out() -> None:
 def test_metadata_is_sent_by_default() -> None:
     assert build_parser().parse_args([]).metadata is True
     assert build_parser().parse_args(["--no-metadata"]).metadata is False
+
+
+# --------------------------------------------------------------------------
+# Media-json sender
+# --------------------------------------------------------------------------
+
+
+def _participant() -> Participant:
+    return Participant(
+        identifier="alice", name="Alice", email="alice@example.com", sample_rate=48000
+    )
+
+
+def test_protocol_defaults_to_binary_and_accepts_media_json() -> None:
+    assert build_parser().parse_args([]).protocol == "binary"
+    assert build_parser().parse_args(["--protocol", "media-json"]).protocol == "media-json"
+
+
+def test_media_json_tags_are_distinct_from_endpoint_ids() -> None:
+    participant = Participant(identifier="alice", name="Alice", email="alice@example.com")
+    assert participant.source_tag == "alice-audio"
+    assert participant.endpoint_id == "endpoint-alice"
+    assert participant.source_tag != participant.endpoint_id
+
+
+def test_media_json_start_announces_the_format_and_endpoint() -> None:
+    event = media_json_start(_participant(), 3)
+    assert event["event"] == "start"
+    assert event["sequenceNumber"] == "3"
+    start = event["start"]
+    assert start["tag"] == "alice-audio"
+    assert start["mediaFormat"]["encoding"] == "opus"
+    assert start["mediaFormat"]["sampleRate"] == 48000
+    assert start["customParameters"]["endpointId"] == "endpoint-alice"
+
+
+def test_media_json_media_carries_an_opus_packet_as_base64() -> None:
+    packet = b"\x01\x02\x03\xff"
+    event = media_json_media(_participant(), 2, 42, 1234567, packet)
+    assert event["event"] == "media"
+    assert event["sequenceNumber"] == "2"
+    media = event["media"]
+    assert media["tag"] == "alice-audio"
+    # The numeric fields inherited from VoxImplant are strings on the wire.
+    assert media["chunk"] == "42"
+    assert media["timestamp"] == "1234567"
+    assert base64.b64decode(media["payload"], validate=True) == packet
+
+
+def test_media_json_ping_and_session_end_shapes() -> None:
+    assert media_json_ping(7) == {"event": "ping", "id": 7}
+    assert media_json_session_end() == {"event": "session-end"}
+
+
+def test_media_json_info_names_the_bridge() -> None:
+    info = media_json_info()
+    assert info["event"] == "info"
+    assert info["application"] == "jitsi-videobridge"

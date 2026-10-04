@@ -1,0 +1,68 @@
+#!/bin/sh
+# Maintainer script for jitsi-audio-bridge, rendered by packaging/build-deb.sh.
+set -e
+
+BUILT_PYTHON="@PYTHON_MINOR@"
+CONF_DIR=/etc/jitsi-audio-bridge
+
+if [ "$1" = "configure" ]; then
+    # The README's manual install creates the user without a matching group,
+    # and the unit names both, so bring an upgraded host into line.
+    if ! getent group jitsi-bridge >/dev/null 2>&1; then
+        addgroup --system --quiet jitsi-bridge
+    fi
+    if ! getent passwd jitsi-bridge >/dev/null 2>&1; then
+        adduser --system --no-create-home --home /nonexistent \
+            --ingroup jitsi-bridge --quiet jitsi-bridge
+    elif [ "$(id -gn jitsi-bridge)" != "jitsi-bridge" ]; then
+        usermod -g jitsi-bridge jitsi-bridge
+    fi
+
+    install -d -o jitsi-bridge -g jitsi-bridge -m 0750 /srv/recordings
+    if [ "$(stat -c %U /srv/recordings 2>/dev/null)" != "jitsi-bridge" ]; then
+        echo "jitsi-audio-bridge: WARNING: /srv/recordings is not owned by" >&2
+        echo "  jitsi-bridge, so the service cannot write recordings there." >&2
+        echo "  Either move recordings_dir in config.ini or run:" >&2
+        echo "  chown -R jitsi-bridge:jitsi-bridge /srv/recordings" >&2
+    fi
+    install -d -m 0755 "$CONF_DIR"
+    if [ ! -e "$CONF_DIR/env" ]; then
+        install -m 0600 -o root -g root /dev/null "$CONF_DIR/env"
+    fi
+
+    target_minor="$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || echo unknown)"
+    if [ "$target_minor" != "$BUILT_PYTHON" ]; then
+        echo "jitsi-audio-bridge: WARNING: this package was built for python3" >&2
+        echo "  $BUILT_PYTHON but the system runs python3 $target_minor; the bundled" >&2
+        echo "  virtualenv will not work. Rebuild it on this machine (see README)." >&2
+    fi
+
+    if command -v deb-systemd-helper >/dev/null 2>&1; then
+        deb-systemd-helper unmask jitsi-audio-bridge.service >/dev/null || true
+        if [ -z "${2:-}" ]; then
+            deb-systemd-helper enable jitsi-audio-bridge.service >/dev/null || true
+        fi
+        deb-systemd-helper update-state jitsi-audio-bridge.service >/dev/null || true
+    fi
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+
+    if [ -n "${2:-}" ]; then
+        # Upgrade: restart the unit only if it was running.
+        if command -v systemctl >/dev/null 2>&1 &&
+            systemctl is-active --quiet jitsi-audio-bridge.service; then
+            systemctl try-restart jitsi-audio-bridge.service || true
+        fi
+    else
+        cat <<'EOF'
+jitsi-audio-bridge: the unit is enabled but deliberately not started yet.
+  1. review /etc/jitsi-audio-bridge/config.ini
+     (recordings_dir, whisper, ollama, smtp)
+  2. put the SMTP password in /etc/jitsi-audio-bridge/env, mode 0600
+  3. systemctl start jitsi-audio-bridge
+EOF
+    fi
+fi
+
+exit 0

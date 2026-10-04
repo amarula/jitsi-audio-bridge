@@ -1,11 +1,19 @@
 """Simulate a meeting by sending audio to a running bridge.
 
 Stands in for whatever forwards participant audio from the Jitsi side, speaking
-the wire protocol documented in README.md:
+one of the two wire protocols the bridge accepts:
+
+``--protocol binary`` (the default) is this repository's custom framing,
+documented in README.md:
 
     ws://<host>:<port>/transcribe?sessionId=<id>
       text frame   -> JSON control frame (room, participants)
       binary frame -> [16-byte participant id][one Opus packet]
+
+``--protocol media-json`` is stock Jitsi's bridge-based transcription framing,
+documented in docs/jitsi-integration.md: JSON events with an ``event``
+discriminator, base64 Opus payloads tagged per source, and a ping the receiver
+must answer with a pong.  It carries no participant metadata.
 
 Examples:
 
@@ -18,8 +26,11 @@ Examples:
     # A control frame with no audio at all, to check nothing gets emailed.
     python3 -m tools.send_meeting --audio none
 
+    # The framing stock Jitsi's JVB uses, with keepalive pings.
+    python3 -m tools.send_meeting --protocol media-json --participants 2 --duration 5
+
 Because this is the only implementation of the sender side, it doubles as the
-way to confirm the protocol against a real sender: point it at the bridge and
+way to confirm each protocol against a real sender: point it at the bridge and
 compare what the bridge records with what the real one produces.
 """
 
@@ -27,6 +38,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import contextlib
 import json
 import math
@@ -55,6 +67,13 @@ DEFAULT_RATE = 48000
 #: Amplitude of a generated tone, well below full scale.
 _TONE_AMPLITUDE = 12000
 
+#: The wire protocols this sender can speak.
+PROTOCOLS = ("binary", "media-json")
+
+#: How often the media-json sender pings, in stream ticks (one tick is one
+#: 20 ms frame per participant).  The real JVB pings on a timer instead.
+PING_EVERY_FRAMES = 50
+
 
 @dataclass
 class Participant:
@@ -68,11 +87,23 @@ class Participant:
     #: Encoded Opus packets, filled in by :func:`encode_streams`.
     packets: list[bytes] = field(default_factory=list)
     packets_sent: int = 0
+    #: Rate the packets were encoded at, announced in a media-json start event.
+    sample_rate: int = DEFAULT_RATE
 
     @property
     def frame_bytes(self) -> bytes:
         """The fixed-width identifier field."""
         return self.identifier.encode("utf-8")[:ID_FIELD_BYTES].ljust(ID_FIELD_BYTES, b"\x00")
+
+    @property
+    def source_tag(self) -> str:
+        """The bridge source name the media-json framing tags packets with."""
+        return f"{self.identifier}-audio"
+
+    @property
+    def endpoint_id(self) -> str:
+        """The participant identity a real bridge puts in customParameters."""
+        return f"endpoint-{self.identifier}"
 
 
 def frame_samples(rate: int) -> int:
@@ -163,6 +194,7 @@ def encode_streams(
         # at its own rate while generated tones use --rate. The bridge decodes
         # both to 16 kHz regardless.
         encoder_rate = source_rate if frames else rate
+        participant.sample_rate = encoder_rate
         encoder = OpusEncoder(encoder_rate, 1, "audio")
         try:
             participant.packets = [
@@ -198,6 +230,176 @@ async def stream(
             await asyncio.sleep(FRAME_MS / 1000)
 
 
+def media_json_info() -> dict[str, object]:
+    """The ``info`` event the JVB sends once the connection opens."""
+    return {
+        "event": "info",
+        "application": "jitsi-videobridge",
+        "version": "simulated-by-tools.send_meeting",
+    }
+
+
+def media_json_start(participant: Participant, sequence: int) -> dict[str, object]:
+    """A ``start`` event announcing one source's format, as the JVB sends it."""
+    return {
+        "event": "start",
+        "sequenceNumber": str(sequence),
+        "start": {
+            "tag": participant.source_tag,
+            "mediaFormat": {
+                "encoding": "opus",
+                "sampleRate": participant.sample_rate,
+                "channels": 1,
+            },
+            "customParameters": {"endpointId": participant.endpoint_id},
+        },
+    }
+
+
+def media_json_media(
+    participant: Participant, sequence: int, chunk: int, timestamp: int, packet: bytes
+) -> dict[str, object]:
+    """A ``media`` event carrying one Opus packet, base64 as the JVB sends it.
+
+    ``sequenceNumber``, ``chunk`` and ``timestamp`` are strings because the
+    format inherited that encoding from VoxImplant.
+    """
+    return {
+        "event": "media",
+        "sequenceNumber": str(sequence),
+        "media": {
+            "tag": participant.source_tag,
+            "chunk": str(chunk),
+            "timestamp": str(timestamp),
+            "payload": base64.b64encode(packet).decode("ascii"),
+        },
+    }
+
+
+def media_json_ping(ping_id: int) -> dict[str, object]:
+    """A ``ping`` event; the bridge must answer a ``pong`` with the same id."""
+    return {"event": "ping", "id": ping_id}
+
+
+def media_json_session_end() -> dict[str, object]:
+    """The ``session-end`` event the JVB sends as it closes the connection."""
+    return {"event": "session-end"}
+
+
+async def stream_media_json(
+    websocket: object,
+    participants: list[Participant],
+    realtime: bool,
+    sequence: int,
+) -> tuple[int, int, int]:
+    """Send every packet as a ``media`` event, pinging as the real JVB does.
+
+    Returns ``(next sequence number, packets sent, pings sent)``.  Per-source
+    chunk counters and sample timestamps are kept locally: the bridge ignores
+    them, but a plausible stream is what makes this a useful counterpart to the
+    binary one.
+    """
+    total = max(len(p.packets) for p in participants) if participants else 0
+    chunks = dict.fromkeys((p.identifier for p in participants), 0)
+    packets_sent = 0
+    pings_sent = 0
+
+    for index in range(total):
+        for participant in participants:
+            if index >= len(participant.packets):
+                continue
+            event = media_json_media(
+                participant,
+                sequence + 1,
+                chunks[participant.identifier],
+                index * frame_samples(participant.sample_rate),
+                participant.packets[index],
+            )
+            sequence += 1
+            chunks[participant.identifier] += 1
+            try:
+                await websocket.send(json.dumps(event))
+            except Exception as exc:  # noqa: BLE001 - report rather than traceback
+                print(f"send failed at frame {index}: {exc}", file=sys.stderr)
+                return sequence, packets_sent, pings_sent
+            packets_sent += 1
+            participant.packets_sent += 1
+        if realtime:
+            await asyncio.sleep(FRAME_MS / 1000)
+        if index and index % PING_EVERY_FRAMES == 0:
+            pings_sent += 1
+            await websocket.send(json.dumps(media_json_ping(pings_sent)))
+
+    return sequence, packets_sent, pings_sent
+
+
+async def collect_pongs(websocket: object, ping_id: int, timeout: float) -> int:
+    """Count ``pong`` replies until the one for *ping_id* arrives or time runs out.
+
+    The bridge sends nothing else back, so any frame that is not a pong is
+    unexpected; it is ignored rather than treated as a failure.
+    """
+    received = 0
+    try:
+        async with asyncio.timeout(timeout):
+            async for message in websocket:
+                try:
+                    event = json.loads(message)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                if isinstance(event, dict) and event.get("event") == "pong":
+                    received += 1
+                    if event.get("id") == ping_id:
+                        return received
+    except Exception:  # noqa: BLE001 - a closed or silent peer is the failure
+        pass
+    return received
+
+
+async def exchange_media_json(
+    websocket: object,
+    args: argparse.Namespace,
+    participants: list[Participant],
+    total_frames: int,
+) -> None:
+    """Send info, start and media events, confirm a pong, then session-end."""
+    await websocket.send(json.dumps(media_json_info()))
+    print('sent info event (application "jitsi-videobridge")')
+
+    sequence = 0
+    for participant in participants:
+        sequence += 1
+        await websocket.send(json.dumps(media_json_start(participant, sequence)))
+    print(
+        f"sent {len(participants)} start event(s); this framing carries no "
+        "participant metadata, so the bridge will use its fallback recipient"
+    )
+
+    pings = 0
+    if args.audio == "none":
+        print("sending no audio (--audio none)")
+    else:
+        print(
+            f"streaming {total_frames} media events per participant "
+            f"({'in real time' if args.realtime else 'as fast as possible'})"
+        )
+        sequence, packets, pings = await stream_media_json(
+            websocket, participants, args.realtime, sequence
+        )
+        print(f"sent {packets} media event(s) across {len(participants)} participant(s)")
+
+    # One final ping, answered before session-end closes the exchange: the pong
+    # is the one message this protocol requires the receiver to send.
+    pings += 1
+    await websocket.send(json.dumps(media_json_ping(pings)))
+    answered = await collect_pongs(websocket, pings, timeout=2.0)
+    print(f"the bridge answered {answered} of {pings} ping(s)")
+
+    await websocket.send(json.dumps(media_json_session_end()))
+    print("sent session-end; the bridge will now transcribe, summarise and email")
+    await asyncio.sleep(0.3)
+
+
 async def run(args: argparse.Namespace) -> int:
     import websockets
 
@@ -223,7 +425,10 @@ async def run(args: argparse.Namespace) -> int:
     print(f"connecting to {uri}", flush=True)
     try:
         async with websockets.connect(uri) as websocket:
-            await exchange(websocket, args, participants, total_frames)
+            if args.protocol == "media-json":
+                await exchange_media_json(websocket, args, participants, total_frames)
+            else:
+                await exchange(websocket, args, participants, total_frames)
     except OSError as exc:
         # The common case by far: nothing is listening yet.
         print(
@@ -370,6 +575,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--duration", type=float, default=10.0, help="seconds of audio (default: %(default)s)"
+    )
+    parser.add_argument(
+        "--protocol",
+        choices=PROTOCOLS,
+        default="binary",
+        help=(
+            "binary is this repository's framing ([16-byte id][Opus]); "
+            "media-json is stock Jitsi's bridge-based transcription "
+            "(default: %(default)s)"
+        ),
     )
     parser.add_argument(
         "--audio",

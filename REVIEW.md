@@ -321,6 +321,10 @@ A sender that reconnects with the same `sessionId` re-transcribes, overwrites
 same identifier interleave writes into the same participant files and corrupt
 both.
 
+This is likelier on the stock-Jitsi path than it was with the custom sender: the
+JVB retries a failed or timed-out connect with backoff and reuses the same
+`sessionId`, so a bridge restart or a dropped ping produces exactly this.
+
 *Fix:* a session registry holding `capturing`/`processing`/`done`, rejecting a
 second live connection with the same identifier and refusing to re-process a
 finished one. A `session.json` recording the state would also make an

@@ -1,0 +1,14 @@
+#!/bin/sh
+# Stop and disable the service before its files are removed.
+set -e
+
+if [ "$1" = "remove" ] || [ "$1" = "deconfigure" ]; then
+    if command -v deb-systemd-invoke >/dev/null 2>&1; then
+        deb-systemd-invoke stop jitsi-audio-bridge.service >/dev/null || true
+    fi
+    if [ "$1" = "remove" ] && command -v deb-systemd-helper >/dev/null 2>&1; then
+        deb-systemd-helper disable jitsi-audio-bridge.service >/dev/null || true
+    fi
+fi
+
+exit 0

@@ -27,9 +27,11 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from tools.send_meeting import Participant  # noqa: E402
 from tools.send_meeting import main as send_main  # noqa: E402
 from tools.stubs import OllamaStub, SmtpStub, WhisperStub, free_port, write_config  # noqa: E402
 from tools.testenv import Bridge  # noqa: E402
+from tools.verify_jitsi import main as verify_main  # noqa: E402
 
 CHECKS: list[tuple[str, bool, str]] = []
 
@@ -119,6 +121,68 @@ def send_junk_then_audio(url: str, session_id: str) -> bool:
             return True
         except Exception as exc:  # noqa: BLE001 - the point is that it does not happen
             print(f"    session died on a junk frame: {type(exc).__name__}: {exc}")
+            return False
+
+    return asyncio.run(attempt())
+
+
+def send_media_json_events(url: str, session_id: str) -> bool:
+    """Send media-json events that must not abort the session, and check the pong.
+
+    Exercises the dispatch and validation rules: junk events, a ping the bridge
+    must answer with a matching pong, and media that arrives before any start
+    event. Returns whether the connection stayed open and the pong arrived.
+    """
+    import websockets
+
+    from jitsi_audio_bridge.audio import OpusEncoder
+    from tools.send_meeting import (
+        frame_samples,
+        media_json_media,
+        media_json_ping,
+        media_json_session_end,
+        tone_frame,
+    )
+
+    async def attempt() -> bool:
+        uri = f"{url}?sessionId={session_id}"
+        participant = Participant(identifier="edge", name="Edge", email="edge@example.com")
+        try:
+            async with websockets.connect(uri) as ws:
+                for junk in (
+                    "not json at all",
+                    "[1,2,3]",
+                    '{"event": 5}',
+                    '{"event": "media"}',
+                    json.dumps({"event": "future-event"}),
+                    json.dumps({"event": "ping"}),  # no id: cannot be answered
+                ):
+                    await ws.send(junk)
+
+                await ws.send(json.dumps(media_json_ping(7)))
+                reply = json.loads(await asyncio.wait_for(ws.recv(), timeout=5))
+                if reply != {"event": "pong", "id": 7}:
+                    print(f"    expected a pong for id 7, got {reply!r}")
+                    return False
+
+                # No start event: the bridge must key the recording by tag anyway.
+                encoder = OpusEncoder(48000, 1, "audio")
+                try:
+                    for index in range(20):
+                        packet = encoder.encode(
+                            tone_frame(440.0, index, 48000), frame_samples(48000)
+                        )
+                        await ws.send(
+                            json.dumps(media_json_media(participant, index + 1, index,
+                                                        index * 960, packet))
+                        )
+                finally:
+                    encoder.close()
+                await ws.send(json.dumps(media_json_session_end()))
+                await asyncio.sleep(0.3)
+            return True
+        except Exception as exc:  # noqa: BLE001 - the point is that it does not happen
+            print(f"    media-json session died: {type(exc).__name__}: {exc}")
             return False
 
     return asyncio.run(attempt())
@@ -421,7 +485,87 @@ def main() -> int:
         # or it arrives mid-check and looks like an extra one.
         wait_for(lambda: len(smtp.messages) > before_junk, timeout=30)
 
-        print("\n7. directory mode (--process-dir)")
+        print("\n7. media-json capture (stock Jitsi's framing)")
+        before_mediajson = len(smtp.messages)
+        send_meeting(
+            url,
+            session_id="mediajson",
+            participants=2,
+            duration=4,
+            fast=True,
+            protocol="media-json",
+            participant=["alice:Alice:alice@example.com", "bob:Bob:bob@example.com"],
+        )
+
+        mediajson = recordings / "mediajson"
+        wait_for(lambda: (mediajson / "participant-alice-audio.wav").exists(), timeout=15)
+
+        check(
+            "media-json recordings are keyed by the source tag",
+            (mediajson / "participant-alice-audio.wav").is_file()
+            and (mediajson / "participant-bob-audio.wav").is_file(),
+            f"contents: {sorted(p.name for p in mediajson.iterdir())}"
+            if mediajson.is_dir()
+            else "no session directory",
+        )
+        check("media events never reach metadata.json",
+              not (mediajson / "metadata.json").exists())
+
+        alice_json = mediajson / "participant-alice-audio.wav"
+        if alice_json.is_file():
+            with wave.open(str(alice_json), "rb") as handle:
+                shape = (handle.getnchannels(), handle.getframerate(), handle.getsampwidth())
+                check("media-json WAV is 16 kHz mono 16-bit", shape == (1, 16000, 2), f"{shape}")
+                expected = 4 * 16000
+                check(
+                    "media-json WAV holds the audio that was sent",
+                    abs(handle.getnframes() - expected) <= 1600,
+                    f"{handle.getnframes()} frames, expected about {expected}",
+                )
+
+        wait_for(lambda: len(smtp.messages) > before_mediajson, timeout=60)
+        transcript = mediajson / "transcript.txt"
+        if transcript.is_file():
+            body = transcript.read_text()
+            # No names arrive on this protocol, so attribution falls back to
+            # the recording's own filename.
+            check("media-json speakers fall back to their tags",
+                  "participant-alice-audio" in body, body.strip()[:80])
+        check("a media-json session is transcribed and emailed",
+              len(smtp.messages) == before_mediajson + 1,
+              f"{len(smtp.messages) - before_mediajson} message(s)")
+        check(
+            "with no metadata the room falls back to 'General Meeting'",
+            bool(ollama.summary_prompts) and "General Meeting" in ollama.summary_prompts[-1],
+        )
+        if len(smtp.messages) > before_mediajson:
+            check("the fallback recipient got the mail",
+                  "fallback@example.com" in smtp.messages[-1])
+
+        print("\n8. media-json edge cases")
+        before_edge = len(smtp.messages)
+        check("junk media-json events do not kill the session, and the pong is answered",
+              send_media_json_events(url, "mediajson-edge"))
+        edge = recordings / "mediajson-edge"
+        check("media sent before any start event is still recorded",
+              bool(list(edge.glob("participant-edge-audio.wav"))))
+        check("edge-case events never reach metadata.json",
+              not (edge / "metadata.json").exists())
+        wait_for(lambda: len(smtp.messages) > before_edge, timeout=60)
+
+        print("\n9. deployment-check probe (tools.verify_jitsi)")
+        probe_url = f"{url}?sessionId=verify-jitsi"
+        passed = verify_main(["--only", "probe", "--url", probe_url, "--timeout", "5"])
+        check("the deployment probe passes against a healthy bridge", passed == 0,
+              f"exit {passed}")
+        refused = verify_main([
+            "--only", "probe", "--url", f"ws://127.0.0.1:{port}/wrong-path",
+            "--timeout", "5", "--ping-timeout", "2",
+        ])
+        check("the deployment probe fails on a path the bridge does not serve",
+              refused == 1, f"exit {refused}")
+
+        print("\n10. directory mode (--process-dir)")
         check_directory_mode(config_path, workdir, smtp, ollama)
 
     finally:

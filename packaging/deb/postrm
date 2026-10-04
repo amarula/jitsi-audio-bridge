@@ -1,0 +1,21 @@
+#!/bin/sh
+# Clean up after removal. Recordings and the service user are deliberately
+# left behind: the recordings are the only copy of a meeting, and a stale
+# system user owns nothing that is removed here.
+set -e
+
+if [ "$1" = "purge" ]; then
+    rm -f /etc/jitsi-audio-bridge/env
+    rmdir /etc/jitsi-audio-bridge 2>/dev/null || true
+    if command -v deb-systemd-helper >/dev/null 2>&1; then
+        deb-systemd-helper purge jitsi-audio-bridge.service >/dev/null || true
+    fi
+fi
+
+if [ "$1" = "remove" ] || [ "$1" = "purge" ]; then
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+fi
+
+exit 0

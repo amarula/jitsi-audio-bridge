@@ -37,9 +37,11 @@ and emails the result.
 
 - [Requirements](#requirements)
 - [Install](#install)
+- [Debian package](#debian-package)
 - [Configuration](#configuration)
 - [Running](#running)
 - [Wire protocol](#wire-protocol)
+- [Jitsi integration](docs/jitsi-integration.md)
 - [Batch mode](#batch-mode)
 - [Running as a service](#running-as-a-service)
 - [Test environment](#test-environment)
@@ -85,6 +87,41 @@ For development, install editable with the test and lint extras:
 ```sh
 .venv/bin/pip install -e '.[dev]'
 ```
+
+## Debian package
+
+`make deb` builds `dist/jitsi-audio-bridge_<version>_<arch>.deb`:
+
+```sh
+sudo apt install dpkg-dev python3-venv   # build prerequisites
+make deb
+sudo dpkg -i dist/jitsi-audio-bridge_*_amd64.deb
+```
+
+**Build on the machine you will install it on** (or in a container matching
+it). The package carries its dependencies in a private virtualenv at
+`/usr/lib/jitsi-audio-bridge/venv`, because the distribution's
+`python3-websockets` is older than the `websockets>=13` this daemon requires
+(Debian 12 ships 10.4, Ubuntu 24.04 ships 12.0). A virtualenv belongs to one
+interpreter version and architecture, so the postinst warns loudly if the
+target's `python3` minor differs from the one it was built for.
+
+What the package installs: `/usr/bin/jitsi-audio-bridge` (a launcher for the
+venv), the systemd unit, and `/etc/jitsi-audio-bridge/config.ini` **as a
+conffile**, so upgrades never clobber your edits. It also installs the two
+deployment tools, so a Jitsi host needs nothing but this package to run them:
+`jitsi-audio-bridge-verify` ([the deployment checker](#jitsi-integration),
+meant to be run on the Jitsi host) and `jitsi-audio-bridge-send` (the sender
+simulator from [Test environment](#test-environment), for exercising the bridge
+without Jitsi). The postinst creates the
+`jitsi-bridge` system user and `/srv/recordings`, and enables the unit but
+deliberately does not start it — review `config.ini`, put the SMTP password in
+`/etc/jitsi-audio-bridge/env` (mode 0600, created empty), then
+`systemctl start jitsi-audio-bridge`. `Depends: python3 (>= 3.11), libopus0`;
+`Recommends: ffmpeg` (only batch mode's master-track extraction uses it).
+Removing the package stops and disables the unit; purging leaves
+`/srv/recordings` and the service user in place, because the recordings are the
+only copy of a meeting.
 
 ## Configuration
 
@@ -193,7 +230,9 @@ the end of the first meeting.
 
 > **This contract is not verified.** It is taken from the behaviour the code was
 > written against, and is documented here because the sender lives outside this
-> repository. See [Limitations](#limitations).
+> repository. See [Limitations](#limitations), and
+> [docs/jitsi-integration.md](docs/jitsi-integration.md) for how stock Jitsi's
+> sender differs from it.
 
 The server accepts a single route, `/transcribe`. A connection to any other path
 is closed with code `1008`.
@@ -264,6 +303,52 @@ session end, which is the signal to look for.
 
 Each packet is decoded straight to 16 kHz mono. A packet that libopus rejects is
 counted and skipped — it never aborts the recording.
+
+### Text frames — stock Jitsi's media-json
+
+The same route also accepts the framing stock Jitsi's JVB uses for bridge-based
+transcription (see [Jitsi integration](#jitsi-integration)): JSON text frames
+with an `event` key. A text frame carrying that key is always treated as a
+media-json event and never as a control frame, so the key is reserved.
+
+| `event` | Handling |
+|---|---|
+| `info` | Logged (application, version, region); ignored |
+| `start` | Logged (tag, endpoint id, format); no file is created from it alone |
+| `media` | Base64-decoded to one Opus packet, appended to `participant-<tag>.wav` |
+| `ping` | Answered with `{"event":"pong","id":<same>}`; the JVB requires it |
+| `session-end` | Finalises the recording without waiting for the close |
+| anything else | Logged and ignored; a malformed event is counted, never fatal |
+
+Frames are dispatched by shape, so both framings can be served on one route
+without negotiating a mode.
+
+The protocol carries no participant names, addresses or room name. A meeting
+recorded this way is therefore summarised as "General Meeting", its speakers
+are attributed by source tag, and the mail goes to `[smtp]
+fallback_recipient`. [docs/jitsi-integration.md](docs/jitsi-integration.md)
+documents the framing in full.
+
+## Jitsi integration
+
+Stock Jitsi can feed this daemon directly. With *bridge-based transcription*,
+Jicofo tells the JVB to open one WebSocket per conference and forward every
+participant's Opus audio over it, tagged per participant — the media-json
+framing described above, which the daemon receives.
+
+[docs/jitsi-integration.md](docs/jitsi-integration.md) has the Jitsi-side
+configuration (Jicofo's `transcription.url-template`, the Prosody gating, the
+`config.js` flag) and the exact protocol the JVB sends. Two things to plan for:
+the framing carries no participant names or addresses (mail falls back to
+`fallback_recipient`), and a reconnecting JVB reuses its `sessionId`.
+
+`python3 -m tools.verify_jitsi` checks a deployment against that document and
+is read-only: `--only config` parses the Jicofo, Prosody and client files
+(finding, for example, a `transcription` block that is still commented out),
+`--only probe` connects to the configured URL as the JVB would and requires the
+pong, and `--only logs` scans recent `jitsi-videobridge2`/`jicofo` journal
+entries for the connect lifecycle. Every failure prints the fix; exit status is
+1 if any check failed.
 
 ## Batch mode
 
@@ -360,6 +445,9 @@ python3 -m tools.send_meeting --audio wav \
     --wav /tmp/samples/alice.wav --wav /tmp/samples/bob.wav --wav /tmp/samples/carol.wav \
     --participant alice:Alice --participant bob:Bob --participant carol:Carol
 
+# Stock Jitsi's framing: JSON events, base64 Opus, ping/pong, no metadata.
+python3 -m tools.send_meeting --protocol media-json --participants 2 --duration 10
+
 # Edge cases worth trying.
 python3 -m tools.send_meeting --audio none        # no audio: nothing should be emailed
 python3 -m tools.send_meeting --no-metadata       # no control frame: no room, no recipients
@@ -442,11 +530,19 @@ daemon closes every file in a `finally`, so this needs a hard kill; see
 
 - **The binary frame format is unverified.** The metadata shape is known from a
   working reference implementation, but the `[16-byte id][Opus]` framing is not:
-  the sending side is not in this repository, and stock Jitsi Videobridge
-  Colibri WebSockets carry JSON control messages for Jicofo rather than
-  per-participant Opus media. So this framing is specific to a custom sender and
-  should be confirmed against it. `tools/send_meeting.py` encodes the assumption
-  rather than validating it.
+  the sending side is not in this repository. Stock Jitsi does export
+  per-participant Opus over a WebSocket — the JVB's media export, driven by
+  Jicofo's `transcription.url-template` — but it frames the audio as JSON media
+  events with base64 payloads, not as binary frames, so it is not the sender
+  this framing came from — the daemon receives that path separately, keyed by
+  source tag (see [docs/jitsi-integration.md](docs/jitsi-integration.md)).
+  `tools/send_meeting.py` encodes the binary assumption rather than validating
+  it.
+- **A media-json meeting loses its participant names.** Stock Jitsi's framing
+  carries no names, addresses or room name, so speakers are attributed by their
+  source tag, the summary is titled "General Meeting", and the mail goes to
+  `[smtp] fallback_recipient`. Correlating `sessionId` with the conference
+  elsewhere is the only way to recover them.
 - **No conversational ordering.** No timestamps are recorded, so the transcript
   is one block per participant in filesystem order, not interleaved by time.
   This is the single largest quality limitation; recovering it means recording

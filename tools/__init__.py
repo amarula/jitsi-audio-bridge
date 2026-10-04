@@ -10,6 +10,10 @@ Three runnable pieces:
     whatever forwards audio from the Jitsi side.
 ``testenv``
     Brings the stubs and the bridge up together and prints how to drive them.
+``verify_jitsi``
+    Checks a Jitsi deployment against docs/jitsi-integration.md: parses the
+    Jicofo, Prosody and client configuration, probes the bridge as the JVB
+    would, and classifies the recent logs.
 
 Run them from a checkout without installing the package first: this module puts
 ``src/`` on the import path.

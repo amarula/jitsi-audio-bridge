@@ -1,0 +1,21 @@
+Package: jitsi-audio-bridge
+Version: @VERSION@
+Section: net
+Priority: optional
+Architecture: @ARCH@
+Depends: python3 (>= 3.11), libopus0, init-system-helpers (>= 1.18)
+Recommends: ffmpeg
+Installed-Size: @INSTALLED_SIZE@
+Maintainer: @MAINTAINER@
+Description: record Jitsi participant audio and email a transcript
+ Captures per-participant Opus audio from a Jitsi Videobridge over a
+ WebSocket, records each participant to a WAV file, then transcribes it with a
+ Whisper endpoint, summarises it with an Ollama endpoint and emails the
+ result. The same pipeline also runs over recordings that already exist on
+ disk.
+ .
+ The package carries its own dependencies in a private virtualenv under
+ /usr/lib/jitsi-audio-bridge, because the distribution's python3-websockets
+ is older than the websockets>=13 this daemon requires. That virtualenv was
+ built for python3 @PYTHON_MINOR@, so build and install on the same
+ distribution.

@@ -138,6 +138,11 @@ def report(session_dir: Path, ollama: OllamaStub, whisper: WhisperStub, smtp: Sm
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Imported here rather than at module level so the interactive mode does
+    # not pull in the Opus binding before it is needed.
+    from tools.send_meeting import PROTOCOLS
+    from tools.send_meeting import main as send_main
+
     parser = argparse.ArgumentParser(
         prog="python3 -m tools.testenv",
         description="Start stub services and the bridge, ready to be driven.",
@@ -164,6 +169,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--wav", action="append", metavar="PATH", help="replay a WAV instead of tones"
+    )
+    parser.add_argument(
+        "--protocol",
+        choices=PROTOCOLS,
+        default="binary",
+        help="wire protocol for the scripted meeting (default: %(default)s)",
     )
     args = parser.parse_args(argv)
 
@@ -232,8 +243,6 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         # Scripted meeting.
-        from tools.send_meeting import main as send_main
-
         print("running a scripted meeting...")
         send_argv = [
             "--url",
@@ -244,6 +253,8 @@ def main(argv: list[str] | None = None) -> int:
             str(args.participants),
             "--duration",
             str(args.duration),
+            "--protocol",
+            args.protocol,
             "--fast",
         ]
         for path in args.wav or []:
