@@ -216,7 +216,10 @@ up on, waiting twice as long before each retry — 1 s, 2 s, 4 s, 8 s — becaus
 what is being waited for is a model being loaded, which takes seconds and then
 takes them all at once. Five attempts span about fifteen seconds; the wait is
 capped at 30 s whatever the limit. Only a 5xx or a failed connection is
-retried: a 4xx means the request itself is wrong.
+retried: a 4xx means the request itself is wrong. Either way the service's
+own explanation is quoted in the log — "model not loaded", "all slots are
+busy", a CUDA error — because a failure body is the only place that reason
+appears, and the daemon's log is where you will be looking.
 
 ### `[whisper]`
 

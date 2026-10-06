@@ -60,6 +60,25 @@ def set_ai_limits(max_concurrent_requests: int, max_attempts: int) -> None:
     _attempts = max(1, max_attempts)
 
 
+#: A failure body is the service explaining itself, and it is the only place
+#: the reason appears: "model not loaded", "all slots are busy", a CUDA error.
+#: It goes into our log, so it has to be bounded and on one line.
+_FAILURE_DETAIL_CHARS = 200
+
+
+def describe_failure(response: requests.Response) -> str:
+    """The service's own words about a failure, or an empty string."""
+    try:
+        body = " ".join((response.text or "").split())
+    except Exception:  # noqa: BLE001 - a broken body must not mask the failure
+        return ""
+    if not body:
+        return ""
+    if len(body) > _FAILURE_DETAIL_CHARS:
+        body = body[:_FAILURE_DETAIL_CHARS] + "…"
+    return f": {body}"
+
+
 def backoff_seconds(attempt: int) -> float:
     """How long to wait before *attempt*, counting from 1.  0 for the first."""
     if attempt < 2:
@@ -95,11 +114,20 @@ def _post_json(url: str, payload: dict[str, object], endpoint: EndpointConfig) -
         status = response.status_code
         if status >= 500:
             # The service is there and cannot serve right now.
-            logger.warning("%s answered %d (attempt %d/%d)", url, status, attempt, attempts)
+            logger.warning(
+                "%s answered %d (attempt %d/%d)%s",
+                url,
+                status,
+                attempt,
+                attempts,
+                describe_failure(response),
+            )
             continue
         if status >= 400:
             # The request itself is wrong: asking it again changes nothing.
-            logger.error("%s answered %d; not retrying", url, status)
+            logger.error(
+                "%s answered %d; not retrying%s", url, status, describe_failure(response)
+            )
             return None
 
         try:

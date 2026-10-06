@@ -1083,6 +1083,40 @@ def test_retries_double_their_wait_and_stop_at_the_limit(
     assert ai_client.backoff_seconds(1) == 0.0
 
 
+
+def test_a_failure_body_is_quoted_in_the_log(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, clean_env: None, caplog
+) -> None:
+    """The service's reason is the only place it appears; keep it in ours."""
+    from jitsi_audio_bridge import ai_client
+
+    monkeypatch.setattr(config_module, "SEARCH_PATHS", (tmp_path / "nothing.ini",))
+    config = load_config()
+    ai_client.set_ai_limits(1, 2)
+    audio = tmp_path / "participant-x.wav"
+    audio.write_bytes(b"payload")
+
+    class Response:
+        status_code = 503
+        text = '{\n  "error": "all slots are busy",\n  "cuda": "out of memory"\n}'
+        def json(self) -> dict:
+            return {}
+
+    monkeypatch.setattr(ai_client.requests, "post", lambda *a, **k: Response())
+    monkeypatch.setattr(ai_client.time, "sleep", lambda _: None)
+
+    with caplog.at_level("WARNING"):
+        assert ai_client.transcribe_audio(audio, config.whisper) == ""
+    assert "all slots are busy" in caplog.text
+    # One line, and bounded: a service that answers with a novel must not
+    # flood the journal.
+    line = next(record.getMessage() for record in caplog.records if "503" in record.getMessage())
+    assert "\n" not in line
+    assert len(ai_client.describe_failure(Response())) < 240
+
+    ai_client.set_ai_limits(1, ai_client.DEFAULT_MAX_ATTEMPTS)
+
+
 def test_a_client_error_is_not_retried(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, clean_env: None
 ) -> None:
