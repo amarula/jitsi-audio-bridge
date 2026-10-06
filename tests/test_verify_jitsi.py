@@ -1034,10 +1034,7 @@ NO_ROOM_METADATA = (
 
 
 def _plugin_reader(plugin_dir: Path) -> object:
-    return _reader({
-        plugin_dir / "mod_room_metadata.lua": "-- room metadata\n",
-        plugin_dir / "mod_room_metadata_component.lua": "-- component\n",
-    })
+    return _reader({plugin_dir / "mod_room_metadata_component.lua": "-- component\n"})
 
 
 def test_lua_block_offsets_start_right_after_the_header() -> None:
@@ -1047,7 +1044,7 @@ def test_lua_block_offsets_start_right_after_the_header() -> None:
     assert text[block.start :].startswith("\n    modules_enabled")
 
 
-def test_propose_prosody_adds_the_room_metadata_plumbing(tmp_path: Path) -> None:
+def test_propose_prosody_adds_the_room_metadata_component(tmp_path: Path) -> None:
     plugin_dir = tmp_path / "plugins"
     plugin_dir.mkdir()
     proposals = propose_prosody_fixes(
@@ -1057,12 +1054,11 @@ def test_propose_prosody_adds_the_room_metadata_plumbing(tmp_path: Path) -> None
     by_id = {p.check_id: p for p in proposals}
     site = by_id["prosody.room_metadata"]
     assert site.target is not None
-    assert '"room_metadata";' in site.new_text
-    assert 'room_metadata_component = "metadata.meet.example.com"' in site.new_text
     assert 'Component "metadata.meet.example.com" "room_metadata_component"' in site.new_text
     assert 'muc_component = "conference.meet.example.com"' in site.new_text
-    # The VirtualHost keeps its own table; the module goes there, not on the MUC.
-    assert '"room_metadata";\n    }' in site.new_text
+    # The deprecated module is gone upstream: only the component is proposed.
+    assert '"room_metadata";' not in site.new_text
+    assert 'room_metadata_component = "' not in site.new_text
 
     # Installing it must satisfy the check it addresses.
     checks = check_prosody(
@@ -1099,3 +1095,29 @@ def test_propose_prosody_skips_room_metadata_work_when_it_is_present(tmp_path: P
     assert site.new_text.count('Component "metadata.') == 1
     assert 'room_metadata_component = "' not in site.new_text
     assert site.new_text.count('"room_metadata";') == 1
+
+
+def test_room_metadata_check_accepts_the_modern_component_only_shape() -> None:
+    """Upstream removed mod_room_metadata.lua in 2026; the component is what counts."""
+    component_only = (
+        'VirtualHost "meet.example.com"\n'
+        '    modules_enabled = { }\n'
+        'Component "conference.meet.example.com" "muc"\n'
+        '    main_muc = "conference.meet.example.com"\n'
+        'Component "metadata.meet.example.com" "room_metadata_component"\n'
+        '    muc_component = "conference.meet.example.com"\n'
+    )
+    checks = check_prosody(
+        _deployment(prosody_text=component_only), "meet.example.com", [], lambda p: None
+    )
+    assert _status(checks, "prosody.room_metadata") is Status.PASS
+
+    module_only = component_only.replace(
+        'Component "metadata.meet.example.com" "room_metadata_component"\n'
+        '    muc_component = "conference.meet.example.com"\n',
+        "",
+    ).replace('modules_enabled = { }', 'modules_enabled = { "room_metadata"; }')
+    checks = check_prosody(
+        _deployment(prosody_text=module_only), "meet.example.com", [], lambda p: None
+    )
+    assert _status(checks, "prosody.room_metadata") is Status.WARN

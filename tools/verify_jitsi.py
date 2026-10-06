@@ -1059,29 +1059,30 @@ def check_prosody(
                 "a random meeting id of its own",
         ))
 
-    has_module = "room_metadata" in modules or any(
-        "room_metadata" in lua_module_names(host.body) for host in virtual_hosts
-    )
     has_component = any(
         block.kind == "Component" and block.type == "room_metadata_component" for block in blocks
     )
-    if has_module and has_component:
+    has_module = "room_metadata" in modules or any(
+        "room_metadata" in lua_module_names(host.body) for host in virtual_hosts
+    )
+    if has_component:
         checks.append(Check("prosody.room_metadata", Status.PASS,
-                            "room_metadata and room_metadata_component are present"))
-    elif has_component or has_module:
+                            "room_metadata_component is present"))
+    elif has_module:
         checks.append(Check(
             "prosody.room_metadata", Status.WARN,
-            "room metadata is only partially configured "
-            f"(module: {has_module}, component: {has_component})",
-            fix="compare with the stock site config; Jicofo reads the gating flags "
-                "from the room metadata component",
+            "the deprecated room_metadata module is enabled, but the "
+            "room_metadata_component Jicofo reads is missing",
+            fix="add the stock Component block; the module it used to pair with was "
+                "removed upstream in 2026",
         ))
     else:
         checks.append(Check(
             "prosody.room_metadata", Status.FAIL,
-            "no room_metadata module or room_metadata_component component found",
-            fix="Jicofo never sees asyncTranscription without them; restore the stock "
-                "room_metadata entries in the site config",
+            "no room_metadata_component in the Prosody configuration",
+            fix="Jicofo never sees asyncTranscription without it; add the stock "
+                'Component "metadata.<domain>" "room_metadata_component" block '
+                "(docs/jitsi-integration.md §2)",
         ))
 
     forcing, missing = module_files_for(modules, plugin_dirs, read_module)
@@ -1439,25 +1440,28 @@ def propose_jicofo_fix(
     return proposals
 
 
-ROOM_METADATA_PLUGINS = ("mod_room_metadata.lua", "mod_room_metadata_component.lua")
+#: The component that stores room metadata for Jicofo.  Its companion module,
+#: ``mod_room_metadata.lua``, was removed upstream in June 2026 ("remove
+#: deprecated modules"), and the current stock configuration declares only the
+#: component — so that, not the module, is what is required and proposed.
+ROOM_METADATA_PLUGIN = "mod_room_metadata_component.lua"
 
 
 def missing_room_metadata_plugins(
     plugin_dirs: Sequence[Path], read: Callable[[Path], str | None]
 ) -> str | None:
-    """The first room-metadata plugin file absent from every readable plugin dir.
+    """The room-metadata plugin file, if it is absent from every readable dir.
 
-    ``None`` when they are all there, or when no plugin directory is readable —
-    in that case the tool cannot tell and says so rather than guessing.  A
+    ``None`` when it is there, or when no plugin directory is readable — in
+    that case the tool cannot tell and says so rather than guessing.  A
     component whose module is missing stops Prosody from starting, so this
     gates the proposal.
     """
     readable = [directory for directory in plugin_dirs if directory.is_dir()]
     if not readable:
         return None
-    for name in ROOM_METADATA_PLUGINS:
-        if not any(read(directory / name) is not None for directory in readable):
-            return name
+    if not any(read(directory / ROOM_METADATA_PLUGIN) is not None for directory in readable):
+        return ROOM_METADATA_PLUGIN
     return None
 
 
@@ -1477,12 +1481,6 @@ def propose_prosody_fixes(
     main_muc = find_main_muc(blocks, domain)
     if main_muc is None:
         return []
-    virtual_host = next(
-        (block for block in blocks
-         if block.kind == "VirtualHost" and (domain is None or block.name == domain)),
-        None,
-    )
-
     proposals: list[Proposal] = []
     notes: list[str] = []
     # (offset, transform) pairs, applied highest offset first so every span
@@ -1493,7 +1491,6 @@ def propose_prosody_fixes(
         return lambda current: current[:offset] + addition + current[offset:]
 
     modules = lua_module_names(main_muc.body)
-    vhost_modules = lua_module_names(virtual_host.body) if virtual_host else []
     enable: list[str] = []
 
     # --- the module that forces asyncTranscription -------------------------
@@ -1524,59 +1521,36 @@ def propose_prosody_fixes(
     if "muc_meeting_id" not in modules:
         enable.append("muc_meeting_id")
 
-    # --- the room metadata plumbing ----------------------------------------
-    has_module = "room_metadata" in modules or "room_metadata" in vhost_modules
+    # --- the room metadata component ---------------------------------------
+    # The stock configuration declares only the component; the module it used
+    # to pair with was removed upstream in 2026, so it is not proposed.
     has_component = any(
         block.kind == "Component" and block.type == "room_metadata_component" for block in blocks
     )
-    component_name = f"metadata.{domain}" if domain else "metadata.<domain>"
-    adding_component = not has_component or not has_module
+    adding_component = not has_component
     if adding_component:
         absent = missing_room_metadata_plugins(plugin_dirs, read)
         if absent is not None:
             adding_component = False
             proposals.append(Proposal(
-                "prosody.room_metadata", "cannot enable the room metadata plumbing",
+                "prosody.room_metadata", "cannot add the room metadata component",
                 reason=f"{absent} is not installed in the Prosody plugin paths; a component "
                        "whose module is missing stops Prosody from starting. Upgrade the "
                        "package (apt install --only-upgrade jitsi-meet-prosody) and rerun "
                        "--fix",
             ))
         else:
-            if not has_module:
-                span = (
-                    lua_table_span(virtual_host.body, "modules_enabled")
-                    if virtual_host
-                    else None
-                )
-                if span is not None:
-                    absolute = (virtual_host.start + span[0], virtual_host.start + span[1])
-                    edits.append((absolute[1], lambda current, at=absolute: add_lua_modules(
-                        current, at, ["room_metadata"]
-                    )))
-                    notes.append('"room_metadata" is enabled on the VirtualHost, as the stock '
-                                 "configuration does")
-                else:
-                    enable.append("room_metadata")
-                    notes.append('"room_metadata" is enabled on the MUC (no VirtualHost module '
-                                 "table was found)")
-            if virtual_host is not None and "room_metadata_component" not in virtual_host.body:
-                # The block's start is immediately after the header, so the
-                # addition ends where the original newline continues it.
-                addition = f'\n    room_metadata_component = "{component_name}"'
-                edits.append((virtual_host.start, insert_at(virtual_host.start, addition)))
-                notes.append(f'the VirtualHost points at {component_name}')
-            if not has_component:
-                block_lua = (
-                    f'Component "{component_name}" "room_metadata_component"\n'
-                    f'    muc_component = "{main_muc.name}"\n'
-                )
-                edits.append((len(text), lambda current, block=block_lua:
-                              append_to_file_text(current, block)))
-                notes.append(f'Component "{component_name}" is appended to the file')
+            component_name = f"metadata.{domain}" if domain else "metadata.<domain>"
+            block_lua = (
+                f'Component "{component_name}" "room_metadata_component"\n'
+                f'    muc_component = "{main_muc.name}"\n'
+            )
+            edits.append((len(text), lambda current, block=block_lua:
+                          append_to_file_text(current, block)))
+            notes.append(f'Component "{component_name}" is appended to the file')
             if not any(directory.is_dir() for directory in plugin_dirs):
-                notes.append("verify mod_room_metadata_component.lua is installed before "
-                             "restarting Prosody")
+                notes.append(f"verify {ROOM_METADATA_PLUGIN} is installed before restarting "
+                             "Prosody")
 
     # --- the module names on the MUC ---------------------------------------
     if enable:

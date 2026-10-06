@@ -371,13 +371,13 @@ It proposes, each only when its check failed:
 - **Prosody** — `mod_force_async_transcription.lua.new` (or the name of a
   module already present that does the job), the site config with that name
   and `muc_meeting_id` added to the MUC's `modules_enabled`, and — when the
-  room-metadata plumbing is missing, as it is on older installs — the three
-  stock edits: `"room_metadata";` on the VirtualHost, its
-  `room_metadata_component` option, and the
-  `Component "metadata.<domain>" "room_metadata_component"` block. If the
-  plugin files are not installed, that part is refused with the upgrade
-  command instead of proposed, because a component whose module is missing
-  stops Prosody from starting.
+  room-metadata component is missing — the stock
+  `Component "metadata.<domain>" "room_metadata_component"` block with its
+  `muc_component` line (the `room_metadata` module it used to pair with was
+  removed upstream in June 2026). If `mod_room_metadata_component.lua` is not
+  installed, that part is refused with the upgrade command instead of
+  proposed, because a component whose module is missing stops Prosody from
+  starting.
 - **jitsi-meet** — the client config with `transcription: { enabled: true }`
   inserted; a commented-out sample block is left as it is and a live one added.
 
