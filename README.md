@@ -363,7 +363,8 @@ the framing carries no participant names or addresses (mail falls back to
 `python3 -m tools.verify_jitsi` checks a deployment against that document and
 is read-only by default: `--only config` parses the Jicofo, Prosody and client
 files (finding, for example, a `transcription` block that is still commented
-out), `--only probe` connects to the configured URL as the JVB would and
+out, or a Record button whose Jicofo brewery is missing), `--only probe`
+connects to the configured URL as the JVB would and
 requires the pong, and `--only logs` scans recent
 `jitsi-videobridge2`/`jicofo` journal entries for the connect lifecycle. Every
 failure prints the fix; exit status is 1 if any check failed.
@@ -553,6 +554,18 @@ settings and the log; a send failure never discards `transcript.txt`.
 **The transcript is empty or garbled.**
 Look for the per-participant dropped-packet counts at session end. A high ratio
 means the payloads are not plain Opus — most often RED is enabled on the sender.
+
+**Jitsi's Record button says "All recorders are currently busy".**
+That is Jibri's business, not this daemon's: the bridge is started by Jicofo
+only for *transcription*, so recording can be broken while transcription works
+perfectly. Jicofo answers `busy` whenever its recorder pool has no available
+instance, and an empty pool is indistinguishable from a busy one from the
+outside — so this message usually means no Jibri ever registered, not that one
+is occupied. Three things have to line up, and
+`jitsi-audio-bridge-verify --only config` reports all three: Jicofo's
+`jicofo.jibri.brewery-jid`, a Prosody MUC at that JID's domain (the stock
+`internal.auth.<domain>` component), and a Jibri that actually logs into it —
+`journalctl -u jicofo | grep 'brewery instance'` shows the last one registering.
 
 **A `SIGKILL` left an unreadable WAV.**
 The `wave` module writes the real length into the header only on `close()`. The

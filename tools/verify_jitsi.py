@@ -1283,6 +1283,128 @@ def check_meet_config(deployment: Deployment) -> list[Check]:
     return checks
 
 
+def js_config_boolean(text: str, name: str) -> bool | None:
+    """A bare ``name: true`` property of the client config, at any depth.
+
+    ``js_boolean`` reads inside an object; the recording flags are often
+    top-level properties of ``config``, so they need their own reader.
+    """
+    match = re.search(rf"(?<![\w.]){re.escape(name)}\s*:\s*(true|false)\b", text)
+    return None if match is None else match.group(1) == "true"
+
+
+def jibri_brewery_from_prosody(prosody_text: str | None) -> str | None:
+    """The brewery MUC Jibri registers in, as the stock Prosody config names it.
+
+    Jibri logs in as ``jibri@auth.<domain>`` and announces itself in a MUC on
+    the internal auth component; Jicofo has to be pointed at the same JID, and
+    it is the one setting the two sides have to agree on.
+    """
+    if not prosody_text:
+        return None
+    for block in find_lua_blocks(lua_uncomment(prosody_text)):
+        if block.name.startswith("internal.auth."):
+            return f"jibri@{block.name}"
+    return None
+
+
+def check_recording(deployment: Deployment) -> list[Check]:
+    """The Jitsi-side recording chain, which the bridge plays no part in.
+
+    Recording is Jibri's: a recorder announces itself in a "brewery" MUC that
+    Jicofo watches, and only then can a recording request be served.  A
+    deployment can have working transcription and a Record button that always
+    answers "all recorders are currently busy", because an empty recorder pool
+    and a busy one look identical from the outside.
+    """
+    checks: list[Check] = []
+    text = deployment.meet_text
+    offered: bool | None = None
+    if text is None:
+        checks.append(Check(
+            "recording.client", Status.SKIP,
+            f"no client config found for {deployment.domain or 'the discovered domain'}",
+        ))
+    else:
+        stripped = strip_js_comments(text)
+        service = find_js_object(stripped, RECORDING_SERVICE_KEY)
+        service_enabled = js_boolean(service, "enabled") if service else None
+        legacy = js_config_boolean(stripped, RECORDING_LEGACY_KEY)
+        if service_enabled is True:
+            offered = True
+            checks.append(Check("recording.client", Status.PASS, "recordingService.enabled"))
+        elif legacy is True:
+            offered = True
+            checks.append(Check("recording.client", Status.PASS, "fileRecordingsEnabled"))
+        elif service_enabled is False or legacy is False:
+            offered = False
+            checks.append(Check(
+                "recording.client", Status.PASS,
+                "recording is off in the client config, so no Record button is offered",
+            ))
+        else:
+            checks.append(Check(
+                "recording.client", Status.WARN,
+                "the client config never enables recording, so no Record button is offered",
+                fix="add `recordingService: { enabled: true },` (or the older "
+                    "`fileRecordingsEnabled: true`) to offer it, or leave it out deliberately",
+            ))
+
+    if offered is not True:
+        checks.append(Check(
+            "recording.jicofo.brewery", Status.SKIP,
+            "recording is not offered to users, so Jicofo needs no recorder pool",
+        ))
+        return checks
+
+    brewery = hocon_str(deployment.hocon, JIBRI_BREWERY_KEY)
+    if deployment.jicofo_conf is None:
+        checks.append(Check("recording.jicofo.brewery", Status.SKIP,
+                            "no Jicofo configuration to read"))
+    elif not brewery:
+        expected = jibri_brewery_from_prosody(deployment.prosody_text)
+        fix = (
+            f'set `{JIBRI_BREWERY_KEY} = "{expected or "jibri@internal.auth.<domain>"}"` '
+            "and restart Jicofo"
+        )
+        if not expected:
+            fix += (
+                "; no internal.auth component was found in the Prosody configuration "
+                "either, so the brewery MUC is missing too"
+            )
+        checks.append(Check(
+            "recording.jicofo.brewery", Status.FAIL,
+            f"Jicofo has no {JIBRI_BREWERY_KEY}, so its recorder pool is empty: every "
+            "recording request is answered 'busy', which the UI shows as \"all "
+            "recorders are currently busy\", however many Jibri instances run",
+            fix=fix,
+        ))
+    else:
+        component = brewery.split("/")[0].split("@")[-1]
+        blocks = find_lua_blocks(lua_uncomment(deployment.prosody_text or ""))
+        names = {block.name for block in blocks}
+        if deployment.prosody_text is None:
+            checks.append(Check(
+                "recording.jicofo.brewery", Status.SKIP,
+                f"{brewery}: no Prosody configuration to check it against",
+            ))
+        elif component in names:
+            checks.append(Check(
+                "recording.jicofo.brewery", Status.PASS,
+                f"{brewery}, hosted by Prosody",
+            ))
+        else:
+            checks.append(Check(
+                "recording.jicofo.brewery", Status.FAIL,
+                f"Jicofo's recorder pool is {brewery}, but the Prosody configuration has "
+                f"no {component} component, so no recorder can ever register",
+                fix=f'add the stock `Component "{component}" "muc"` block (with Jibri\'s '
+                    "account in its admins) or point the brewery at the component that "
+                    "exists",
+            ))
+    return checks
+
+
 def check_jvb(deployment: Deployment) -> list[Check]:
     if deployment.jvb_conf is None:
         return [Check("jvb.exporter", Status.SKIP, f"no {DEFAULT_JVB_CONF}")]
@@ -1312,6 +1434,18 @@ PROSODY_MODULE_NAME = "force_async_transcription"
 #: component — and drop its messages — without it.
 FEATURES_IDENTITY_MODULE = "features_identity"
 FEATURES_IDENTITY_PLUGIN = "mod_features_identity.lua"
+
+#: Jicofo's recorder pool.  Unset, the pool is empty and every recording
+#: request is answered "busy" — indistinguishable, from the UI, from a pool
+#: whose recorders are all occupied.
+JIBRI_BREWERY_KEY = "jicofo.jibri.brewery-jid"
+#: An instance joined a brewery; the line carries its JID, which is how the
+#: Jibri brewery can be told from the bridge's.
+BREWERY_INSTANCE_LINE = "Added brewery instance:"
+#: The client-side flags that offer recording: the current service block and
+#: the older bare boolean.
+RECORDING_SERVICE_KEY = "recordingService"
+RECORDING_LEGACY_KEY = "fileRecordingsEnabled"
 
 #: The bookkeeping module, verbatim from docs/jitsi-integration.md §2; a test
 #: compares the two so they cannot drift apart.
@@ -2064,6 +2198,8 @@ class LogReport:
     failures: dict[str, int] = field(default_factory=dict)
     normal_closes: int = 0
     runtime_urls: list[str] = field(default_factory=list)
+    #: JIDs of the instances that joined a watched brewery, in the window.
+    brewery_instances: list[str] = field(default_factory=list)
 
 
 def classify_jvb(lines: Iterable[str], source: str = "") -> LogReport:
@@ -2089,7 +2225,14 @@ def classify_jvb(lines: Iterable[str], source: str = "") -> LogReport:
     return report
 
 
-def classify_jicofo(lines: Iterable[str], source: str = "") -> LogReport:
+def classify_jicofo(
+    lines: Iterable[str], source: str = "", brewery: str | None = None
+) -> LogReport:
+    """Classify Jicofo's log lines.
+
+    *brewery* is the recorder pool to look for: registering instances are
+    logged with their JID, and only the configured pool's are interesting.
+    """
     report = LogReport(source=source)
     for line in lines:
         report.lines += 1
@@ -2101,6 +2244,10 @@ def classify_jicofo(lines: Iterable[str], source: str = "") -> LogReport:
             report.failures[JICOFO_WARNING_PATTERN] = (
                 report.failures.get(JICOFO_WARNING_PATTERN, 0) + 1
             )
+        if BREWERY_INSTANCE_LINE in line:
+            instance = line.split(BREWERY_INSTANCE_LINE, 1)[1].strip()
+            if brewery is None or instance.startswith(brewery.split("/")[0]):
+                report.brewery_instances.append(instance)
     return report
 
 
@@ -2220,6 +2367,7 @@ def run_config_section(deployment: Deployment, args: argparse.Namespace) -> Sect
     )
     section.checks.extend(check_meet_config(deployment))
     section.checks.extend(check_jvb(deployment))
+    section.checks.extend(check_recording(deployment))
     return section
 
 
@@ -2317,6 +2465,7 @@ def run_probe_section(deployment: Deployment, args: argparse.Namespace) -> Secti
 def run_logs_section(deployment: Deployment, args: argparse.Namespace) -> Section:
     section = Section("logs")
     configured = hocon_str(deployment.hocon, "jicofo.transcription.url-template")
+    brewery = hocon_str(deployment.hocon, JIBRI_BREWERY_KEY)
 
     for name, unit, log_path, classify, error, warning in (
         ("logs.jvb", args.jvb_unit, args.jvb_log, classify_jvb, None, None),
@@ -2335,7 +2484,11 @@ def run_logs_section(deployment: Deployment, args: argparse.Namespace) -> Sectio
                 fix="run as root or with the systemd-journal group, or pass a log file",
             ))
             continue
-        report = classify(lines, source)
+        report = (
+            classify_jicofo(lines, source, brewery=brewery)
+            if name == "logs.jicofo"
+            else classify(lines, source)
+        )
         section.checks.append(Check(
             f"{name}.source", Status.PASS,
             f"{report.lines} line(s) from {source}",
@@ -2379,7 +2532,35 @@ def run_logs_section(deployment: Deployment, args: argparse.Namespace) -> Sectio
                 _log_checks(name, report, error_pattern=error, warning_pattern=warning,
                             configured=configured)
             )
+            section.checks.append(_recorder_check(report, brewery))
     return section
+
+
+def _recorder_check(report: LogReport, brewery: str | None) -> Check:
+    """Whether any recorder registered with the pool Jicofo watches.
+
+    An instance logs this once, when it starts, so one that has been up longer
+    than the search window leaves no line — absence is a hint, not a verdict.
+    """
+    if not brewery:
+        return Check(
+            "logs.jicofo.recorders", Status.SKIP,
+            "no jibri.brewery-jid is configured, so there is no recorder pool to watch",
+        )
+    if report.brewery_instances:
+        return Check(
+            "logs.jicofo.recorders", Status.PASS,
+            f"{len(report.brewery_instances)} instance(s) registered with {brewery}",
+            detail="\n".join(report.brewery_instances[-5:]),
+        )
+    return Check(
+        "logs.jicofo.recorders", Status.WARN,
+        f"no recorder registered with {brewery} in the window, so every recording "
+        "request was answered 'busy'",
+        fix="check that a Jibri runs and logs into that MUC; if it has been up longer "
+            "than the window, search further back with "
+            "`journalctl -u jicofo | grep 'brewery instance'`",
+    )
 
 
 def render(sections: Sequence[Section]) -> None:

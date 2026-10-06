@@ -25,8 +25,10 @@ from tools.verify_jitsi import (
     Deployment,
     DiscoveryError,
     HoconDocument,
+    LogReport,
     Section,
     Status,
+    _recorder_check,
     add_js_property,
     add_lua_modules,
     analyze_template,
@@ -34,6 +36,7 @@ from tools.verify_jitsi import (
     check_jicofo,
     check_meet_config,
     check_prosody,
+    check_recording,
     classify_jicofo,
     classify_jvb,
     exit_code,
@@ -1171,6 +1174,109 @@ def test_prosody_warns_when_the_module_never_publishes_the_metadata(tmp_path: Pa
         _reader({publishing: PROSODY_MODULE_LUA}),
     )
     assert not [c for c in checks if c.id.endswith(".publish")]
+
+
+# --------------------------------------------------------------------------
+# Recording (Jibri)
+# --------------------------------------------------------------------------
+
+RECORDING_CLIENT = """var config = {
+    hosts: { domain: 'meet.example.com' },
+    fileRecordingsEnabled: true,
+};
+"""
+
+PROSODY_WITH_BREWERY = PROSODY + (
+    '\nComponent "internal.auth.meet.example.com" "muc"\n'
+    '    storage = "memory"\n'
+)
+
+
+def test_recording_is_not_checked_when_the_client_does_not_offer_it() -> None:
+    disabled = RECORDING_CLIENT.replace(
+        "fileRecordingsEnabled: true", "fileRecordingsEnabled: false"
+    )
+    checks = check_recording(_deployment(meet_text=disabled))
+    assert _status(checks, "recording.client") is Status.PASS
+    assert _status(checks, "recording.jicofo.brewery") is Status.SKIP
+
+    # Neither flag anywhere: the button is simply not offered.
+    checks = check_recording(_deployment(meet_text=LIVE_CLIENT))
+    assert _status(checks, "recording.client") is Status.WARN
+    assert _status(checks, "recording.jicofo.brewery") is Status.SKIP
+
+
+def test_recording_accepts_either_client_flag() -> None:
+    service = "var config = {\n    recordingService: { enabled: true },\n};\n"
+    assert _status(
+        check_recording(_deployment(meet_text=service)), "recording.client"
+    ) is Status.PASS
+    assert _status(
+        check_recording(_deployment(meet_text=RECORDING_CLIENT)), "recording.client"
+    ) is Status.PASS
+
+
+def test_recording_needs_jicofo_to_watch_a_brewery() -> None:
+    """An empty recorder pool answers exactly like a busy one."""
+    checks = check_recording(
+        _deployment(meet_text=RECORDING_CLIENT, prosody_text=PROSODY_WITH_BREWERY)
+    )
+    check = next(c for c in checks if c.id == "recording.jicofo.brewery")
+    assert check.status is Status.FAIL
+    assert "all recorders are currently busy" in check.summary
+    # The JID comes from the Prosody config, not out of the air.
+    assert 'jibri@internal.auth.meet.example.com' in check.fix
+
+    # With no brewery MUC either, the fix says so rather than inventing one.
+    checks = check_recording(
+        _deployment(meet_text=RECORDING_CLIENT, prosody_text=PROSODY)
+    )
+    check = next(c for c in checks if c.id == "recording.jicofo.brewery")
+    assert "internal.auth" in check.fix
+
+
+def test_recording_brewery_must_be_hosted_by_prosody() -> None:
+    document = _document(
+        'jicofo { jibri { brewery-jid = "jibri@internal.auth.meet.example.com" } }'
+    )
+    checks = check_recording(_deployment(
+        meet_text=RECORDING_CLIENT, prosody_text=PROSODY_WITH_BREWERY, hocon=document
+    ))
+    assert _status(checks, "recording.jicofo.brewery") is Status.PASS
+
+    checks = check_recording(_deployment(
+        meet_text=RECORDING_CLIENT, prosody_text=PROSODY, hocon=document
+    ))
+    check = next(c for c in checks if c.id == "recording.jicofo.brewery")
+    assert check.status is Status.FAIL
+    assert "no internal.auth.meet.example.com component" in check.summary
+
+
+def test_classify_jicofo_collects_only_the_watched_brewery() -> None:
+    lines = [
+        "Jicofo INFO Added brewery instance: jvb@meet.example.com/abc",
+        "Jicofo INFO Added brewery instance: jibri@internal.auth.meet.example.com/xyz",
+        "Jicofo INFO Removed brewery instance: jibri@internal.auth.meet.example.com/old",
+    ]
+    report = classify_jicofo(lines, brewery="jibri@internal.auth.meet.example.com")
+    assert report.brewery_instances == ["jibri@internal.auth.meet.example.com/xyz"]
+    # Without a configured pool, everything that registered is reported.
+    assert classify_jicofo(lines).brewery_instances == [
+        "jvb@meet.example.com/abc",
+        "jibri@internal.auth.meet.example.com/xyz",
+    ]
+
+
+def test_recorder_log_check_reports_registration_and_absence() -> None:
+    brewery = "jibri@internal.auth.meet.example.com"
+    registered = LogReport(source="journalctl", brewery_instances=[f"{brewery}/xyz"])
+    assert _recorder_check(registered, brewery).status is Status.PASS
+
+    check = _recorder_check(LogReport(source="journalctl"), brewery)
+    assert check.status is Status.WARN
+    assert "busy" in check.summary
+
+    assert _recorder_check(LogReport(source="journalctl"), None).status is Status.SKIP
 
 
 def test_prosody_warns_when_every_room_is_transcribed_unconditionally(

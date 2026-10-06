@@ -78,6 +78,13 @@ Three consequences worth internalising before the step-by-step:
 | Jicofo | `jicofo.conf` | Point the transcriber connect at the audio bridge |
 | JVB | — | Nothing: it is driven over Colibri2. Optional reconnect tuning only |
 
+Jitsi's **Record** button is not part of this: recording is
+[Jibri](https://jitsi.github.io/handbook/docs/devops-guide/devops-guide-quickstart)'s
+job, and the bridge never sees it. A deployment can therefore transcribe
+perfectly while the UI answers every recording request with "all recorders are
+currently busy" — see the README's troubleshooting entry, and `verify_jitsi`,
+which checks Jicofo's recorder pool as well.
+
 ### 1. jitsi-meet — `config.js`
 
 ```javascript
