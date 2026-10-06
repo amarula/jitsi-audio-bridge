@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import base64
 import logging
+import time
 from pathlib import Path
 
 import requests
@@ -27,6 +28,62 @@ logger = logging.getLogger(__name__)
 #: Only this much of a transcript is sent when asking Ollama for the language;
 #: the answer is stable long before the end of the meeting.
 _LANGUAGE_SAMPLE_CHARS = 1500
+
+#: A 5xx answer means the service is there but not serving — restarting,
+#: reloading a model, momentarily overloaded — and the same request usually
+#: works a moment later.  Transcription is now one request per speaking turn,
+#: so a brief outage used to cost every turn in flight.  A 4xx is never
+#: retried: the request itself is wrong.
+_ATTEMPT_BACKOFF_SECONDS = (1.0, 3.0)
+
+
+def _post_json(url: str, payload: dict[str, object], endpoint: EndpointConfig) -> dict | None:
+    """POST *payload* and return the JSON object, retrying a 5xx answer.
+
+    Returns ``None`` — having logged why — when every attempt failed, which is
+    the same contract the callers had before, only with fewer ways to lose a
+    meeting to a service that was busy for a second.
+    """
+    attempts = len(_ATTEMPT_BACKOFF_SECONDS) + 1
+    for attempt in range(1, attempts + 1):
+        if attempt > 1:
+            time.sleep(_ATTEMPT_BACKOFF_SECONDS[attempt - 2])
+        try:
+            response = requests.post(
+                url, json=payload, verify=endpoint.verify_tls, timeout=endpoint.timeout
+            )
+            if response.status_code >= 500:
+                logger.warning(
+                    "%s answered %d (attempt %d/%d)",
+                    url,
+                    response.status_code,
+                    attempt,
+                    attempts,
+                )
+                continue
+            response.raise_for_status()
+            body = response.json()
+        except requests.RequestException as exc:
+            logger.warning(
+                "request to %s failed (attempt %d/%d): %s", url, attempt, attempts, exc
+            )
+            continue
+        except ValueError as exc:  # a non-JSON body
+            logger.warning(
+                "%s returned a malformed response (attempt %d/%d): %s",
+                url,
+                attempt,
+                attempts,
+                exc,
+            )
+            continue
+        if not isinstance(body, dict):
+            logger.error("%s returned %s, expected a JSON object", url, type(body).__name__)
+            return None
+        return body
+
+    logger.error("giving up on %s after %d attempt(s)", url, attempts)
+    return None
 
 
 def transcribe_audio(wav_path: str | Path, endpoint: EndpointConfig) -> str:
@@ -50,21 +107,9 @@ def transcribe_audio(wav_path: str | Path, endpoint: EndpointConfig) -> str:
 
     payload = {"audio_base64": encoded, "filename": path.name}
 
-    try:
-        response = requests.post(
-            endpoint.url, json=payload, verify=endpoint.verify_tls, timeout=endpoint.timeout
-        )
-        response.raise_for_status()
-        body = response.json()
-    except requests.RequestException as exc:
-        logger.error("whisper request for %s failed: %s", path.name, exc)
-        return ""
-    except ValueError as exc:  # a non-JSON body
-        logger.error("whisper returned a malformed response for %s: %s", path.name, exc)
-        return ""
-
-    if not isinstance(body, dict):
-        logger.error("whisper returned %s, expected a JSON object", type(body).__name__)
+    body = _post_json(endpoint.url, payload, endpoint)
+    if body is None:
+        logger.error("whisper did not transcribe %s", path.name)
         return ""
     return (body.get("text") or "").strip()
 
@@ -97,15 +142,11 @@ def detect_language(transcript_text: str, endpoint: OllamaConfig) -> str:
         "options": {"temperature": 0.0},
     }
 
-    try:
-        response = requests.post(
-            endpoint.url, json=payload, verify=endpoint.verify_tls, timeout=endpoint.timeout
-        )
-        response.raise_for_status()
-        detected = (response.json().get("response") or "").strip().strip(".").strip('"')
-    except (requests.RequestException, ValueError, AttributeError) as exc:
-        logger.warning("language detection failed, assuming English: %s", exc)
+    body = _post_json(endpoint.url, payload, endpoint)
+    if body is None:
+        logger.warning("language detection failed, assuming English")
         return "English"
+    detected = str(body.get("response") or "").strip().strip(".").strip('"')
 
     if not detected:
         logger.warning("language detection returned nothing, assuming English")
@@ -175,17 +216,9 @@ def generate_summary(
         "options": {"temperature": 0.1},
     }
 
-    try:
-        response = requests.post(
-            endpoint.url, json=payload, verify=endpoint.verify_tls, timeout=endpoint.timeout
-        )
-        response.raise_for_status()
-        body = response.json()
-    except requests.RequestException as exc:
-        logger.error("ollama request failed: %s", exc)
-        return ""
-    except ValueError as exc:
-        logger.error("ollama returned a malformed response: %s", exc)
+    body = _post_json(endpoint.url, payload, endpoint)
+    if body is None:
+        logger.error("ollama produced no summary")
         return ""
 
     if not isinstance(body, dict):

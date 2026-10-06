@@ -70,6 +70,9 @@ class WhisperStub:
         self.fixed_text = text
         self.requests: list[dict] = []
         self.last_audio: dict = {}
+        #: Answer this many requests with 503 first, the way a restarting
+        #: service does; the daemon is expected to come back and ask again.
+        self.fail_next = 0
         outer = self
 
         class Handler(_QuietHandler):
@@ -83,6 +86,11 @@ class WhisperStub:
 
                 outer.requests.append(body)
                 outer.last_audio = outer._describe(body.get("audio_base64", ""))
+
+                if outer.fail_next > 0:
+                    outer.fail_next -= 1
+                    outer._reply(self, 503, {"error": "service unavailable"})
+                    return
 
                 text = outer.fixed_text
                 if text is None:

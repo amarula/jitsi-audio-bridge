@@ -16,6 +16,7 @@ from pathlib import Path
 import pytest
 
 from jitsi_audio_bridge import config as config_module
+from jitsi_audio_bridge import daemon as daemon_module
 from jitsi_audio_bridge.audio import (
     EXTRACTED_AUDIO_NAME,
     OpusDecoder,
@@ -974,6 +975,40 @@ def test_timeline_write_leaves_no_temporary_file(tmp_path: Path) -> None:
     assert [item.name for item in tmp_path.iterdir()] == ["timeline.json"]
     assert SessionTimeline.load(path) == timeline
     assert SessionTimeline.load(tmp_path / "absent.json") is None
+
+
+
+def test_a_participant_whose_turns_all_failed_is_transcribed_whole(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, clean_env: None
+) -> None:
+    """Every turn failing is a service problem; one request may still work."""
+    monkeypatch.setattr(config_module, "SEARCH_PATHS", (tmp_path / "nothing.ini",))
+    config = load_config()
+
+    recording = tmp_path / "participant-alice.wav"
+    recorder = OpusParticipantRecorder(recording)
+    for packet in _encode_tone(frames=50):
+        recorder.write_packet(packet)
+    recorder.close()
+
+    timeline = SessionTimeline(
+        started_at="now",
+        duration=1.0,
+        recorded={"alice": 1.0},
+        turns=[Turn("alice", 0.0, 0.4, 0.0, 10), Turn("alice", 0.5, 1.0, 0.4, 10)],
+    )
+
+    def refuses_turns(path: str | Path, endpoint: object) -> str:
+        return "" if "-00" in Path(path).name else "said something at length"
+
+    monkeypatch.setattr(daemon_module, "transcribe_audio", refuses_turns)
+    lines = daemon_module.transcribe_recordings(
+        [recording], {"id_to_name": {}}, timeline, config
+    )
+    # One line, unattributed in time because it is the whole recording, and
+    # still attributed to the right speaker.
+    assert lines == [(None, "participant-alice", "said something at length")]
+
 
 
 def test_slice_wav_cuts_the_named_window(tmp_path: Path) -> None:

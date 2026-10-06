@@ -428,22 +428,29 @@ def _transcribe_turns(
     turns: Sequence[Any],
     turns_dir: Path,
     config: Config,
-) -> list[TranscriptLine]:
-    """Cut one participant's speaking turns out and transcribe them."""
+) -> tuple[list[TranscriptLine], int]:
+    """Cut one participant's speaking turns out and transcribe them.
+
+    Returns the lines and how many turns produced nothing, so the caller can
+    tell "this participant said little" from "the service refused everything".
+    """
     lines: list[TranscriptLine] = []
+    failures = 0
     for index, turn in enumerate(turns):
         slice_path = turns_dir / f"{recording.stem}-{index:04d}.wav"
         try:
             slice_wav(recording, turn.offset, turn.duration, slice_path)
         except (OpusError, OSError) as exc:
             logger.warning("cannot cut %s at %.3fs: %s", recording.name, turn.offset, exc)
+            failures += 1
             continue
         text = transcribe_audio(slice_path, config.whisper)
         if text:
             lines.append((turn.start, speaker, text))
         else:
+            failures += 1
             logger.warning("no transcript produced for turn %d of %s", index, speaker)
-    return lines
+    return lines, failures
 
 
 def transcribe_recordings(
@@ -493,8 +500,22 @@ def transcribe_recordings(
                     turns = merge_turns(list(turns), allowance)
             if turns:
                 logger.info("transcribing %d turn(s) of %s", len(turns), speaker)
-                lines.extend(_transcribe_turns(recording, speaker, turns, turns_dir, config))
-                continue
+                turn_lines, failures = _transcribe_turns(
+                    recording, speaker, turns, turns_dir, config
+                )
+                if turn_lines:
+                    lines.extend(turn_lines)
+                    continue
+                if failures:
+                    # Every turn failed, which says more about the service than
+                    # about this participant: hand it the whole recording, one
+                    # request, the way it worked before turns existed.
+                    logger.warning(
+                        "none of %s's %d turn(s) produced text; transcribing the recording "
+                        "whole instead",
+                        speaker,
+                        len(turns),
+                    )
 
             text = transcribe_audio(recording, config.whisper)
             if text:

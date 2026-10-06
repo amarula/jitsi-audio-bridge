@@ -585,7 +585,27 @@ def main() -> int:
               not (edge / "metadata.json").exists())
         wait_for(lambda: len(smtp.messages) > before_edge, timeout=60)
 
-        print("\n9. a reconnect is not the end of the meeting")
+        print("\n9. a service that is momentarily down")
+        # A 5xx is the service saying "not now": the request is retried, and a
+        # participant whose every turn failed is handed over as one recording
+        # rather than lost.
+        before_flaky = len(smtp.messages)
+        whisper.fail_next = 2
+        send_meeting(
+            url, session_id="flaky", participants=1, duration=2, fast=True,
+            protocol="media-json", participant=["dave:Dave:dave@example.com"],
+        )
+        flaky = recordings / "flaky"
+        wait_for(lambda: len(smtp.messages) > before_flaky, timeout=60)
+        transcript = flaky / "transcript.txt"
+        check("a retried request still produces a transcript",
+              transcript.is_file() and bool(transcript.read_text().strip()),
+              transcript.read_text().strip()[:120] if transcript.is_file() else "no transcript")
+        check("the retry did not lose the turn to the mail",
+              len(smtp.messages) == before_flaky + 1,
+              f"{len(smtp.messages) - before_flaky} message(s)")
+
+        print("\n10. a reconnect is not the end of the meeting")
         # The JVB ends an export and opens another for the same conference, so
         # a connection ending must not finalise the meeting: no mail from the
         # first connection, no file truncated by the second, and one transcript
