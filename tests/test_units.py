@@ -408,6 +408,29 @@ def test_parse_metadata_reads_flat_participants(tmp_path: Path) -> None:
     assert meta["participants"] == ["Ada (ada@example.com)", "Grace (grace@example.com)"]
 
 
+
+def test_named_participants_without_addresses_reach_the_summary_list(
+    tmp_path: Path,
+) -> None:
+    """A deployment without tokens has names and no addresses; the summary
+    prompt is told who was there from the names alone."""
+    (tmp_path / "metadata.json").write_text(json.dumps({
+        "room_name": "Standup",
+        "participants": [
+            {"id": "8aa1c4ba", "name": "Michael"},
+            {"id": "bb7b6e09", "name": "Anna", "email": "anna@example.com"},
+            {"id": "cc1d2e3f", "name": "Michael"},
+        ],
+    }))
+    info = parse_metadata(tmp_path)
+    assert info["participants"] == ["Michael", "Anna (anna@example.com)"]
+    assert info["recipients"] == ["anna@example.com"]
+    assert info["id_to_name"]["8aa1c4ba"] == "Michael"
+    assert info["id_to_name"]["bb7b6e09"] == "Anna"
+    assert info["room_name"] == "Standup"
+
+
+
 def test_parse_metadata_reads_nested_user_objects(tmp_path: Path) -> None:
     (tmp_path / "metadata.json").write_text(
         json.dumps(

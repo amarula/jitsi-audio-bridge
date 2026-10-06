@@ -510,6 +510,27 @@ class OpusParticipantRecorder:
 _EMAIL_IN_TEXT = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
 
 
+def _add_participant(
+    participants: list[str], seen: set[str], name: str, email: str = ""
+) -> None:
+    """Add a participant to the human-readable list, once.
+
+    This list is what the summariser is given as the people in the meeting,
+    and it is told to attribute points to them.  An address is a nice thing to
+    have beside a name, but it is not what makes the attribution possible: a
+    deployment that authenticates nobody has names and no addresses, and a
+    list built only from addresses would be empty for it.
+    """
+    key = name or email
+    if not key or key in seen:
+        return
+    seen.add(key)
+    if name and email:
+        participants.append(f"{name} ({email})")
+    else:
+        participants.append(key)
+
+
 def room_name_from_metadata(meta: dict[str, Any]) -> str | None:
     """Work out the room name from an explicit field, or from ``meeting_url``.
 
@@ -569,6 +590,7 @@ def parse_metadata(meeting_dir: str | Path) -> dict[str, Any]:
 
     recipients: list[str] = []
     id_to_name: dict[str, str] = {}
+    seen_participants: set[str] = set()
 
     for participant in meta.get("participants", []) or []:
         if not isinstance(participant, dict):
@@ -593,10 +615,13 @@ def parse_metadata(meeting_dir: str | Path) -> dict[str, Any]:
             # address rather than the opaque participant id.
             if name:
                 id_to_name[clean] = name
-            info["participants"].append(f"{name} ({clean})" if name else clean)
+            _add_participant(info["participants"], seen_participants, name, clean)
 
         if isinstance(participant_id, str) and participant_id and name:
             id_to_name[participant_id] = name
+            # Named but unaddressed: still a person the summary should know
+            # about, and the only kind a deployment without tokens has.
+            _add_participant(info["participants"], seen_participants, name)
 
     if not recipients:
         # Nothing structured, but an address may still be buried somewhere in
@@ -605,7 +630,8 @@ def parse_metadata(meeting_dir: str | Path) -> dict[str, Any]:
         if found:
             logger.info("no structured recipients; recovered %d from the raw metadata", len(found))
             recipients = list(dict.fromkeys(address.strip() for address in found))
-            info["participants"] = list(recipients)
+            if not info["participants"]:
+                info["participants"] = list(recipients)
 
     info["recipients"] = sorted(recipients)
     info["id_to_name"] = id_to_name
