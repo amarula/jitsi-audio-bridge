@@ -318,7 +318,20 @@ loses their name, and their audio is attributed to a bare identifier.
 control frame is a snapshot or an increment is a contract question for the
 sender, so this should be settled with it rather than guessed at here.
 
-### No idempotency — **Medium**
+### No idempotency — **Medium** — Fixed
+
+A reconnecting JVB reuses its `sessionId`, and each connection used to be
+treated as a whole meeting: the transcript and the mail went out for the part
+that had been recorded so far, and the next connection's recorder truncated the
+WAV it reused, destroying that audio.
+
+A connection is no longer the meeting. A session now keeps its clock, its
+turns and its audio across connections, each connection records into its own
+`participant-<id>-<n>.wav` part, and post-processing waits out
+`[storage] session_grace_seconds` of quiet before running — a connection
+arriving sooner cancels it. What remains: a meeting whose transcriber is
+restarted after a gap longer than the grace period is still processed as two
+meetings, because nothing on this socket says the conference ended.
 
 A sender that reconnects with the same `sessionId` re-transcribes, overwrites
 `transcript.txt`, and sends a second email. Two concurrent connections with the

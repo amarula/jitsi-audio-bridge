@@ -46,6 +46,7 @@ DEFAULTS: dict[str, dict[str, str]] = {
         "cleanup_after_send": "false",
         "session_metadata_dir": "",
         "capture_timeline": "true",
+        "session_grace_seconds": "60",
     },
     "transcript": {
         "interleave": "true",
@@ -107,6 +108,13 @@ class StorageConfig:
     #: the meeting is running, so switching it off means those transcripts are
     #: never interleaved, however they are processed later.
     capture_timeline: bool = True
+    #: How long a session may stay silent before the meeting counts as over.
+    #: A connection ending is not the meeting ending — the JVB closes one
+    #: export and opens another for the same conference — so post-processing
+    #: waits this long, and a connection arriving sooner cancels it.  Zero
+    #: transcribes and mails as soon as a connection closes, which is how a
+    #: meeting interrupted mid-way gets mailed in parts.
+    session_grace_seconds: float = 60.0
 
 
 @dataclass(frozen=True)
@@ -306,6 +314,9 @@ def load_config(path: str | os.PathLike[str] | None = None) -> Config:
             cleanup_after_send=resolver.boolean("storage", "cleanup_after_send"),
             session_metadata_dir=resolver.optional_path("storage", "session_metadata_dir"),
             capture_timeline=resolver.boolean("storage", "capture_timeline"),
+            session_grace_seconds=resolver.number(
+                "storage", "session_grace_seconds", minimum=0.0
+            ),
         ),
         transcript=TranscriptConfig(
             interleave=resolver.boolean("transcript", "interleave"),

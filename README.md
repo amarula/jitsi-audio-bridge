@@ -151,6 +151,7 @@ The environment layer exists so secrets can be supplied by a systemd
 | `cleanup_after_send` | boolean | `false` | `JITSI_AUDIO_BRIDGE_STORAGE_CLEANUP_AFTER_SEND` |
 | `session_metadata_dir` | path | *(empty)* | `JITSI_AUDIO_BRIDGE_STORAGE_SESSION_METADATA_DIR` |
 | `capture_timeline` | boolean | `true` | `JITSI_AUDIO_BRIDGE_STORAGE_CAPTURE_TIMELINE` |
+| `session_grace_seconds` | seconds | `60` | `JITSI_AUDIO_BRIDGE_STORAGE_SESSION_GRACE_SECONDS` |
 
 `cleanup_after_send` deletes the audio, transcript and summary once the email
 has been sent. It is off by default deliberately: those files are the only copy
@@ -167,6 +168,17 @@ Empty disables it.
 media export: who spoke when, on the session's own clock. It can only be
 captured while the meeting is running — a meeting recorded with this off can
 never be interleaved afterwards — and it costs one small file per session.
+
+`session_grace_seconds` is how long a session may stay silent before the
+meeting is treated as over. A connection ending is not the meeting ending: the
+JVB closes one export and opens another for the same conference (a transcriber
+restarted, a bridge reconnected), so a meeting must be transcribed and mailed
+once, not once per connection. Every connection arriving within this window
+resumes the same session — the clock and the turns carry on, and each
+connection's audio goes to its own part file, `participant-<id>-2.wav`,
+because `wave.open` truncates and reusing the file would destroy what came
+before. Zero restores the old behaviour of processing each connection's audio
+on its own.
 
 ### `[transcript]`
 
@@ -539,6 +551,13 @@ on the session, and where it begins in that participant's WAV. It is what
 makes the transcript interleaved; see [Limitations](#limitations) for what it
 cannot do. The `.turns/` directory it is transcribed through is removed
 afterwards.
+
+A session recorded over more than one connection — a transcriber restarted, a
+bridge reconnected — holds one WAV per connection: the first as
+`participant-<id>.wav`, the next as `participant-<id>-2.wav`, and so on. They
+are transcribed as what they are, the same speaker carrying on, and the
+timeline keeps their turns apart because a turn's offset only means something
+next to the file it came from.
 
 `metadata.json` is written by the **control frame** path, so it exists only when
 the sender sent one. The stock-Jitsi path has no control frame at all — the

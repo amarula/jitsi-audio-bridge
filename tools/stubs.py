@@ -299,6 +299,9 @@ port = {bridge_port}
 
 [storage]
 recordings_dir = {recordings_dir}
+; A connection ending is not the meeting ending, so the daemon waits this long
+; before post-processing.  The tests wait for the mail, so keep it short.
+session_grace_seconds = 1
 
 [whisper]
 url = {whisper.url}

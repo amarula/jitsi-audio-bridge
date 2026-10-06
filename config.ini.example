@@ -40,6 +40,13 @@ session_metadata_dir =
 ; when, on the session's own clock.  The timing can only be captured while the
 ; meeting is running, and it is what lets the transcript be interleaved.
 capture_timeline = true
+; How long a session may stay silent before the meeting counts as over.  A
+; connection ending is not the meeting ending -- the JVB closes one export and
+; opens another for the same conference -- so the transcript and the mail wait
+; this long, and a connection arriving sooner cancels them.  Zero mails each
+; connection's audio separately, which is what a meeting interrupted mid-way
+; used to produce.
+session_grace_seconds = 60
 
 [transcript]
 ; Merge the participants' speaking turns into one time-ordered document,

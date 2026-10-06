@@ -459,6 +459,9 @@ def main() -> int:
               check_wrong_path_is_refused(port) == 1008)
 
         print("\n5. empty session handling")
+        # The previous session's mail arrives a grace period after its last
+        # connection, so let it land before counting what this one sends.
+        time.sleep(2)
         before = len(smtp.messages)
         send_meeting(url, session_id="noaudio", participants=1, audio="none", fast=True)
         time.sleep(2)
@@ -581,6 +584,54 @@ def main() -> int:
         check("edge-case events never reach metadata.json",
               not (edge / "metadata.json").exists())
         wait_for(lambda: len(smtp.messages) > before_edge, timeout=60)
+
+        print("\n9. a reconnect is not the end of the meeting")
+        # The JVB ends an export and opens another for the same conference, so
+        # a connection ending must not finalise the meeting: no mail from the
+        # first connection, no file truncated by the second, and one transcript
+        # covering both once the session finally goes quiet.
+        before_reconnect = len(smtp.messages)
+        send_meeting(
+            url, session_id="reconnect", participants=1, duration=2, fast=True,
+            protocol="media-json", participant=["carol:Carol:carol@example.com"],
+        )
+        first = recordings / "reconnect" / "participant-carol-audio.wav"
+        wait_for(lambda: first.exists(), timeout=15)
+        first_size = first.stat().st_size if first.is_file() else 0
+
+        send_meeting(
+            url, session_id="reconnect", participants=1, duration=2, fast=True,
+            protocol="media-json", participant=["carol:Carol:carol@example.com"],
+        )
+        second = recordings / "reconnect" / "participant-carol-audio-2.wav"
+        wait_for(lambda: second.exists(), timeout=15)
+
+        contents = sorted(p.name for p in (recordings / "reconnect").iterdir())
+        check("the second connection records its own part", second.is_file(),
+              f"contents: {contents}")
+        check("the first part is not truncated by the second",
+              first.is_file() and first.stat().st_size == first_size and first_size > 0,
+              f"{first_size} bytes before, {first.stat().st_size if first.is_file() else 0} after")
+
+        wait_for(lambda: len(smtp.messages) > before_reconnect, timeout=60)
+        check("one meeting, one email, however many connections",
+              len(smtp.messages) == before_reconnect + 1,
+              f"{len(smtp.messages) - before_reconnect} message(s)")
+        transcript = recordings / "reconnect" / "transcript.txt"
+        if transcript.is_file():
+            body = transcript.read_text()
+            blocks = [block for block in body.split("\n\n") if block.strip()]
+            check(
+                "both parts reach the transcript, each stamped",
+                len(blocks) == 2
+                and all(re.match(r"^\[\d\d:\d\d:\d\d\] ", block) for block in blocks),
+                body.strip()[:160],
+            )
+        timeline = recordings / "reconnect" / "timeline.json"
+        if timeline.is_file():
+            parts = {turn["participant"] for turn in json.loads(timeline.read_text())["turns"]}
+            check("the timeline keeps the parts apart", parts == {"carol-audio", "carol-audio-2"},
+                  str(sorted(parts)))
 
         print("\n9. deployment-check probe (tools.verify_jitsi)")
         probe_url = f"{url}?sessionId=verify-jitsi"

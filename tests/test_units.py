@@ -33,6 +33,7 @@ from jitsi_audio_bridge.config import ConfigError, load_config
 from jitsi_audio_bridge.daemon import (
     DEFAULT_SESSION_ID,
     StreamError,
+    _free_wav_path,
     adopt_session_metadata,
     build_media_json_pong,
     describe_media_json_start,
@@ -1005,6 +1006,23 @@ def test_a_malformed_merge_gap_is_rejected(tmp_path: Path, clean_env: None) -> N
     path.write_text("[transcript]\nmerge_gap_seconds = soon\n", encoding="utf-8")
     with pytest.raises(ConfigError, match="merge_gap_seconds"):
         load_config(path)
+
+
+
+def test_each_connection_records_into_its_own_part(tmp_path: Path) -> None:
+    """wave.open truncates, so a reconnect must not reuse the first file."""
+    first = _free_wav_path(tmp_path, "d6ae7ffe-a0")
+    assert first.name == "participant-d6ae7ffe-a0.wav"
+    first.write_bytes(b"audio")
+
+    second = _free_wav_path(tmp_path, "d6ae7ffe-a0")
+    assert second.name == "participant-d6ae7ffe-a0-2.wav"
+    second.write_bytes(b"more audio")
+
+    third = _free_wav_path(tmp_path, "d6ae7ffe-a0")
+    assert third.name == "participant-d6ae7ffe-a0-3.wav"
+    # Another participant is unaffected by any of it.
+    assert _free_wav_path(tmp_path, "bb7b6e09-a0").name == "participant-bb7b6e09-a0.wav"
 
 
 # --------------------------------------------------------------------------

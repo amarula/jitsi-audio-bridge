@@ -35,6 +35,7 @@ import signal
 import tempfile
 import time
 from collections.abc import Iterable, Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -608,6 +609,37 @@ def process_directory(meeting_dir: Path, config: Config) -> int:
     return 0 if sent else 1
 
 
+def _schedule_finalisation(state: SessionState, config: Config) -> None:
+    """Post-process this session once it has been quiet long enough."""
+    if state.pending is not None:
+        state.pending.cancel()
+    state.pending = asyncio.create_task(_finalise_later(state, config))
+
+
+async def _finalise_later(state: SessionState, config: Config) -> None:
+    """Wait for the meeting to be over, then process it.
+
+    A new connection cancels this — see :func:`_session_state` — and a
+    shutdown sets ``_SHUTDOWN``, which ends the wait early rather than losing
+    a meeting that has just finished.
+    """
+    grace = config.storage.session_grace_seconds
+    with contextlib.suppress(asyncio.TimeoutError):
+        await asyncio.wait_for(_SHUTDOWN.wait(), timeout=grace)
+    state.pending = None
+    _SESSIONS.pop(state.session_id, None)
+    if not any(seconds > 0 for seconds in state.recorded.values()):
+        logger.info("session %s: no audio captured; nothing to process", state.session_id)
+        return
+    logger.info(
+        "session %s: quiet for %ds; processing the meeting (%.1fs of audio)",
+        state.session_id,
+        int(grace),
+        sum(state.recorded.values()),
+    )
+    await _run_post_processing(state.meeting_dir, config)
+
+
 async def _run_post_processing(meeting_dir: Path, config: Config) -> None:
     """Run the blocking pipeline off the event loop, bounded by a semaphore."""
     async with _semaphore():
@@ -616,6 +648,83 @@ async def _run_post_processing(meeting_dir: Path, config: Config) -> None:
         except Exception:
             # A failed pipeline must not propagate into the connection handler.
             logger.exception("post-processing failed for %s", meeting_dir)
+
+
+@dataclass
+class SessionState:
+    """One meeting, however many connections it takes.
+
+    The JVB ends an export and opens a new one for the same meeting id when a
+    transcriber is restarted, and a bridge reconnect does the same; the
+    connection is therefore not the meeting.  This is what survives between
+    them — the clock, the turns heard so far, and how much audio each part
+    holds — so that a transcript is only made once the meeting is really over.
+    """
+
+    session_id: str
+    meeting_dir: Path
+    started_monotonic: float
+    started_at: str
+    tracker: TurnTracker
+    #: Recording key -> seconds of audio in it, accumulated per part.
+    recorded: dict[str, float] = field(default_factory=dict)
+    saw_media_json: bool = False
+    #: The grace timer holding off post-processing, if one is running.
+    pending: asyncio.Task[None] | None = None
+
+
+#: Sessions whose connections ended but whose meetings may not be over.
+_SESSIONS: dict[str, SessionState] = {}
+
+#: Set when the daemon is shutting down, so a pending grace timer stops
+#: waiting and processes its meeting instead of losing it.
+_SHUTDOWN = asyncio.Event()
+
+
+def _session_state(session_id: str, meeting_dir: Path, config: Config) -> SessionState:
+    """Resume the session *session_id*, or start it.
+
+    A connection arriving while a grace timer is running means the meeting is
+    still going: the timer is cancelled and the same state carries on, so the
+    transcript covers the whole meeting rather than the part that happened to
+    fit in one connection.
+    """
+    state = _SESSIONS.get(session_id)
+    if state is not None:
+        if state.pending is not None:
+            state.pending.cancel()
+            state.pending = None
+            logger.info(
+                "session %s: a new connection arrived; the meeting continues", session_id
+            )
+        return state
+
+    state = SessionState(
+        session_id=session_id,
+        meeting_dir=meeting_dir,
+        started_monotonic=time.monotonic(),
+        started_at=utc_now(),
+        tracker=TurnTracker(merge_gap=config.transcript.merge_gap_seconds),
+    )
+    _SESSIONS[session_id] = state
+    return state
+
+
+def _free_wav_path(meeting_dir: Path, participant_id: str) -> Path:
+    """A recording path no earlier connection is already using.
+
+    ``wave.open`` truncates, so a reconnect that reused the first file would
+    destroy the audio recorded before it — and the timeline, whose offsets are
+    per file, would then name the wrong audio.  Each connection gets its own
+    part instead, and the parts are transcribed as separate recordings of the
+    same speaker.
+    """
+    path = meeting_dir / f"participant-{participant_id}.wav"
+    part = 1
+    while path.exists():
+        part += 1
+        path = meeting_dir / f"participant-{participant_id}-{part}.wav"
+    return path
 
 
 def _recorder_for(
@@ -634,7 +743,7 @@ def _recorder_for(
     if recorder is not None:
         return recorder
 
-    wav_path = meeting_dir / f"participant-{participant_id}.wav"
+    wav_path = _free_wav_path(meeting_dir, participant_id)
     try:
         recorder = OpusParticipantRecorder(wav_path)
     except (OpusError, OSError) as exc:
@@ -679,19 +788,16 @@ async def handle_jvb_stream(websocket: Any, config: Config) -> None:
 
     logger.info("session %s started, recording to %s", session_id, meeting_dir)
 
+    # The meeting outlives this connection: a reconnect resumes the clock and
+    # the turns rather than starting a second meeting in the same directory.
+    state = _session_state(session_id, meeting_dir, config)
+
     recorders: dict[str, OpusParticipantRecorder] = {}
     #: Sanitised identifier -> the raw tag that claimed it, so two tags
     #: reducing to one filename are reported instead of silently merging.
     source_tags: dict[str, str] = {}
     frames = 0
     malformed = 0
-    # The session's own clock, and the turns heard on it.  Only the media-json
-    # path has a clock: the binary framing carries no timing at all, so
-    # sessions fed that way keep the transcript they have always had.
-    session_started = time.monotonic()
-    started_at = utc_now()
-    tracker = TurnTracker(merge_gap=config.transcript.merge_gap_seconds)
-    saw_media_json = False
 
     try:
         async for message in websocket:
@@ -783,10 +889,13 @@ async def handle_jvb_stream(websocket: Any, config: Config) -> None:
             file_offset = recorder.decoded_samples / recorder.sample_rate
             if recorder.write_packet(payload):
                 media_json = isinstance(message, str)
-                saw_media_json = saw_media_json or media_json
-                tracker.add(
-                    participant_id,
-                    session_offset=time.monotonic() - session_started,
+                state.saw_media_json = state.saw_media_json or media_json
+                # Keyed by the recording, not by the tag: a reconnect records
+                # into its own part file, and a turn's offset only means
+                # something next to the file it came from.
+                state.tracker.add(
+                    participant_id_from_path(recorder.wav_path) or participant_id,
+                    session_offset=time.monotonic() - state.started_monotonic,
                     file_offset=file_offset,
                     duration=recorder.decoded_samples / recorder.sample_rate - file_offset,
                     level=recorder.last_level,
@@ -797,35 +906,36 @@ async def handle_jvb_stream(websocket: Any, config: Config) -> None:
     finally:
         for participant_id, recorder in recorders.items():
             recorder.close()
+            key = participant_id_from_path(recorder.wav_path) or participant_id
+            state.recorded[key] = recorder.duration_seconds
             logger.info(
                 "session %s: participant %s recorded %.1fs (%d packets dropped)",
                 session_id,
-                participant_id,
+                key,
                 recorder.duration_seconds,
                 recorder.dropped_packets,
             )
 
         logger.info(
-            "session %s finished: %d frames, %d malformed, %d participants",
+            "session %s: connection finished: %d frames, %d malformed, %d participant(s); "
+            "audio so far: %.1fs",
             session_id,
             frames,
             malformed,
             len(recorders),
+            sum(state.recorded.values()),
         )
 
-        if config.storage.capture_timeline and saw_media_json and recorders:
-            turns = tracker.finish()
-            elapsed = time.monotonic() - session_started
+        if config.storage.capture_timeline and state.saw_media_json and state.recorded:
+            turns = state.tracker.finish()
+            elapsed = time.monotonic() - state.started_monotonic
             timeline = SessionTimeline(
-                started_at=started_at,
+                started_at=state.started_at,
                 # A stream that arrived faster than it plays makes the wall
                 # clock shorter than the meeting it describes; the turns know
                 # better, so keep the larger of the two.
                 duration=max(elapsed, turns[-1].end if turns else 0.0),
-                recorded={
-                    participant: recorder.duration_seconds
-                    for participant, recorder in recorders.items()
-                },
+                recorded=dict(state.recorded),
                 turns=turns,
             )
             if timeline.write(meeting_dir / TIMELINE_FILENAME):
@@ -836,12 +946,13 @@ async def handle_jvb_stream(websocket: Any, config: Config) -> None:
                     TIMELINE_FILENAME,
                 )
 
-        # Only run the pipeline when there is actually something to process:
-        # a connection that sent nothing must not email an empty meeting.
-        if frames and any(recorder.has_audio for recorder in recorders.values()):
-            await _run_post_processing(meeting_dir, config)
+        # A connection ending is not the meeting ending: the JVB ends an
+        # export to start a new one for the same conference, and a restart
+        # does the same.  Wait for quiet before transcribing and mailing.
+        if sum(state.recorded.values()) > 0:
+            _schedule_finalisation(state, config)
         else:
-            logger.info("session %s: no audio captured; skipping post-processing", session_id)
+            logger.info("session %s: no audio captured yet", session_id)
 
 
 def check_storage(config: Config) -> None:
@@ -872,6 +983,7 @@ async def serve(config: Config) -> None:
         loop.add_signal_handler(caught, stop.set)
 
     _semaphore()  # bind the semaphore to this loop before serving
+    _SHUTDOWN.clear()
 
     handler = functools.partial(handle_jvb_stream, config=config)
     try:
@@ -892,6 +1004,14 @@ async def serve(config: Config) -> None:
             exc,
         )
         raise
+
+    # A meeting that ended moments ago is still waiting out its grace period;
+    # shutting down must not lose it.
+    _SHUTDOWN.set()
+    pending = [state.pending for state in _SESSIONS.values() if state.pending is not None]
+    if pending:
+        logger.info("processing %d session(s) that were still waiting", len(pending))
+        await asyncio.gather(*pending, return_exceptions=True)
 
     logger.info("shutting down")
 
