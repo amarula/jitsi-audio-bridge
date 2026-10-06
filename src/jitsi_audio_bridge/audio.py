@@ -51,6 +51,10 @@ EXTRACTED_AUDIO_NAME = "extracted_audio.wav"
 #: Who spoke when, as captured while the meeting was running.
 TIMELINE_FILENAME = "timeline.json"
 
+#: The transcript after the optional grammar pass.  The raw transcript is what
+#: was said and is never replaced; this is what is summarised and mailed.
+CORRECTED_TRANSCRIPT_NAME = "transcript.corrected.txt"
+
 #: Where the post-processing step cuts a participant's turns out, before
 #: transcribing them one by one.  Removed as soon as they have been read.
 TURN_DIR_NAME = ".turns"

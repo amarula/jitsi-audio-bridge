@@ -44,8 +44,15 @@ from urllib.parse import parse_qs, urlparse
 import websockets
 
 from . import __version__
-from .ai_client import detect_language, generate_summary, set_ai_limits, transcribe_audio
+from .ai_client import (
+    correct_transcript,
+    detect_language,
+    generate_summary,
+    set_ai_limits,
+    transcribe_audio,
+)
 from .audio import (
+    CORRECTED_TRANSCRIPT_NAME,
     EXTRACTED_AUDIO_NAME,
     METADATA_FILENAME,
     TIMELINE_FILENAME,
@@ -631,8 +638,28 @@ def process_completed_session(meeting_dir: Path, config: Config) -> bool:
     # Detected once, then given to both: the summary is written in it and the
     # mail around the summary follows it, so the two read in one language.
     language = detect_language(transcript, config.ollama)
+
+    # An optional pass over the transcript before it is summarised: speech
+    # recognition mishears words, and the model that reads the whole meeting
+    # can often repair them from context.  The raw transcript is what was
+    # said, so it is never replaced — the corrected one is written beside it,
+    # is what gets summarised and mailed, and is dropped if the pass fails.
+    summarised = transcript
+    attached = transcript_path
+    if config.ollama.correct_transcript:
+        corrected = correct_transcript(transcript, config.ollama, language=language)
+        if corrected:
+            corrected_path = meeting_dir / CORRECTED_TRANSCRIPT_NAME
+            corrected_path.write_text(corrected, encoding="utf-8")
+            summarised, attached = corrected, corrected_path
+            logger.info("wrote %s", corrected_path.name)
+        else:
+            logger.warning(
+                "the correction pass produced nothing; summarising the transcript as it is"
+            )
+
     summary = generate_summary(
-        transcript,
+        summarised,
         metadata["room_name"],
         metadata["participants"],
         config.ollama,
@@ -650,7 +677,7 @@ def process_completed_session(meeting_dir: Path, config: Config) -> bool:
         metadata["recipients"],
         metadata["room_name"],
         summary,
-        transcript_path,
+        attached,
         summary_path,
         config.smtp,
         started_at=session_started_at(meeting_dir, timeline),

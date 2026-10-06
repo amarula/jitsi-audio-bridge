@@ -254,6 +254,18 @@ appears, and the daemon's log is where you will be looking.
 | `model` | string | `qwen2.5:14b-instruct` | `JITSI_AUDIO_BRIDGE_OLLAMA_MODEL` |
 | `timeout` | seconds | `600` | `JITSI_AUDIO_BRIDGE_OLLAMA_TIMEOUT` |
 | `verify_tls` | boolean | `true` | `JITSI_AUDIO_BRIDGE_OLLAMA_VERIFY_TLS` |
+| `correct_transcript` | boolean | `false` | `JITSI_AUDIO_BRIDGE_OLLAMA_CORRECT_TRANSCRIPT` |
+
+`correct_transcript` asks the model to repair grammar, punctuation and
+clearly misheard words before the summary is written. Speech recognition
+leaves all three behind, and the model that reads the whole meeting can often
+tell "teh" from "the" or a mangled name from a correct one in context. It
+costs one more pass, in chunks of a few thousand characters so a long meeting
+still fits the model's context, and it **rewrites what people said** — which
+is why it is off by default and why the raw transcript is kept: the corrected
+text is written beside it as `transcript.corrected.txt`, is what gets
+summarised and mailed, and is discarded (with a warning) if the pass fails, so
+a meeting is never mailed half-repaired.
 
 ### `[smtp]`
 
@@ -585,6 +597,7 @@ bridge records with what the real sender produces.
 ├── participant-<id>.wav     # 16 kHz, mono, 16-bit PCM, one per participant
 ├── extracted_audio.wav      # only when a master recording had to be extracted
 ├── transcript.txt           # written once post-processing succeeds
+├── transcript.corrected.txt # only with [ollama] correct_transcript
 └── summary.md               # the LLM summary, likewise
 ```
 

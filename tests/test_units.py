@@ -13,6 +13,7 @@ import struct
 import threading
 import time
 import wave
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -656,6 +657,129 @@ def test_safe_attachment_name_is_flat_and_bounded(room_name: str) -> None:
 def test_safe_attachment_name_keeps_an_ordinary_room_name() -> None:
     assert safe_attachment_name("Daily Standup") == "Daily_Standup_transcript.txt"
 
+
+
+
+
+def test_correction_is_off_unless_it_is_asked_for(clean_env: None) -> None:
+    config = load_config()
+    assert config.ollama.correct_transcript is False
+
+
+
+def test_the_summary_reads_the_corrected_transcript(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, clean_env: None
+) -> None:
+    """Repaired words go to the summary and the mail; the raw text stays."""
+    monkeypatch.setattr(config_module, "SEARCH_PATHS", (tmp_path / "nothing.ini",))
+    config = load_config()
+    config = replace(
+        config, ollama=replace(config.ollama, correct_transcript=True)
+    )
+
+    session = tmp_path / "session"
+    session.mkdir()
+    recording = session / "participant-michael-a0.wav"
+    recorder = OpusParticipantRecorder(recording)
+    for packet in _encode_tone(frames=25):
+        recorder.write_packet(packet)
+    recorder.close()
+    SessionTimeline(
+        started_at="2026-10-06T18:50:00+00:00",
+        duration=0.5,
+        recorded={"michael-a0": 0.5},
+        turns=[Turn("michael-a0", 0.0, 0.5, 0.0, 8000)],
+    ).write(session / "timeline.json")
+
+    seen: dict[str, object] = {}
+    monkeypatch.setattr(daemon_module, "detect_language", lambda text, ep: "Italian")
+    monkeypatch.setattr(
+        daemon_module,
+        "transcribe_audio",
+        lambda path, ep: "[Michael]: we discussed teh deployment",
+    )
+
+    def fake_correct(text: str, endpoint: object, language: str | None = None) -> str:
+        seen["corrected_from"] = text
+        return "[Michael]: we discussed the deployment"
+
+    def fake_summary(text: str, room: str, participants: list, endpoint: object,
+                     language: str | None = None) -> str:
+        seen["summarised"] = text
+        return "riassunto"
+
+    def fake_mail(recipients: object, room: str, summary: str, transcript: Path,
+                  summary_path: Path, smtp: object, **kwargs: object) -> bool:
+        seen["attached"] = transcript
+        return True
+
+    monkeypatch.setattr(daemon_module, "correct_transcript", fake_correct)
+    monkeypatch.setattr(daemon_module, "generate_summary", fake_summary)
+    monkeypatch.setattr(daemon_module, "send_meeting_email", fake_mail)
+
+    assert daemon_module.process_completed_session(session, config) is True
+
+    # The line arrives rendered, timestamp and speaker already in place.
+    assert "teh deployment" in seen["corrected_from"]
+    assert seen["corrected_from"].startswith("[00:00:00] participant-michael-a0: ")
+    assert seen["summarised"] == "[Michael]: we discussed the deployment"
+    assert seen["attached"] == session / "transcript.corrected.txt"
+    # What was actually said is still on disk, untouched.
+    assert "teh deployment" in (session / "transcript.txt").read_text()
+    assert (session / "transcript.corrected.txt").read_text() == (
+        "[Michael]: we discussed the deployment"
+    )
+
+
+def test_a_failed_correction_falls_back_to_the_raw_transcript(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, clean_env: None
+) -> None:
+    monkeypatch.setattr(config_module, "SEARCH_PATHS", (tmp_path / "nothing.ini",))
+    config = replace(
+        load_config(), ollama=replace(load_config().ollama, correct_transcript=True)
+    )
+
+    session = tmp_path / "session"
+    session.mkdir()
+    recorder = OpusParticipantRecorder(session / "participant-x-a0.wav")
+    for packet in _encode_tone(frames=25):
+        recorder.write_packet(packet)
+    recorder.close()
+
+    monkeypatch.setattr(daemon_module, "detect_language", lambda text, ep: "Italian")
+    monkeypatch.setattr(daemon_module, "transcribe_audio", lambda path, ep: "raw text")
+    monkeypatch.setattr(daemon_module, "correct_transcript", lambda *a, **k: "")
+    seen: dict[str, object] = {}
+
+    def fake_summary(text: str, room: str, participants: list, endpoint: object,
+                     language: str | None = None) -> str:
+        seen["summarised"] = text
+        return ""
+
+    monkeypatch.setattr(daemon_module, "generate_summary", fake_summary)
+    assert daemon_module.process_completed_session(session, config) is False
+    assert "raw text" in seen["summarised"]
+    assert not (session / "transcript.corrected.txt").exists()
+
+
+
+def test_correction_chunks_keep_speaker_lines_whole() -> None:
+    from jitsi_audio_bridge.ai_client import split_for_correction
+
+    transcript = "\n".join(f"[Alice]: sentence number {i} " + "word " * 20 for i in range(60))
+    chunks = split_for_correction(transcript, 700)
+    assert len(chunks) > 1
+    assert all(len(chunk) <= 700 for chunk in chunks)
+    # No line is cut in half, and nothing is dropped.
+    assert all(line.startswith("[Alice]: ") for chunk in chunks for line in chunk.splitlines())
+    assert sum(len(chunk.splitlines()) for chunk in chunks) == 60
+
+
+def test_a_line_too_long_to_fit_is_cut_anyway() -> None:
+    from jitsi_audio_bridge.ai_client import split_for_correction
+
+    chunks = split_for_correction("x" * 25, 10)
+    assert "".join(chunks) == "x" * 25
 
 
 

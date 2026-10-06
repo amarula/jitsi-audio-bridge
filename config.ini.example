@@ -79,6 +79,11 @@ url = https://whisper.omnia.amarulasolutions.com/transcribe-b64
 timeout = 600
 ; Set to false only for an endpoint with a self-signed certificate.
 verify_tls = true
+; Ask the model to repair grammar and wording before summarising.  The raw
+; transcript is never replaced -- the corrected one is written beside it as
+; transcript.corrected.txt, is what gets summarised and mailed -- and the pass
+; is skipped, with a warning, if the model cannot produce it.
+correct_transcript = false
 
 [ollama]
 url = https://ollama.omnia.amarulasolutions.com/api/generate

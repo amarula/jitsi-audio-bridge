@@ -255,6 +255,108 @@ def build_summary_prompt(transcript_text: str, room_name: str, participants: lis
     )
 
 
+#: A correction pass is one Ollama call per this many characters.  A long
+#: meeting does not fit a model's context, and a corrected transcript that
+#: quietly lost its second half would be worse than an uncorrected one.
+CORRECTION_CHUNK_CHARS = 6000
+
+
+def build_correction_prompt(chunk: str, language: str) -> str:
+    """Ask for the transcript back, repaired — not summarised.
+
+    Speech recognition mishears words, drops endings and leaves punctuation
+    out; the model is good at repairing that, and bad at resisting the urge to
+    improve on what was said.  The instructions spend their words on the
+    second risk: keep the tags, keep the order, keep everything, invent
+    nothing.
+    """
+    return (
+        "You are editing a meeting transcript for grammar and wording. "
+        f"The transcript is in {language}; keep it in {language}.\n"
+        "\n"
+        "RULES:\n"
+        "- Keep every speaker tag exactly as it is, at the start of its line: "
+        "[Name]: ...\n"
+        "- Keep every line, in the order it appears. Do not merge, split, "
+        "reorder, add or remove anything.\n"
+        "- Repair grammar, punctuation and words that were clearly misheard, "
+        "using the context of the conversation.\n"
+        "- Where the intended word is not clear, leave what is written alone "
+        "rather than inventing a replacement.\n"
+        "- Do not summarise, do not comment, do not add headings.\n"
+        "\n"
+        "Reply with the corrected transcript only.\n"
+        "\n"
+        f"{chunk}"
+    )
+
+
+def split_for_correction(text: str, limit: int = CORRECTION_CHUNK_CHARS) -> list[str]:
+    """Split a transcript into chunks no longer than *limit* characters.
+
+    Cut on line boundaries so a speaker's turn is never split in half — the
+    model is told to keep every line intact, and it cannot do that with half
+    of one.  A single line longer than the limit is cut anyway: it is better
+    corrected in pieces than not at all.
+    """
+    chunks: list[str] = []
+    current: list[str] = []
+    size = 0
+    for line in text.splitlines():
+        while len(line) > limit:
+            # A pathological line (no newlines for thousands of characters).
+            if current:
+                chunks.append("\n".join(current))
+                current, size = [], 0
+            chunks.append(line[:limit])
+            line = line[limit:]
+        if current and size + len(line) + 1 > limit:
+            chunks.append("\n".join(current))
+            current, size = [], 0
+        current.append(line)
+        size += len(line) + 1
+    if current:
+        chunks.append("\n".join(current))
+    return [chunk for chunk in chunks if chunk.strip()]
+
+
+def correct_transcript(
+    transcript_text: str, endpoint: OllamaConfig, language: str | None = None
+) -> str:
+    """Return the transcript with grammar and wording repaired.
+
+    Returns ``""`` — having logged why — when any chunk could not be
+    corrected, so the caller falls back to the transcript as it was rather
+    than mailing half a meeting.
+    """
+    chunks = split_for_correction(transcript_text)
+    if not chunks:
+        return ""
+    if language is None:
+        language = detect_language(transcript_text, endpoint)
+
+    corrected: list[str] = []
+    for index, chunk in enumerate(chunks, start=1):
+        payload = {
+            "model": endpoint.model,
+            "prompt": build_correction_prompt(chunk, language),
+            "stream": False,
+            "options": {"temperature": 0.1},
+        }
+        body = _post_json(endpoint.url, payload, endpoint)
+        if body is None:
+            logger.error("correction of chunk %d/%d failed", index, len(chunks))
+            return ""
+        piece = str(body.get("response") or "").strip()
+        if not piece:
+            logger.error("correction of chunk %d/%d produced nothing", index, len(chunks))
+            return ""
+        corrected.append(piece)
+
+    logger.info("corrected %d chunk(s) of the transcript", len(corrected))
+    return "\n\n".join(corrected)
+
+
 def generate_summary(
     transcript_text: str,
     room_name: str,

@@ -66,6 +66,7 @@ DEFAULTS: dict[str, dict[str, str]] = {
         "model": "qwen2.5:14b-instruct",
         "timeout": "600",
         "verify_tls": "true",
+        "correct_transcript": "false",
     },
     "smtp": {
         "host": "127.0.0.1",
@@ -167,6 +168,11 @@ class OllamaConfig(EndpointConfig):
     """The Ollama generate endpoint, which additionally needs a model name."""
 
     model: str
+    #: Ask the model to repair grammar and wording before summarising.  It
+    #: costs one more pass per meeting, and it rewrites what people said —
+    #: which is why it is off by default and why the raw transcript is always
+    #: kept beside the corrected one.
+    correct_transcript: bool = False
 
 
 @dataclass(frozen=True)
@@ -357,6 +363,7 @@ def load_config(path: str | os.PathLike[str] | None = None) -> Config:
             verify_tls=resolver.boolean("whisper", "verify_tls"),
         ),
         ollama=OllamaConfig(
+            correct_transcript=resolver.boolean("ollama", "correct_transcript"),
             url=resolver.required("ollama", "url"),
             timeout=resolver.number("ollama", "timeout", minimum=0.1),
             verify_tls=resolver.boolean("ollama", "verify_tls"),
