@@ -36,6 +36,7 @@ import tempfile
 import time
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -43,7 +44,7 @@ from urllib.parse import parse_qs, urlparse
 import websockets
 
 from . import __version__
-from .ai_client import generate_summary, set_ai_limits, transcribe_audio
+from .ai_client import detect_language, generate_summary, set_ai_limits, transcribe_audio
 from .audio import (
     EXTRACTED_AUDIO_NAME,
     METADATA_FILENAME,
@@ -402,6 +403,21 @@ MAX_TURNS_PER_SESSION = 600
 TranscriptLine = tuple[float | None, str, str]
 
 
+def session_started_at(meeting_dir: Path, timeline: SessionTimeline | None) -> str | None:
+    """When the meeting was, for the mail's subject and heading.
+
+    The timeline knows exactly.  A session without one — the legacy framing, or
+    a directory someone else recorded — falls back to the directory's own
+    timestamp, which is close enough to tell two meetings in a room apart.
+    """
+    if timeline is not None and timeline.started_at:
+        return timeline.started_at
+    try:
+        return datetime.fromtimestamp(meeting_dir.stat().st_mtime).isoformat(timespec="minutes")
+    except OSError:
+        return None
+
+
 def render_transcript(lines: Sequence[TranscriptLine]) -> str:
     """One document, in the order people spoke.
 
@@ -612,11 +628,15 @@ def process_completed_session(meeting_dir: Path, config: Config) -> bool:
         len(transcript_lines),
     )
 
+    # Detected once, then given to both: the summary is written in it and the
+    # mail around the summary follows it, so the two read in one language.
+    language = detect_language(transcript, config.ollama)
     summary = generate_summary(
         transcript,
         metadata["room_name"],
         metadata["participants"],
         config.ollama,
+        language=language,
     )
     if not summary:
         logger.warning("no summary was produced for %s; the transcript is kept", meeting_dir)
@@ -633,6 +653,8 @@ def process_completed_session(meeting_dir: Path, config: Config) -> bool:
         transcript_path,
         summary_path,
         config.smtp,
+        started_at=session_started_at(meeting_dir, timeline),
+        language=language,
     )
 
     if sent and config.storage.cleanup_after_send:

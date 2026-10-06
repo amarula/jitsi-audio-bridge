@@ -153,6 +153,23 @@ The environment layer exists so secrets can be supplied by a systemd
 | `capture_timeline` | boolean | `true` | `JITSI_AUDIO_BRIDGE_STORAGE_CAPTURE_TIMELINE` |
 | `session_grace_seconds` | seconds | `60` | `JITSI_AUDIO_BRIDGE_STORAGE_SESSION_GRACE_SECONDS` |
 
+The subject and the heading inside the mail carry the meeting's local date and
+time — `Meeting Summary & Transcript: Weekly-Planning (2026-10-06 18:50)` —
+because a room keeps its name and every meeting held in it would otherwise be
+labelled identically. The time comes from the timeline; a session without one
+(see `capture_timeline`) is labelled with the session directory's own
+timestamp, or with nothing if even that cannot be read. `subject_suffix` is
+appended after it, so the two are easy to tell apart in a mailbox.
+
+The mail is written in the language the meeting was held in: the summary, its
+headings (the model's) and the subject line, the heading and the introduction
+(the daemon's) all follow the detected language, so an Italian meeting is not
+mailed under an English title. English, Italian, Spanish, French and German
+have their own words; anything else is mailed in English, which is also the
+fallback when detection fails. The subject and heading also carry the
+meeting's local date and time, because a room keeps its name and two meetings
+in it would otherwise be labelled identically.
+
 `cleanup_after_send` deletes the audio, transcript and summary once the email
 has been sent. It is off by default deliberately: those files are the only copy
 of the meeting, so a mistake here destroys one.

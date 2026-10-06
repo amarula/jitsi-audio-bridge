@@ -657,6 +657,44 @@ def test_safe_attachment_name_keeps_an_ordinary_room_name() -> None:
     assert safe_attachment_name("Daily Standup") == "Daily_Standup_transcript.txt"
 
 
+
+
+def test_the_mail_is_written_in_the_meetings_language() -> None:
+    """An Italian meeting should not be headed in English."""
+    from jitsi_audio_bridge.mailer import _subject_for, mail_strings
+
+    subject, heading, introduction = mail_strings("Italian")
+    assert heading == "RIEPILOGO DELLA RIUNIONE"
+    assert "riunione" in introduction.format(room="Weekly")
+    assert _subject_for("Weekly", "", None, "Italian") == (
+        "Riepilogo e trascrizione della riunione: Weekly"
+    )
+    # However the model spelled it, and case-insensitively.
+    assert mail_strings("italian") == mail_strings("Italian")
+    assert mail_strings(" French ")[1] == "RÉSUMÉ DE LA RÉUNION"
+
+    # A language we have no words for is mailed in English, not in nothing.
+    assert mail_strings("Klingon") == mail_strings("English")
+    assert mail_strings(None) == mail_strings("English")
+
+
+def test_the_subject_says_when_the_meeting_was() -> None:
+    """One room, many meetings: the name alone cannot tell them apart."""
+    from jitsi_audio_bridge.mailer import _format_when, _subject_for
+
+    assert _subject_for("Weekly", "") == "Meeting Summary & Transcript: Weekly"
+    assert _subject_for("Weekly", "", "2026-10-06T18:50:00") == (
+        "Meeting Summary & Transcript: Weekly (2026-10-06 18:50)"
+    )
+    assert _subject_for("Weekly", "Amarula", "2026-10-06T18:50:00") == (
+        "Meeting Summary & Transcript: Weekly (2026-10-06 18:50) - Amarula"
+    )
+    # Anything unparseable is left out; the mail still goes.
+    assert _format_when("not a time") == ""
+    assert _format_when(None) == ""
+    assert _subject_for("Weekly", "", "not a time") == "Meeting Summary & Transcript: Weekly"
+
+
 def test_subject_flattens_embedded_newlines() -> None:
     """A newline in the room name would otherwise raise inside EmailMessage."""
     subject = _subject_for("Standup\r\nBcc: evil@example.com")

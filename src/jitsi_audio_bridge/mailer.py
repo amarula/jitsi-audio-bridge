@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 import re
 import smtplib
+from datetime import datetime
 from email.message import EmailMessage
 from pathlib import Path
 
@@ -62,10 +63,84 @@ def _usable_recipients(addresses: list[str] | None) -> list[str]:
     return usable
 
 
-def _subject_for(room_name: str, suffix: str = "") -> str:
+def _format_when(started_at: str | None) -> str:
+    """A meeting's local date and time, or "" when it is not known.
+
+    A room keeps its name, so every meeting held in one would otherwise carry
+    exactly the same subject and heading; the moment it started is what tells
+    them apart in a mailbox.  A timestamp without a zone is taken at face
+    value, which is what the fallback for a session without a timeline is.
+    """
+    if not started_at:
+        return ""
+    try:
+        moment = datetime.fromisoformat(str(started_at))
+    except ValueError:
+        return ""
+    if moment.tzinfo is not None:
+        moment = moment.astimezone()
+    return moment.strftime("%Y-%m-%d %H:%M")
+
+
+#: The mail's own words.  Only the phrases the daemon writes are here — the
+#: summary and its headings come from the model, already in the meeting's
+#: language — and a language that is not in the table is mailed in English
+#: rather than in nothing.
+_MAIL_STRINGS: dict[str, tuple[str, str, str]] = {
+    "english": (
+        "Meeting Summary & Transcript",
+        "MEETING SUMMARY",
+        "Please find the automated summary and raw transcript for room "
+        "'{room}' attached below.",
+    ),
+    "italian": (
+        "Riepilogo e trascrizione della riunione",
+        "RIEPILOGO DELLA RIUNIONE",
+        "In allegato il riepilogo automatico e la trascrizione della riunione "
+        "'{room}'.",
+    ),
+    "spanish": (
+        "Resumen y transcripción de la reunión",
+        "RESUMEN DE LA REUNIÓN",
+        "Adjunto encontrará el resumen automático y la transcripción de la "
+        "sala '{room}'.",
+    ),
+    "french": (
+        "Résumé et transcription de la réunion",
+        "RÉSUMÉ DE LA RÉUNION",
+        "Veuillez trouver ci-joint le résumé automatique et la transcription "
+        "de la salle '{room}'.",
+    ),
+    "german": (
+        "Zusammenfassung und Transkript des Meetings",
+        "ZUSAMMENFASSUNG DES MEETINGS",
+        "Im Anhang finden Sie die automatische Zusammenfassung und das "
+        "Transkript des Raums '{room}'.",
+    ),
+}
+
+
+def mail_strings(language: str | None) -> tuple[str, str, str]:
+    """Subject prefix, heading and introduction for *language*.
+
+    The language is the one the summary was written in, so the whole mail
+    reads in one voice.  Anything not in the table falls back to English.
+    """
+    return _MAIL_STRINGS.get(str(language or "").strip().lower(), _MAIL_STRINGS["english"])
+
+
+def _subject_for(
+    room_name: str,
+    suffix: str = "",
+    started_at: str | None = None,
+    language: str | None = None,
+) -> str:
     """Build a subject line with any embedded newlines flattened out."""
     flattened = " ".join(str(room_name).split()) or "Meeting"
-    subject = f"Meeting Summary & Transcript: {flattened}"
+    subject = f"{mail_strings(language)[0]}: {flattened}"
+    when = _format_when(started_at)
+    if when:
+        subject = f"{subject} ({when})"
     # Tolerate a suffix written either as "Amarula" or "- Amarula": the
     # separator is added here, so a leading one is stripped rather than doubled.
     cleaned = " ".join(str(suffix).split()).strip("-–—").strip()
@@ -95,11 +170,16 @@ def send_meeting_email(
     transcript_path: str | Path | None,
     summary_path: str | Path | None,
     smtp: SmtpConfig,
+    started_at: str | None = None,
+    language: str | None = None,
 ) -> bool:
     """Email the summary to *recipients*, attaching the transcript and summary.
 
     Falls back to the configured fallback recipient when the meeting recorded
-    no addresses.  Returns whether the message was handed to the relay.
+    no addresses.  *started_at* is the meeting's own clock, used to tell one
+    meeting in a room from the next, and *language* is the one the summary was
+    written in, which the subject, the heading and the introduction follow.
+    Returns whether the message was handed to the relay.
     """
     targets = _usable_recipients(recipients)
     if not targets and smtp.fallback_recipient:
@@ -113,19 +193,26 @@ def send_meeting_email(
 
     try:
         message = EmailMessage()
-        message["Subject"] = _subject_for(room_name, smtp.subject_suffix)
+        message["Subject"] = _subject_for(
+            room_name, smtp.subject_suffix, started_at, language
+        )
         message["From"] = smtp.sender
         message["To"] = ", ".join(targets)
+        # The model wrote the summary in the meeting's language; the mail
+        # around it is written in the same one, so it reads in one voice.
+        _, heading, introduction = mail_strings(language)
+        when = _format_when(started_at)
         message.set_content(
-            f"Hello,\n\n"
-            f"Please find the automated summary and raw transcript for room "
-            f"'{room_name}' attached below.\n\n"
-            f"{'-' * 50}\n"
-            f"MEETING SUMMARY ({room_name.upper()})\n"
-            f"{'-' * 50}\n\n"
-            f"{summary_text}\n\n"
-            f"Best regards,\n"
-            f"Automated meeting transcription\n"
+            introduction.format(room=room_name)
+            + "\n\n"
+            + f"{'-' * 50}\n"
+            + f"{heading} ({room_name.upper()})"
+            + (f" — {when}" if when else "")
+            + "\n"
+            + f"{'-' * 50}\n\n"
+            + f"{summary_text}\n\n"
+            + "Best regards,\n"
+            + "Automated meeting transcription\n"
         )
 
         # Both are attached: the transcript is the record, the summary is what

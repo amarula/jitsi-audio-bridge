@@ -260,12 +260,16 @@ def generate_summary(
     room_name: str,
     participants: list[str],
     endpoint: OllamaConfig,
+    language: str | None = None,
 ) -> str:
     """Generate a meeting summary with Ollama, in the transcript's language.
 
-    Returns the summary, or ``""`` if Ollama could not be reached.
+    *language* may be supplied when the caller has already asked — the mail
+    around the summary is written in it too.  Returns the summary, or ``""``
+    if Ollama could not be reached.
     """
-    language = detect_language(transcript_text, endpoint)
+    if language is None:
+        language = detect_language(transcript_text, endpoint)
     prompt = build_summary_prompt(transcript_text, room_name, participants, language)
     payload = {
         "model": endpoint.model,
