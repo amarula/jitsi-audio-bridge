@@ -1141,3 +1141,30 @@ def test_propose_prosody_does_not_re_add_an_already_enabled_module(tmp_path: Pat
     assert "prosody.force_async_transcription" in ids          # the module file is proposed
     site = next(p for p in proposals if p.check_id == "prosody.room_metadata")
     assert site.new_text.count("force_async_transcription") == 1
+
+
+def test_prosody_warns_when_the_module_never_publishes_the_metadata(tmp_path: Path) -> None:
+    """Setting the flag is not enough: the component only broadcasts on an event."""
+    plugin_dir = tmp_path / "plugins"
+    plugin_dir.mkdir()
+    silent = plugin_dir / "mod_force_async_transcription.lua"
+    silent.write_text(
+        "module:hook('muc-room-created', function(event)\n"
+        "    event.room.jitsiMetadata.asyncTranscription = true;\n"
+        "end, -2);\n"
+    )
+    reader = _reader({silent: silent.read_text()})
+    checks = check_prosody(
+        _deployment(prosody_text=PROSODY), "meet.example.com", [plugin_dir], reader
+    )
+    assert _status(checks, "prosody.force_async_transcription") is Status.PASS
+    assert _status(checks, "prosody.force_async_transcription.publish") is Status.WARN
+
+    # The shipped module fires the event, so it does not warn.
+    publishing = plugin_dir / "mod_force_async_transcription.lua"
+    publishing.write_text(PROSODY_MODULE_LUA)
+    checks = check_prosody(
+        _deployment(prosody_text=PROSODY), "meet.example.com", [plugin_dir],
+        _reader({publishing: PROSODY_MODULE_LUA}),
+    )
+    assert not [c for c in checks if c.id.endswith(".publish")]

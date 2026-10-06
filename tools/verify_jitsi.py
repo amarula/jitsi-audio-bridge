@@ -1006,6 +1006,17 @@ def forcing_candidates(
     return found
 
 
+def lua_publishes_room_metadata(text: str) -> bool:
+    """Whether a module publishes its metadata changes.
+
+    ``mod_room_metadata_component`` does not watch ``room.jitsiMetadata``; it
+    broadcasts only when a module fires ``room-metadata-changed``.  A module
+    that sets the flag without firing it changes nothing anyone can see — which
+    is exactly what the handbook's sample module does on the current stack.
+    """
+    return "room-metadata-changed" in lua_uncomment(text)
+
+
 def check_prosody(
     deployment: Deployment,
     domain: str | None,
@@ -1089,6 +1100,18 @@ def check_prosody(
     if forcing:
         checks.append(Check("prosody.force_async_transcription", Status.PASS,
                             "set by " + ", ".join(f"{name} ({path})" for name, path in forcing)))
+        if not any(
+            lua_publishes_room_metadata(read_module(path) or "") for _, path in forcing
+        ):
+            checks.append(Check(
+                "prosody.force_async_transcription.publish", Status.WARN,
+                "the module that sets asyncTranscription never fires "
+                "room-metadata-changed, so the flag is published to neither Jicofo "
+                "nor the clients — transcription never starts",
+                fix="use the module in docs/jitsi-integration.md §2, which fires the "
+                    "event on every occupant join (a room starts empty, so a "
+                    "creation-time broadcast reaches nobody)",
+            ))
     else:
         available = forcing_candidates(plugin_dirs, read_module)
         if available:
