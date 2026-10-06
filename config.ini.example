@@ -30,6 +30,12 @@ recordings_dir = /srv/recordings
 ; Off by default: these files are the only copy of the meeting, so a
 ; misconfiguration should not be able to destroy one.
 cleanup_after_send = false
+; Where a Prosody module (docs/jitsi-integration.md §5) drops per-meeting
+; metadata, keyed by meeting id.  Stock Jitsi's framing carries no names,
+; addresses or room name; with this set, a session adopts the file written for
+; it — room name, participants, and those speakers' names — as its metadata.
+; Empty disables it and leaves such sessions on the defaults.
+session_metadata_dir =
 
 [whisper]
 ; Endpoint accepting {"audio_base64": ..., "filename": ...} and returning

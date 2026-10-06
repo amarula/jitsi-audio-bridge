@@ -31,6 +31,7 @@ from jitsi_audio_bridge.config import ConfigError, load_config
 from jitsi_audio_bridge.daemon import (
     DEFAULT_SESSION_ID,
     StreamError,
+    adopt_session_metadata,
     build_media_json_pong,
     describe_media_json_start,
     extract_media_json_media,
@@ -275,6 +276,67 @@ def test_describe_media_json_start_tolerates_a_sparse_event(event: dict[str, obj
 # Control frames
 # --------------------------------------------------------------------------
 
+
+
+# --------------------------------------------------------------------------
+# Session metadata dropped by a companion service
+# --------------------------------------------------------------------------
+
+
+def test_adopted_metadata_becomes_the_sessions_own(tmp_path: Path) -> None:
+    drop = tmp_path / "drop"
+    drop.mkdir()
+    session = tmp_path / "abc-123"
+    session.mkdir()
+    (drop / "abc-123.json").write_text(json.dumps({
+        "room_name": "Weekly-Planning",
+        "participants": [{"id": "8aa1c4ba", "name": "Alice", "email": "a@example.com"}],
+    }))
+
+    assert adopt_session_metadata(session, drop) == session / "metadata.json"
+    stored = json.loads((session / "metadata.json").read_text())
+    assert stored["room_name"] == "Weekly-Planning"
+    # Consumed, so it is not picked up again by a later reprocessing.
+    assert not (drop / "abc-123.json").exists()
+
+    info = parse_metadata(session)
+    assert info["room_name"] == "Weekly-Planning"
+    assert info["recipients"] == ["a@example.com"]
+    recording = session / "participant-8aa1c4ba-a0.wav"
+    assert attribute_speaker(recording, info["id_to_name"]) == "Alice"
+
+
+def test_adoption_leaves_the_sessions_own_metadata_alone(tmp_path: Path) -> None:
+    drop = tmp_path / "drop"
+    drop.mkdir()
+    session = tmp_path / "abc-123"
+    session.mkdir()
+    (session / "metadata.json").write_text(json.dumps({"room_name": "From the sender"}))
+    (drop / "abc-123.json").write_text(json.dumps({"room_name": "From Prosody"}))
+
+    assert adopt_session_metadata(session, drop) is None
+    assert json.loads((session / "metadata.json").read_text())["room_name"] == "From the sender"
+    assert (drop / "abc-123.json").exists()          # still there if wanted later
+
+
+def test_adoption_is_off_and_tolerant(tmp_path: Path) -> None:
+    session = tmp_path / "abc-123"
+    session.mkdir()
+    drop = tmp_path / "drop"
+    drop.mkdir()
+
+    assert adopt_session_metadata(session, None) is None       # feature off
+    assert adopt_session_metadata(session, drop) is None       # nothing dropped
+
+    for bad in ("not json", "[1, 2]", '"text"'):
+        (drop / "abc-123.json").write_text(bad)
+        assert adopt_session_metadata(session, drop) is None
+        assert not (session / "metadata.json").exists()
+
+    # Too large to be a description of a meeting.
+    (drop / "abc-123.json").write_text(json.dumps({"x": "y" * (1 << 21)}))
+    assert adopt_session_metadata(session, drop) is None
+    assert not (session / "metadata.json").exists()
 
 def test_write_metadata_stores_a_json_object(tmp_path: Path) -> None:
     assert write_metadata(tmp_path, json.dumps({"room_name": "Standup"}))

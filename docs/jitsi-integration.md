@@ -315,6 +315,201 @@ the deployment's planning:
 | `videobridge.exporter.max-delay` | `30 seconds` | Backoff ceiling |
 | `videobridge.exporter.stable-connection-threshold` | `30 seconds` | A connection must live this long before it resets the attempt counter, to prevent tight reconnect loops |
 
+### 5. Optional — give sessions their names back
+
+Everything above produces transcripts whose speakers are `participant-<tag>`,
+whose summary is titled "General Meeting", and whose mail goes to
+`[smtp] fallback_recipient` — because the JVB's framing carries no names,
+addresses or room name. Prosody knows all three, and it already knows which
+room a session belongs to: the session directory is named after the meeting ID
+that `muc_meeting_id` generates and Jicofo substitutes into `{{MEETING_ID}}`.
+
+So one more module writes what it knows under that ID, and the bridge adopts
+it when a session has no metadata of its own. Create
+`mod_audio_bridge_metadata.lua` beside the other module:
+
+```lua
+-- mod_audio_bridge_metadata.lua
+-- Gives the audio bridge what stock Jitsi's media export does not carry: the
+-- meeting's name, and the participants with the display names the JVB cannot
+-- send.  The session directory the bridge creates is named after the meeting
+-- id, which is exactly what this module has in room._data.meetingId.
+-- Enable on the main MUC component (e.g. conference.<domain>), and point the
+-- bridge at the same directory with [storage] session_metadata_dir.
+
+local jid = require 'util.jid';
+local json = require 'cjson.safe';
+local lfs = require 'lfs';
+
+local util = module:require 'util';
+local is_admin = util.is_admin;
+local is_jibri = util.is_jibri;
+local is_transcriber = util.is_transcriber;
+local is_healthcheck_room = util.is_healthcheck_room;
+
+-- Must be the bridge's [storage] session_metadata_dir.
+local output_dir = module:get_option_string(
+    'audio_bridge_metadata_dir', '/srv/recordings/.session-metadata');
+
+-- Display names travel in the occupant's presence, under XEP-0172.
+local NICK_NS = 'http://jabber.org/protocol/nick';
+
+-- Emails only exist where the deployment authenticates its users, and they
+-- arrive in the session's token context rather than in the presence.
+local emails = {};
+
+-- Jicofo, the JVB, Jibri and the transcriber are in the room but are not in
+-- the audio: the bridge would have nobody to attribute them to.
+local function is_participant(occupant)
+    return not is_admin(occupant.bare_jid)
+        and not is_jibri(occupant)
+        and not is_transcriber(occupant.jid);
+end
+
+local function display_name(occupant)
+    local presence = occupant:get_presence();
+    local name = presence and presence:get_child_text('nick', NICK_NS);
+    if name and #name > 0 then
+        return name;
+    end
+    return nil;
+end
+
+local function collect(room)
+    local participants = {};
+    for _, occupant in room:each_occupant() do
+        if is_participant(occupant) then
+            local id = jid.resource(occupant.nick);
+            if id then
+                local store = emails[room.jid] or {};
+                table.insert(participants, {
+                    id = id;
+                    name = display_name(occupant);
+                    email = store[id];
+                });
+            end
+        end
+    end
+    return participants;
+end
+
+local function write_metadata(room)
+    local meeting_id = room._data and room._data.meetingId;
+    if not meeting_id then
+        -- Without muc_meeting_id Jicofo invents an id of its own, and this
+        -- file could not be matched to the session it describes.
+        module:log('warn', 'no meeting id for %s; is muc_meeting_id enabled?', room.jid);
+        return;
+    end
+
+    local encoded = json.encode({
+        room_name = jid.node(room.jid);
+        meeting_id = meeting_id;
+        source = 'audio_bridge_metadata';
+        participants = collect(room);
+    });
+    if not encoded then
+        module:log('error', 'cannot encode the metadata of %s', room.jid);
+        return;
+    end
+
+    if not lfs.attributes(output_dir, 'mode') then
+        lfs.mkdir(output_dir);
+    end
+
+    -- Written whole and renamed into place: the bridge reads this file while
+    -- the meeting is still running.
+    local path = output_dir .. '/' .. meeting_id .. '.json';
+    local temporary = path .. '.tmp';
+    local handle, err = io.open(temporary, 'w');
+    if not handle then
+        module:log('error', 'cannot write %s: %s', temporary, err or 'unknown error');
+        return;
+    end
+    handle:write(encoded);
+    handle:close();
+    local moved, move_err = os.rename(temporary, path);
+    if not moved then
+        module:log('error', 'cannot move %s into place: %s', temporary,
+            move_err or 'unknown error');
+    end
+end
+
+local function remember_email(room, occupant, session)
+    local user = session and session.jitsi_meet_context_user;
+    if not (user and user.email) then
+        return;
+    end
+    local store = emails[room.jid];
+    if not store then
+        store = {};
+        emails[room.jid] = store;
+    end
+    store[jid.resource(occupant.nick)] = user.email;
+end
+
+-- Rewritten as people come and go, so a participant who left before the end
+-- is still in the list the bridge reads.
+module:hook('muc-occupant-joined', function(event)
+    local room = event.room;
+
+    if is_healthcheck_room(room.jid) then
+        return;
+    end
+
+    remember_email(room, event.occupant, event.origin);
+    write_metadata(room);
+end, -2);
+
+module:hook('muc-occupant-left', function(event)
+    local room = event.room;
+
+    if is_healthcheck_room(room.jid) then
+        return;
+    end
+
+    write_metadata(room);
+end, -2);
+```
+
+Enable it on the MUC component, exactly like the other one:
+
+```lua
+Component "conference.example.com" "muc"
+    modules_enabled = {
+        -- ... existing modules ...
+        "audio_bridge_metadata";
+    }
+```
+
+Then the two sides have to share one directory. Prosody runs as `prosody` and
+the bridge as `jitsi-bridge`, so the directory belongs to the bridge's group
+and the setgid bit keeps it there:
+
+```sh
+sudo install -d -o jitsi-bridge -g jitsi-bridge -m 2770 /srv/recordings/.session-metadata
+sudo usermod -aG jitsi-bridge prosody
+```
+
+and in the bridge's `config.ini`:
+
+```ini
+[storage]
+session_metadata_dir = /srv/recordings/.session-metadata
+```
+
+```sh
+sudo systemctl restart prosody jitsi-audio-bridge
+```
+
+Now a session that has no `metadata.json` of its own adopts the dropped file:
+`transcript.txt` is attributed by display name, the summary carries the room's
+name, and — where the deployment authenticates users, so that the token has an
+email — the transcript goes to the participants instead of
+`fallback_recipient`. Each accepted file is removed as it is consumed, so the
+directory only holds the meetings still running. Sessions that did send a
+control frame are untouched: their own `metadata.json` always wins.
+
 ## What arrives on the socket
 
 The JVB→service protocol is JSON text frames in a format derived from

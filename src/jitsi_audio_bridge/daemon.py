@@ -282,6 +282,65 @@ def write_metadata(meeting_dir: Path, raw: str) -> bool:
     return True
 
 
+#: A dropped metadata file describes a meeting; anything this size is not one.
+MAX_SESSION_METADATA_BYTES = 1 << 20
+
+
+def adopt_session_metadata(meeting_dir: Path, source_dir: Path | None) -> Path | None:
+    """Take the metadata a companion service dropped for this session.
+
+    Stock Jitsi's framing carries no names, addresses or room name, so a
+    session it produced has nothing to attribute speakers with and no
+    recipient to address.  A Prosody module can write what it knows about the
+    room under the meeting id — which is the session's own id — and this moves
+    that file in as the session's ``metadata.json`` before post-processing
+    reads it.  A ``metadata.json`` the session produced itself always wins.
+
+    Returns the path written, or ``None`` when there was nothing to take.
+    """
+    if source_dir is None:
+        return None
+    target = meeting_dir / METADATA_FILENAME
+    if target.exists():
+        return None
+
+    source = source_dir / f"{meeting_dir.name}.json"
+    try:
+        if source.stat().st_size > MAX_SESSION_METADATA_BYTES:
+            logger.warning(
+                "ignoring %s: larger than %d bytes", source, MAX_SESSION_METADATA_BYTES
+            )
+            return None
+        raw = source.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        logger.warning("cannot read %s: %s", source, exc)
+        return None
+
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        logger.warning("cannot parse %s: %s", source, exc)
+        return None
+    if not isinstance(parsed, dict):
+        logger.warning("%s is not a JSON object; ignoring it", source)
+        return None
+
+    if not write_metadata(meeting_dir, raw):
+        return None
+    logger.info(
+        "adopted the session metadata %s wrote (%d participant(s))",
+        source.name,
+        len(parsed.get("participants") or []),
+    )
+    try:
+        source.unlink()
+    except OSError as exc:
+        logger.warning("cannot remove %s: %s", source, exc)
+    return target
+
+
 def _semaphore() -> asyncio.Semaphore:
     """Return the processing semaphore, binding it to the running loop."""
     global _PROCESSING_SEMAPHORE
@@ -313,6 +372,7 @@ def process_completed_session(meeting_dir: Path, config: Config) -> bool:
     """
     logger.info("post-processing %s", meeting_dir)
     meeting_dir = Path(meeting_dir)
+    adopt_session_metadata(meeting_dir, config.storage.session_metadata_dir)
     metadata = parse_metadata(meeting_dir)
 
     participant_files, master_file = discover_audio(meeting_dir)

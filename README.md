@@ -149,10 +149,18 @@ The environment layer exists so secrets can be supplied by a systemd
 |---|---|---|---|
 | `recordings_dir` | path | `/srv/recordings` | `JITSI_AUDIO_BRIDGE_STORAGE_RECORDINGS_DIR` |
 | `cleanup_after_send` | boolean | `false` | `JITSI_AUDIO_BRIDGE_STORAGE_CLEANUP_AFTER_SEND` |
+| `session_metadata_dir` | path | *(empty)* | `JITSI_AUDIO_BRIDGE_STORAGE_SESSION_METADATA_DIR` |
 
 `cleanup_after_send` deletes the audio, transcript and summary once the email
 has been sent. It is off by default deliberately: those files are the only copy
 of the meeting, so a mistake here destroys one.
+
+`session_metadata_dir` is where a companion service — the Prosody module in
+[docs/jitsi-integration.md](docs/jitsi-integration.md) §5 — drops per-meeting
+metadata, keyed by meeting id. A session that has no `metadata.json` of its own
+adopts the file written for it, which is how a stock-Jitsi session gets a room
+name, speaker names and, where the deployment authenticates users, recipients.
+Empty disables it.
 
 ### `[whisper]`
 
@@ -616,10 +624,12 @@ daemon closes every file in a `finally`, so this needs a hard kill; see
   `tools/send_meeting.py` encodes the binary assumption rather than validating
   it.
 - **A media-json meeting loses its participant names.** Stock Jitsi's framing
-  carries no names, addresses or room name, so speakers are attributed by their
-  source tag, the summary is titled "General Meeting", and the mail goes to
-  `[smtp] fallback_recipient`. Correlating `sessionId` with the conference
-  elsewhere is the only way to recover them.
+  carries no names, addresses or room name, so by default speakers are
+  attributed by their source tag, the summary is titled "General Meeting", and
+  the mail goes to `[smtp] fallback_recipient`. Recovering them means
+  correlating `sessionId` with the conference elsewhere — which
+  [docs/jitsi-integration.md](docs/jitsi-integration.md) §5 does with a Prosody
+  module and `[storage] session_metadata_dir`.
 - **No conversational ordering.** No timestamps are recorded, so the transcript
   is one block per participant in filesystem order, not interleaved by time.
   This is the single largest quality limitation; recovering it means recording

@@ -21,6 +21,7 @@ import pytest
 
 from tools import verify_jitsi
 from tools.verify_jitsi import (
+    PROSODY_METADATA_MODULE_LUA,
     PROSODY_MODULE_LUA,
     Check,
     Deployment,
@@ -670,10 +671,17 @@ def test_find_js_var_object_span_requires_exactly_one_candidate() -> None:
 
 
 def test_module_source_matches_the_documented_module() -> None:
+    """The shipped modules and the documented ones are the same text."""
     docs = (Path(__file__).resolve().parent.parent / "docs" / "jitsi-integration.md").read_text()
-    marker = "Create `mod_force_async_transcription.lua`"
-    fence = docs.split(marker, 1)[1].split("```lua", 1)[1].split("```", 1)[0]
-    assert fence.strip() == PROSODY_MODULE_LUA.strip()
+    for marker, module in (
+        ("Create `mod_force_async_transcription.lua`", PROSODY_MODULE_LUA),
+        (
+            "Create\n`mod_audio_bridge_metadata.lua` beside the other module:",
+            PROSODY_METADATA_MODULE_LUA,
+        ),
+    ):
+        fence = docs.split(marker, 1)[1].split("```lua", 1)[1].split("```", 1)[0]
+        assert fence.strip() == module.strip()
 
 
 # --------------------------------------------------------------------------

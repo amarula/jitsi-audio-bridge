@@ -44,6 +44,7 @@ DEFAULTS: dict[str, dict[str, str]] = {
     "storage": {
         "recordings_dir": "/srv/recordings",
         "cleanup_after_send": "false",
+        "session_metadata_dir": "",
     },
     "whisper": {
         "url": "https://whisper.omnia.amarulasolutions.com/transcribe-b64",
@@ -91,6 +92,11 @@ class StorageConfig:
     #: Off by default: deleting a recording is irreversible, so a
     #: misconfiguration should not be able to destroy a meeting.
     cleanup_after_send: bool
+    #: Where a companion service (a Prosody module) drops per-meeting metadata
+    #: for stock-Jitsi sessions, keyed by meeting id.  ``None`` disables it:
+    #: the JVB's framing carries no names, addresses or room name, so those
+    #: sessions then run entirely on the defaults.
+    session_metadata_dir: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -220,6 +226,11 @@ class _Resolver:
         value = self.required(section, key)
         return Path(value).expanduser()
 
+    def optional_path(self, section: str, key: str) -> Path | None:
+        """A path setting that is absent or empty when the feature is off."""
+        value = self.text(section, key)
+        return Path(value).expanduser() if value else None
+
 
 def _find_config_file(explicit: str | os.PathLike[str] | None) -> Path | None:
     """Resolve which config file to read, if any."""
@@ -268,6 +279,7 @@ def load_config(path: str | os.PathLike[str] | None = None) -> Config:
         storage=StorageConfig(
             recordings_dir=resolver.path("storage", "recordings_dir"),
             cleanup_after_send=resolver.boolean("storage", "cleanup_after_send"),
+            session_metadata_dir=resolver.optional_path("storage", "session_metadata_dir"),
         ),
         whisper=EndpointConfig(
             url=resolver.required("whisper", "url"),
