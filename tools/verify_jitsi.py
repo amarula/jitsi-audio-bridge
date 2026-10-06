@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import configparser
 import contextlib
 import json
 import os
@@ -79,6 +80,8 @@ DEFAULT_PROSODY_CONF_D = Path("/etc/prosody/conf.d")
 DEFAULT_MEET_DIR = Path("/etc/jitsi/meet")
 DEFAULT_JVB_CONF = Path("/etc/jitsi/videobridge/jvb.conf")
 DEFAULT_JIBRI_CONF = Path("/etc/jitsi/jibri/jibri.conf")
+#: The bridge's own configuration, read to learn where it writes meetings.
+DEFAULT_BRIDGE_CONF = Path("/etc/jitsi-audio-bridge/config.ini")
 #: Jibri before the HOCON configuration; the brewery is a plain key there.
 DEFAULT_JIBRI_LEGACY_CONF = Path("/etc/jitsi/jibri/config.json")
 DEFAULT_PLUGIN_DIRS = (
@@ -1313,6 +1316,37 @@ _JIBRI_LEGACY_BREWERY = re.compile(
     r"""["']?brewery[_-]?jid["']?\s*[:=]\s*["']([^"']+)["']"""
 )
 
+#: Both packages default to this tree, which is why a single host needs the
+#: two told apart: the bridge owns it (user jitsi-bridge), and Jibri runs as
+#: user jibri.
+_JIBRI_RECORDINGS_KEY = re.compile(
+    r"""["']?recordings[_-]directory["']?\s*[:=]\s*["']?([^"'\s,}]+)"""
+)
+
+
+def jibri_recordings_directory(text: str) -> str | None:
+    """Where Jibri puts its recordings, from its own configuration.
+
+    The stock Jibri package uses ``/srv/recordings``, and so does this bridge
+    when it is installed on the same host — where the two then collide: the
+    directory belongs to the bridge's user, Jibri's attempt to create a session
+    directory fails with an access error, and that error marks Jibri unhealthy.
+    """
+    found = _JIBRI_RECORDINGS_KEY.search(_hocon_lines(text))
+    return found.group(1).strip() if found else None
+
+
+def bridge_recordings_dir() -> Path:
+    """Where the bridge writes its meetings, from its own configuration."""
+    if DEFAULT_BRIDGE_CONF.is_file():
+        parser = configparser.ConfigParser(interpolation=None)
+        try:
+            parser.read(DEFAULT_BRIDGE_CONF)
+            return Path(parser.get("storage", "recordings_dir", fallback="/srv/recordings"))
+        except (OSError, configparser.Error):
+            pass
+    return Path("/srv/recordings")
+
 
 def jibri_control_muc(text: str) -> str | None:
     """The brewery MUC Jibri itself logs into, read from its configuration.
@@ -1395,6 +1429,30 @@ def check_recording(deployment: Deployment) -> list[Check]:
                 fix="add `recordingService: { enabled: true },` (or the older "
                     "`fileRecordingsEnabled: true`) to offer it, or leave it out deliberately",
             ))
+
+    # Independent of what the client offers: if Jibri records into the bridge's
+    # tree, its first attempt fails, and that failure is permanent until Jibri
+    # restarts.
+    jibri_dir = jibri_recordings_directory(deployment.jibri_text or "")
+    if jibri_dir is None:
+        checks.append(Check(
+            "recording.directory", Status.SKIP,
+            "no Jibri configuration read, so its recordings directory is unknown",
+            fix="pass --jibri-conf if Jibri runs elsewhere",
+        ))
+    elif Path(jibri_dir) == bridge_recordings_dir():
+        checks.append(Check(
+            "recording.directory", Status.WARN,
+            f"Jibri records into {jibri_dir} — the same tree this bridge writes its "
+            "meetings into, which belongs to the bridge's user",
+            fix="give Jibri a directory of its own (recording.recordings-directory in "
+                "jibri.conf, e.g. /srv/jibri-recordings, owned by the jibri user); as "
+                "user jibri it cannot write the bridge's tree, and the resulting system "
+                "error marks it unhealthy, which Jicofo reads as 'all recorders busy' "
+                "until Jibri is restarted",
+        ))
+    else:
+        checks.append(Check("recording.directory", Status.PASS, f"Jibri records into {jibri_dir}"))
 
     if offered is not True:
         checks.append(Check(

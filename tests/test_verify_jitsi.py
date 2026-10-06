@@ -49,6 +49,7 @@ from tools.verify_jitsi import (
     hocon_str,
     hocon_transcription_block,
     jibri_control_muc,
+    jibri_recordings_directory,
     js_boolean,
     load_deployment,
     load_hocon,
@@ -1324,6 +1325,61 @@ def test_recording_reports_rooms_the_two_sides_disagree_on() -> None:
         c for c in check_recording(deployment) if c.id == "recording.jibri.brewery"
     )
     assert check.status is Status.PASS
+
+
+JIBRI_CONF = """
+jibri {
+  recording {
+    recordings-directory = /srv/recordings
+  }
+  xmpp {
+    environments = [
+      {
+        control-muc {
+          domain = "internal.auth.meet.example.com"
+          room = "jibribrewery"
+        }
+      }
+    ]
+  }
+}
+"""
+
+
+def test_jibri_recordings_directory_reads_both_shapes() -> None:
+    assert jibri_recordings_directory(JIBRI_CONF) == "/srv/recordings"
+    legacy = '{\n  "recordings_directory": "/srv/jibri"\n}\n'
+    assert jibri_recordings_directory(legacy) == "/srv/jibri"
+    assert jibri_recordings_directory("jibri {\n  recording { }\n}\n") is None
+
+
+def test_recording_warns_when_jibri_writes_into_the_bridge_tree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Both packages default to /srv/recordings, and only one user owns it."""
+    monkeypatch.setattr(verify_jitsi, "DEFAULT_BRIDGE_CONF", tmp_path / "absent.ini")
+    deployment = replace(
+        _deployment(meet_text=RECORDING_CLIENT, prosody_text=PROSODY_WITH_BREWERY),
+        jibri_text=JIBRI_CONF,
+    )
+    check = next(c for c in check_recording(deployment) if c.id == "recording.directory")
+    assert check.status is Status.WARN
+    assert "jitsi-bridge" in check.fix or "user jibri" in check.fix
+
+    # Jibri's own directory is the fix, and then nothing is reported.
+    apart = replace(deployment, jibri_text=JIBRI_CONF.replace("/srv/recordings", "/srv/jibri"))
+    check = next(c for c in check_recording(apart) if c.id == "recording.directory")
+    assert check.status is Status.PASS
+
+    # A bridge that was moved elsewhere takes the collision with it.
+    moved = tmp_path / "config.ini"
+    moved.write_text("[storage]\nrecordings_dir = /data/meetings\n")
+    monkeypatch.setattr(verify_jitsi, "DEFAULT_BRIDGE_CONF", moved)
+    into_moved = replace(
+        deployment, jibri_text=JIBRI_CONF.replace("/srv/recordings", "/data/meetings")
+    )
+    check = next(c for c in check_recording(into_moved) if c.id == "recording.directory")
+    assert check.status is Status.WARN
 
 
 def test_classify_jicofo_collects_only_the_watched_brewery() -> None:

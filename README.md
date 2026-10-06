@@ -573,6 +573,26 @@ recorder existed. `jibribrewery` is the convention, but what counts is the
 `control-muc` in Jibri's own `jibri.conf` — the checker reads it and compares
 the two sides directly (`--jibri-conf` when Jibri runs on another host).
 
+And on a host that runs both Jibri and this bridge, **check
+`recording.recordings-directory`**. Jibri's package and this one both default to
+`/srv/recordings`, which only one user can own: Jibri runs as `jibri`, the
+bridge as `jitsi-bridge`, and the bridge's package claims the directory. Jibri's
+attempt then fails with `ErrorCreatingRecordingsDirectory … SYSTEM` and a
+`AccessDeniedException` on its session directory, and because a system error
+marks Jibri unhealthy — a state it does not re-advertise until something changes
+— Jicofo reads it as "all recorders are currently busy" from then on, however
+healthy the rest of the deployment is. Give Jibri a tree of its own:
+
+```sh
+sudo install -d -o jibri -g jibri -m 0750 /srv/jibri-recordings
+sudo sed -i 's|^\( *recordings-directory *= *\).*|\1"/srv/jibri-recordings"|' \
+    /etc/jitsi/jibri/jibri.conf
+sudo systemctl restart jibri
+```
+
+The checker reports the collision as `recording.directory`, comparing Jibri's
+setting with this bridge's own `[storage] recordings_dir`.
+
 **A `SIGKILL` left an unreadable WAV.**
 The `wave` module writes the real length into the header only on `close()`. The
 daemon closes every file in a `finally`, so this needs a hard kill; see
