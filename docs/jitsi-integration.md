@@ -354,9 +354,12 @@ local output_dir = module:get_option_string(
 -- Display names travel in the occupant's presence, under XEP-0172.
 local NICK_NS = 'http://jabber.org/protocol/nick';
 
--- Emails only exist where the deployment authenticates its users, and they
--- arrive in the session's token context rather than in the presence.
-local emails = {};
+-- Everyone the room has seen, by room and then by participant id.  The bridge
+-- reads this file long after the meeting -- it waits for the session to go
+-- quiet first -- so writing only who is *present* would hand it an empty
+-- room.  Emails arrive in the session's token context rather than in the
+-- presence, and only where the deployment authenticates users.
+local known = {};
 
 -- Jicofo, the JVB, Jibri and the transcriber are in the room but are not in
 -- the audio: the bridge would have nobody to attribute them to.
@@ -375,20 +378,41 @@ local function display_name(occupant)
     return nil;
 end
 
-local function collect(room)
+local function remember(room, occupant, session)
+    local id = jid.resource(occupant.nick);
+    if not id then
+        return;
+    end
+
+    local user = session and session.jitsi_meet_context_user;
+    local store = known[room.jid];
+    if not store then
+        store = {};
+        known[room.jid] = store;
+    end
+
+    local entry = store[id] or {};
+    entry.name = display_name(occupant) or entry.name;
+    entry.email = (user and user.email) or entry.email;
+    store[id] = entry;
+end
+
+local function participants_of(room)
+    local store = known[room.jid] or {};
+    local ids = {};
+    for id in pairs(store) do
+        table.insert(ids, id);
+    end
+    table.sort(ids);
+
     local participants = {};
-    for _, occupant in room:each_occupant() do
-        if is_participant(occupant) then
-            local id = jid.resource(occupant.nick);
-            if id then
-                local store = emails[room.jid] or {};
-                table.insert(participants, {
-                    id = id;
-                    name = display_name(occupant);
-                    email = store[id];
-                });
-            end
-        end
+    for _, id in ipairs(ids) do
+        local entry = store[id];
+        table.insert(participants, {
+            id = id;
+            name = entry.name;
+            email = entry.email;
+        });
     end
     return participants;
 end
@@ -402,7 +426,7 @@ local function write_metadata(room)
         return;
     end
 
-    local participants = collect(room);
+    local participants = participants_of(room);
     local encoded = json.encode({
         room_name = jid.node(room.jid);
         meeting_id = meeting_id;
@@ -440,21 +464,11 @@ local function write_metadata(room)
         room.jid, #participants, meeting_id);
 end
 
-local function remember_email(room, occupant, session)
-    local user = session and session.jitsi_meet_context_user;
-    if not (user and user.email) then
-        return;
-    end
-    local store = emails[room.jid];
-    if not store then
-        store = {};
-        emails[room.jid] = store;
-    end
-    store[jid.resource(occupant.nick)] = user.email;
-end
+-- A room reused for a later meeting starts with nobody in its record.
+module:hook('muc-room-created', function(event)
+    known[event.room.jid] = nil;
+end, -2);
 
--- Rewritten as people come and go, so a participant who left before the end
--- is still in the list the bridge reads.
 module:hook('muc-occupant-joined', function(event)
     local room = event.room;
 
@@ -462,10 +476,16 @@ module:hook('muc-occupant-joined', function(event)
         return;
     end
 
-    remember_email(room, event.occupant, event.origin);
+    if is_participant(event.occupant) then
+        remember(room, event.occupant, event.origin);
+    end
+
     write_metadata(room);
 end, -2);
 
+-- Rewritten when someone leaves too, so the file is complete before the
+-- meeting ends -- but nobody is dropped from it: a participant who left early
+-- is still someone who spoke.
 module:hook('muc-occupant-left', function(event)
     local room = event.room;
 
@@ -474,6 +494,12 @@ module:hook('muc-occupant-left', function(event)
     end
 
     write_metadata(room);
+end, -2);
+
+-- The room's own record goes when the room does; the file stays, because the
+-- bridge consumes it when it processes the meeting.
+module:hook('muc-room-destroyed', function(event)
+    known[event.room.jid] = nil;
 end, -2);
 ```
 
@@ -506,6 +532,13 @@ session_metadata_dir = /srv/recordings/.session-metadata
 ```sh
 sudo systemctl restart prosody jitsi-audio-bridge
 ```
+
+The module keeps a record of everyone the room has *seen*, not of who is
+still in it: the bridge adopts this file when it processes the meeting, which
+is by then some time after the last person left, and a file that only listed
+who was present would be empty exactly when it is read. It is also rewritten
+as people join and leave, so a meeting cut short still names the people who
+spoke before it was.
 
 Now a session that has no `metadata.json` of its own adopts the dropped file:
 `transcript.txt` is attributed by display name, the summary carries the room's
