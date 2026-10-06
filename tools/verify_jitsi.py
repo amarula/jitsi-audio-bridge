@@ -1057,6 +1057,16 @@ def lua_publishes_room_metadata(text: str) -> bool:
     return "room-metadata-changed" in lua_uncomment(text)
 
 
+def lua_forces_unconditional_transcription(text: str) -> bool:
+    """Whether a module also sets the flag the client is meant to set.
+
+    ``recording.isTranscribingEnabled`` is what turning transcription on in
+    the UI writes; a module that sets it transcribes every room from the first
+    join, whether or not anyone asked for it.  Legitimate, but a choice.
+    """
+    return "isTranscribingEnabled" in lua_uncomment(text)
+
+
 def check_prosody(
     deployment: Deployment,
     domain: str | None,
@@ -1191,6 +1201,17 @@ def check_prosody(
                     "event on every occupant join (a room starts empty, so a "
                     "creation-time broadcast reaches nobody)",
             ))
+        if any(
+            lua_forces_unconditional_transcription(read_module(path) or "")
+            for _, path in forcing
+        ):
+            checks.append(Check(
+                "prosody.force_async_transcription.unconditional", Status.WARN,
+                "the module also sets recording.isTranscribingEnabled, so every room is "
+                "transcribed from the first join whether or not anyone asks for it",
+                fix="keep it if that is intended; drop the line to start transcription "
+                    "only when a user turns it on (docs/jitsi-integration.md §2)",
+            ))
     else:
         available = forcing_candidates(plugin_dirs, read_module)
         if available:
@@ -1296,18 +1317,26 @@ FEATURES_IDENTITY_PLUGIN = "mod_features_identity.lua"
 #: compares the two so they cannot drift apart.
 PROSODY_MODULE_LUA = """\
 -- mod_force_async_transcription.lua
--- Forces transcription on for every room's metadata, and makes the room
--- metadata component publish it: the component broadcasts only when
--- 'room-metadata-changed' fires, so writing room.jitsiMetadata alone never
--- reaches Jicofo or the clients.
+-- Makes every room advertise that a backend transcriber exists, so turning
+-- transcription on in the UI starts the audio bridge rather than dialling the
+-- legacy Jigasi number.
 -- Enable on the main MUC component (e.g. conference.<domain>).
+--
+-- Only asyncTranscription is set here. Jicofo also waits for
+-- recording.isTranscribingEnabled, which the client of whoever asks for
+-- transcription writes; rooms are transcribed on request, not on creation.
+-- Set that key here too to transcribe every room from the first join,
+-- whether or not anyone asks for it.
+--
+-- The metadata component broadcasts only when 'room-metadata-changed' fires,
+-- so writing room.jitsiMetadata alone never reaches Jicofo or the clients.
 
 local jid = require 'util.jid';
 
 local util = module:require 'util';
 local is_healthcheck_room = util.is_healthcheck_room;
 
-local function force_transcription(room)
+local function announce_transcription(room)
     -- mod_room_metadata_component initializes this table at priority -1,
     -- so run after it.
     if not room.jitsiMetadata then
@@ -1315,12 +1344,6 @@ local function force_transcription(room)
     end
 
     room.jitsiMetadata.asyncTranscription = true;
-
-    -- Also request the transcription itself. A client normally sets this when
-    -- the user turns transcription on, but that path wants a free recorder;
-    -- setting it here transcribes every room with no UI interaction.
-    room.jitsiMetadata.recording = room.jitsiMetadata.recording or {};
-    room.jitsiMetadata.recording.isTranscribingEnabled = true;
 end
 
 module:hook('muc-room-created', function(event)
@@ -1330,14 +1353,15 @@ module:hook('muc-room-created', function(event)
         return;
     end
 
-    force_transcription(room);
+    announce_transcription(room);
 
-    module:log('info', 'Forced transcription for room %s', room.jid);
+    module:log('info', 'Announced transcription for room %s', room.jid);
 end, -2);
 
 -- The metadata component publishes only on this event, and at room creation
 -- there is nobody to publish to, so re-publish as occupants arrive: Jicofo
--- first, then the clients.
+-- first, then the clients. A client needs the flag before its user can turn
+-- transcription on.
 module:hook('muc-occupant-joined', function(event)
     local room = event.room;
 
@@ -1345,7 +1369,7 @@ module:hook('muc-occupant-joined', function(event)
         return;
     end
 
-    force_transcription(room);
+    announce_transcription(room);
 
     module:context(jid.host(room.jid)):fire_event('room-metadata-changed', { room = room; });
 end, -2);

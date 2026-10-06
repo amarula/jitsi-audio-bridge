@@ -27,11 +27,12 @@ anything back except the keepalive replies the JVB requires.
 ```
   jitsi-meet          Prosody                  Jicofo                   JVB
       │                  │                        │                      │
+      │  someone joins ─►│                        │                      │
+      │                  │  asyncTranscription=true (server-side)        │
+      │◄── the client now knows a backend exists ─│                      │
+      │                  │                        │                      │
       │  user enables    │                        │                      │
-      │  transcription ─►│                        │                      │
-      │                  │  room metadata:        │                      │
-      │                  │   asyncTranscription=true                     │
-      │                  │   recording.isTranscribingEnabled=true        │
+      │  transcription ─►│  recording.isTranscribingEnabled=true         │
       │                  │                        │                      │
       │                  │──── room metadata ────►│                      │
       │                  │                        │                      │
@@ -97,33 +98,49 @@ If nothing in the room ever sets the second flag, the transcriber never starts.
 To transcribe unconditionally, force it server-side as well — see the note at
 the end of the Prosody section.
 
-### 2. Prosody — force `asyncTranscription`
+### 2. Prosody — advertise the transcriber
 
-Transcription is gated by per-room metadata stored by
-`mod_room_metadata_component` under `room.jitsiMetadata`. The relevant key,
-`asyncTranscription`, is server-controlled: the handbook says clients are
-forbidden from setting it (a `blocked_metadata_keys` list in the component),
-though the module versions inspected while writing this do not implement such a
-list. Either way, set it server-side, as below — never rely on a client doing
-it.
+Transcription is gated by two per-room metadata keys stored by
+`mod_room_metadata_component` under `room.jitsiMetadata`. The first,
+`asyncTranscription`, is server-controlled — the component's
+`blocked_metadata_keys` list rejects client writes to it — and answers the
+client's question "is there a backend transcriber here?":
+
+- **false**: turning transcription on dials the `jitsi_meet_transcribe`
+  extension, which needs Jigasi in the room; with none, the user gets
+  "Transcribing failed".
+- **true**: the client, already knowing a backend exists, writes the second key
+  (`recording.isTranscribingEnabled`) itself and Jicofo starts the bridge.
+
+So the module below does exactly that one thing: it announces the backend in
+every room. Transcription then starts when a user turns it on — which is the
+default the checker expects.
 
 Create `mod_force_async_transcription.lua` on the Prosody plugin path (for
 example `/usr/share/jitsi-meet/prosody-plugins/`):
 
 ```lua
 -- mod_force_async_transcription.lua
--- Forces transcription on for every room's metadata, and makes the room
--- metadata component publish it: the component broadcasts only when
--- 'room-metadata-changed' fires, so writing room.jitsiMetadata alone never
--- reaches Jicofo or the clients.
+-- Makes every room advertise that a backend transcriber exists, so turning
+-- transcription on in the UI starts the audio bridge rather than dialling the
+-- legacy Jigasi number.
 -- Enable on the main MUC component (e.g. conference.<domain>).
+--
+-- Only asyncTranscription is set here. Jicofo also waits for
+-- recording.isTranscribingEnabled, which the client of whoever asks for
+-- transcription writes; rooms are transcribed on request, not on creation.
+-- Set that key here too to transcribe every room from the first join,
+-- whether or not anyone asks for it.
+--
+-- The metadata component broadcasts only when 'room-metadata-changed' fires,
+-- so writing room.jitsiMetadata alone never reaches Jicofo or the clients.
 
 local jid = require 'util.jid';
 
 local util = module:require 'util';
 local is_healthcheck_room = util.is_healthcheck_room;
 
-local function force_transcription(room)
+local function announce_transcription(room)
     -- mod_room_metadata_component initializes this table at priority -1,
     -- so run after it.
     if not room.jitsiMetadata then
@@ -131,12 +148,6 @@ local function force_transcription(room)
     end
 
     room.jitsiMetadata.asyncTranscription = true;
-
-    -- Also request the transcription itself. A client normally sets this when
-    -- the user turns transcription on, but that path wants a free recorder;
-    -- setting it here transcribes every room with no UI interaction.
-    room.jitsiMetadata.recording = room.jitsiMetadata.recording or {};
-    room.jitsiMetadata.recording.isTranscribingEnabled = true;
 end
 
 module:hook('muc-room-created', function(event)
@@ -146,14 +157,15 @@ module:hook('muc-room-created', function(event)
         return;
     end
 
-    force_transcription(room);
+    announce_transcription(room);
 
-    module:log('info', 'Forced transcription for room %s', room.jid);
+    module:log('info', 'Announced transcription for room %s', room.jid);
 end, -2);
 
 -- The metadata component publishes only on this event, and at room creation
 -- there is nobody to publish to, so re-publish as occupants arrive: Jicofo
--- first, then the clients.
+-- first, then the clients. A client needs the flag before its user can turn
+-- transcription on.
 module:hook('muc-occupant-joined', function(event)
     local room = event.room;
 
@@ -161,7 +173,7 @@ module:hook('muc-occupant-joined', function(event)
         return;
     end
 
-    force_transcription(room);
+    announce_transcription(room);
 
     module:context(jid.host(room.jid)):fire_event('room-metadata-changed', { room = room; });
 end, -2);
@@ -218,10 +230,12 @@ module file without touching your site config (dpkg keeps the local version), so
 the two drift apart silently. The checker reports this as
 `prosody.features_identity`.
 
-> **Note.** This only forces `asyncTranscription`. For transcription to start,
-> the room must also have `recording.isTranscribingEnabled` set — normally by a
-> user turning transcription on. To transcribe every room unconditionally,
-> extend the module to set the `recording` metadata too, or pre-seed it from
+> **Note.** Rooms are transcribed **on request**: Jicofo waits for both keys,
+> and `recording.isTranscribingEnabled` is written by the client of whoever
+> turns transcription on. For the user doing that to be a moderator, since the
+> component rejects metadata writes from anyone else — in practice the person
+> who opened the room first. To transcribe every room unconditionally, extend
+> the module to set the `recording` metadata too, or pre-seed it from
 > whatever creates the room.
 
 ### 3. Jicofo — `jicofo.conf`

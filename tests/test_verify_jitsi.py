@@ -47,6 +47,7 @@ from tools.verify_jitsi import (
     js_boolean,
     load_deployment,
     load_hocon,
+    lua_forces_unconditional_transcription,
     lua_module_names,
     lua_sets_async_transcription,
     lua_string_list,
@@ -1170,6 +1171,43 @@ def test_prosody_warns_when_the_module_never_publishes_the_metadata(tmp_path: Pa
         _reader({publishing: PROSODY_MODULE_LUA}),
     )
     assert not [c for c in checks if c.id.endswith(".publish")]
+
+
+def test_prosody_warns_when_every_room_is_transcribed_unconditionally(
+    tmp_path: Path,
+) -> None:
+    """Setting the client's own flag is a choice, so it is reported as one."""
+    plugin_dir = tmp_path / "plugins"
+    plugin_dir.mkdir()
+    eager = plugin_dir / "mod_force_async_transcription.lua"
+    eager.write_text(
+        "room.jitsiMetadata.asyncTranscription = true;\n"
+        "room.jitsiMetadata.recording.isTranscribingEnabled = true;\n"
+    )
+    checks = check_prosody(
+        _deployment(prosody_text=PROSODY), "meet.example.com", [plugin_dir],
+        _reader({eager: eager.read_text()}),
+    )
+    check = next(c for c in checks if c.id == "prosody.force_async_transcription.unconditional")
+    assert check.status is Status.WARN
+    assert "whether or not anyone asks" in check.summary
+
+    # The shipped module announces the backend and leaves the choice to the
+    # user, so it does not warn.
+    assert not lua_forces_unconditional_transcription(PROSODY_MODULE_LUA)
+    publishing = plugin_dir / "mod_force_async_transcription.lua"
+    publishing.write_text(PROSODY_MODULE_LUA)
+    checks = check_prosody(
+        _deployment(prosody_text=PROSODY), "meet.example.com", [plugin_dir],
+        _reader({publishing: PROSODY_MODULE_LUA}),
+    )
+    assert not [c for c in checks if c.id.endswith(".unconditional")]
+
+
+def test_unconditional_transcription_check_ignores_comments() -> None:
+    assert not lua_forces_unconditional_transcription(
+        "-- room.jitsiMetadata.recording.isTranscribingEnabled = true;\n"
+    )
 
 
 def test_prosody_requires_features_identity_for_clients_to_see_the_metadata(
