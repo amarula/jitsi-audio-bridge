@@ -226,6 +226,8 @@ Component "metadata.meet.example.com" "room_metadata_component"
     muc_component = "conference.meet.example.com"
 """
 
+PROSODY_WITHOUT_FORCE = PROSODY.replace('        "force_async_transcription";\n', "")
+
 FORCE_MODULE = """
 local util = module:require 'util';
 module:hook('muc-room-created', function(event)
@@ -750,7 +752,8 @@ def test_propose_jicofo_keeps_an_existing_custom_template(tmp_path: Path) -> Non
 def test_propose_prosody_writes_the_module_and_the_site_config(tmp_path: Path) -> None:
     plugin_dir = tmp_path / "plugins"
     plugin_dir.mkdir()
-    deployment = _deployment(prosody_text=PROSODY)
+    # The MUC does not enable it yet, so both a module file and a site edit are due.
+    deployment = _deployment(prosody_text=PROSODY_WITHOUT_FORCE)
     proposals = propose_prosody_fixes(deployment, [plugin_dir], read=_reader({}))
     by_name = {p.target.name: p for p in proposals}
     assert set(by_name) == {"mod_force_async_transcription.lua", "meet.example.com.cfg.lua"}
@@ -827,7 +830,7 @@ def test_proposals_satisfy_the_checks_they_address(tmp_path: Path) -> None:
     (plugin_dir / "mod_force_async_transcription.lua").write_text(PROSODY_MODULE_LUA)
 
     prosody_proposals = propose_prosody_fixes(
-        _deployment(prosody_text=PROSODY), [plugin_dir], read=_reader({})
+        _deployment(prosody_text=PROSODY_WITHOUT_FORCE), [plugin_dir], read=_reader({})
     )
     site = next(p for p in prosody_proposals if p.target and p.target.suffix == ".lua"
                 and not p.target.name.startswith("mod_"))
@@ -1086,15 +1089,16 @@ def test_propose_prosody_refuses_a_component_whose_module_is_missing(tmp_path: P
 def test_propose_prosody_skips_room_metadata_work_when_it_is_present(tmp_path: Path) -> None:
     plugin_dir = tmp_path / "plugins"
     plugin_dir.mkdir()
+    module = plugin_dir / "mod_force_async_transcription.lua"
+    module.write_text(PROSODY_MODULE_LUA)
+    component = plugin_dir / "mod_room_metadata_component.lua"
+    component.write_text("-- component\n")
+    reader = _reader({module: PROSODY_MODULE_LUA, component: "-- component\n"})
     proposals = propose_prosody_fixes(
-        _deployment(prosody_text=PROSODY), [plugin_dir], read=_plugin_reader(plugin_dir)
+        _deployment(prosody_text=PROSODY), [plugin_dir], read=reader
     )
-    site = next(p for p in proposals if p.check_id == "prosody.modules_enabled")
-    # The fixture already has the module and the component, so the edit must
-    # neither add a second component nor an option that was not there.
-    assert site.new_text.count('Component "metadata.') == 1
-    assert 'room_metadata_component = "' not in site.new_text
-    assert site.new_text.count('"room_metadata";') == 1
+    # Everything the checker wants is present, so there is nothing to propose.
+    assert proposals == []
 
 
 def test_room_metadata_check_accepts_the_modern_component_only_shape() -> None:
@@ -1121,3 +1125,19 @@ def test_room_metadata_check_accepts_the_modern_component_only_shape() -> None:
         _deployment(prosody_text=module_only), "meet.example.com", [], lambda p: None
     )
     assert _status(checks, "prosody.room_metadata") is Status.WARN
+
+
+def test_propose_prosody_does_not_re_add_an_already_enabled_module(tmp_path: Path) -> None:
+    """The module name may be enabled while its file is missing: install, do not duplicate."""
+    plugin_dir = tmp_path / "plugins"
+    plugin_dir.mkdir()
+    text = NO_ROOM_METADATA.replace(
+        "modules_enabled = { }", 'modules_enabled = { "force_async_transcription"; }'
+    )
+    proposals = propose_prosody_fixes(
+        _deployment(prosody_text=text), [plugin_dir], read=_plugin_reader(plugin_dir)
+    )
+    ids = {p.check_id for p in proposals}
+    assert "prosody.force_async_transcription" in ids          # the module file is proposed
+    site = next(p for p in proposals if p.check_id == "prosody.room_metadata")
+    assert site.new_text.count("force_async_transcription") == 1

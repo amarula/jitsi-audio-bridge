@@ -1499,12 +1499,23 @@ def propose_prosody_fixes(
         available = forcing_candidates(plugin_dirs, read)
         if available:
             name, path = available[0]
-            enable.append(name)
-            notes.append(
-                f"{path} already sets asyncTranscription; enabling it avoids a second module"
-            )
+            if name in modules:
+                # Enabled already, but its file was missing until now; a second
+                # entry in modules_enabled would only be a duplicate.
+                notes.append(f"{name} is already enabled; the module file was the missing part")
+            else:
+                enable.append(name)
+                notes.append(
+                    f"{path} already sets asyncTranscription; enabling it avoids a second module"
+                )
         else:
-            enable.append(PROSODY_MODULE_NAME)
+            if PROSODY_MODULE_NAME in modules:
+                notes.append(
+                    f'"{PROSODY_MODULE_NAME}" is already enabled; the module file was the '
+                    "missing part"
+                )
+            else:
+                enable.append(PROSODY_MODULE_NAME)
             writable = next(
                 (directory for directory in plugin_dirs
                  if directory.is_dir() and os.access(directory, os.W_OK)),
