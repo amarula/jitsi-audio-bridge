@@ -495,15 +495,22 @@ bridge records with what the real sender produces.
 
 ```
 <srv/recordings>/<sessionId>/
-├── metadata.json            # last control frame received
+├── metadata.json            # the last control frame received — see below
 ├── participant-<id>.wav     # 16 kHz, mono, 16-bit PCM, one per participant
 ├── extracted_audio.wav      # only when a master recording had to be extracted
 ├── transcript.txt           # written once post-processing succeeds
 └── summary.md               # the LLM summary, likewise
 ```
 
-`transcript.txt` is the transcript, one block per participant, attributed by
-name:
+`metadata.json` is written by the **control frame** path, so it exists only when
+the sender sent one. The stock-Jitsi path has no control frame at all — the
+JVB's framing carries no meeting metadata — so a Jitsi-driven session has no
+such file, and post-processing runs on the defaults: the mail goes to
+`[smtp] fallback_recipient`, the summary is titled "General Meeting", and
+speakers are attributed by their source tag rather than a name. See
+[Limitations](#limitations).
+
+Where a control frame did arrive, `transcript.txt` is attributed by name:
 
 ```
 [Alice]: Let's start with the release schedule.
