@@ -112,19 +112,18 @@ example `/usr/share/jitsi-meet/prosody-plugins/`):
 
 ```lua
 -- mod_force_async_transcription.lua
--- Forces asyncTranscription=true on every room's metadata.
+-- Forces transcription on for every room's metadata, and makes the room
+-- metadata component publish it: the component broadcasts only when
+-- 'room-metadata-changed' fires, so writing room.jitsiMetadata alone never
+-- reaches Jicofo or the clients.
 -- Enable on the main MUC component (e.g. conference.<domain>).
+
+local jid = require 'util.jid';
 
 local util = module:require 'util';
 local is_healthcheck_room = util.is_healthcheck_room;
 
-module:hook('muc-room-created', function(event)
-    local room = event.room;
-
-    if is_healthcheck_room(room.jid) then
-        return;
-    end
-
+local function force_transcription(room)
     -- mod_room_metadata_component initializes this table at priority -1,
     -- so run after it.
     if not room.jitsiMetadata then
@@ -133,8 +132,39 @@ module:hook('muc-room-created', function(event)
 
     room.jitsiMetadata.asyncTranscription = true;
 
-    module:log('info', 'Forced asyncTranscription=true for room %s', room.jid);
-end, -2); -- priority -2: after room_metadata_component (-1)
+    -- Also request the transcription itself. A client normally sets this when
+    -- the user turns transcription on, but that path wants a free recorder;
+    -- setting it here transcribes every room with no UI interaction.
+    room.jitsiMetadata.recording = room.jitsiMetadata.recording or {};
+    room.jitsiMetadata.recording.isTranscribingEnabled = true;
+end
+
+module:hook('muc-room-created', function(event)
+    local room = event.room;
+
+    if is_healthcheck_room(room.jid) then
+        return;
+    end
+
+    force_transcription(room);
+
+    module:log('info', 'Forced transcription for room %s', room.jid);
+end, -2);
+
+-- The metadata component publishes only on this event, and at room creation
+-- there is nobody to publish to, so re-publish as occupants arrive: Jicofo
+-- first, then the clients.
+module:hook('muc-occupant-joined', function(event)
+    local room = event.room;
+
+    if is_healthcheck_room(room.jid) then
+        return;
+    end
+
+    force_transcription(room);
+
+    module:context(jid.host(room.jid)):fire_event('room-metadata-changed', { room = room; });
+end, -2);
 ```
 
 The `-2` priority makes the hook run *after* `mod_room_metadata_component`
