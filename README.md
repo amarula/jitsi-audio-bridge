@@ -205,6 +205,24 @@ printf 'JITSI_AUDIO_BRIDGE_SMTP_PASSWORD=...\n' >> /etc/jitsi-audio-bridge/env
 connections. Only use it for an endpoint with a self-signed certificate on a
 trusted network; it makes the transcript path interceptable.
 
+To keep verification on against a self-signed endpoint, point
+`REQUESTS_CA_BUNDLE` at a PEM holding its certificate — via
+`/etc/jitsi-audio-bridge/env`, which the unit reads:
+
+```sh
+sudo openssl s_client -connect whisper.example.com:443 -servername whisper.example.com \
+    </dev/null 2>/dev/null | sudo tee /etc/jitsi-audio-bridge/ca.pem >/dev/null
+printf 'REQUESTS_CA_BUNDLE=/etc/jitsi-audio-bridge/ca.pem\n' \
+    | sudo tee -a /etc/jitsi-audio-bridge/env
+```
+
+One file, so concatenate the certificates into it if Whisper and Ollama have
+different ones. The system trust store is **not** consulted: the daemon runs
+from its bundled virtualenv, whose `requests` uses its own `certifi` bundle, so
+`update-ca-certificates` on its own changes nothing. The certificate also has
+to carry a `subjectAltName` for the host — a CN-only one fails verification
+however it was installed.
+
 ## Running
 
 ```sh
