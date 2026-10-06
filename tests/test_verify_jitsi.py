@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -47,6 +48,7 @@ from tools.verify_jitsi import (
     hocon_duration,
     hocon_str,
     hocon_transcription_block,
+    jibri_control_muc,
     js_boolean,
     load_deployment,
     load_hocon,
@@ -479,6 +481,7 @@ def _namespace(**overrides: object) -> argparse.Namespace:
         "prosody_config": None,
         "meet_config": None,
         "jvb_conf": None,
+        "jibri_conf": None,
     }
     values.update(overrides)
     return argparse.Namespace(**values)
@@ -506,6 +509,7 @@ def test_discovery_selects_a_single_domain(
     monkeypatch.setattr(verify_jitsi, "DEFAULT_PROSODY_MAIN", tmp_path / "prosody.cfg.lua")
     monkeypatch.setattr(verify_jitsi, "DEFAULT_PROSODY_CONF_D", tmp_path / "conf.d")
     monkeypatch.setattr(verify_jitsi, "DEFAULT_JVB_CONF", tmp_path / "jvb.conf")
+    monkeypatch.setattr(verify_jitsi, "DEFAULT_JIBRI_CONF", tmp_path / "jibri.conf")
 
     deployment = load_deployment(_namespace())
     assert deployment.domain == "meet.example.com"
@@ -535,6 +539,7 @@ def test_discovery_tolerates_no_configuration_when_not_required(
     monkeypatch.setattr(verify_jitsi, "DEFAULT_PROSODY_CONF_AVAIL", tmp_path / "conf.avail")
     monkeypatch.setattr(verify_jitsi, "DEFAULT_JICOFO_CONF", tmp_path / "jicofo.conf")
     monkeypatch.setattr(verify_jitsi, "DEFAULT_JVB_CONF", tmp_path / "jvb.conf")
+    monkeypatch.setattr(verify_jitsi, "DEFAULT_JIBRI_CONF", tmp_path / "jibri.conf")
     deployment = load_deployment(_namespace(), require_files=False)
     assert deployment.jicofo_conf is None
 
@@ -978,6 +983,7 @@ def _broken_tree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, P
     monkeypatch.setattr(verify_jitsi, "DEFAULT_PROSODY_CONF_AVAIL", conf_avail)
     monkeypatch.setattr(verify_jitsi, "DEFAULT_JICOFO_CONF", jicofo)
     monkeypatch.setattr(verify_jitsi, "DEFAULT_JVB_CONF", tmp_path / "jvb.conf")
+    monkeypatch.setattr(verify_jitsi, "DEFAULT_JIBRI_CONF", tmp_path / "jibri.conf")
     monkeypatch.setattr(verify_jitsi, "DEFAULT_PROSODY_MAIN", tmp_path / "prosody.cfg.lua")
     monkeypatch.setattr(verify_jitsi, "DEFAULT_PROSODY_CONF_D", tmp_path / "conf.d")
     return {"jicofo": jicofo, "prosody": prosody, "meet": meet_config, "plugins": plugins}
@@ -1225,7 +1231,7 @@ def test_recording_needs_jicofo_to_watch_a_brewery() -> None:
     assert check.status is Status.FAIL
     assert "all recorders are currently busy" in check.summary
     # The JID comes from the Prosody config, not out of the air.
-    assert 'jibri@internal.auth.meet.example.com' in check.fix
+    assert 'jibribrewery@internal.auth.meet.example.com' in check.fix
 
     # With no brewery MUC either, the fix says so rather than inventing one.
     checks = check_recording(
@@ -1250,6 +1256,74 @@ def test_recording_brewery_must_be_hosted_by_prosody() -> None:
     check = next(c for c in checks if c.id == "recording.jicofo.brewery")
     assert check.status is Status.FAIL
     assert "no internal.auth.meet.example.com component" in check.summary
+
+
+def test_jibri_control_muc_reads_both_configuration_shapes() -> None:
+    modern = """
+jibri {
+  xmpp {
+    environments = [
+      {
+        xmpp-domain = "meet.example.com"
+        control-muc {
+          domain = "internal.auth.meet.example.com"
+          room = "jibribrewery"
+          nickname = "recorder"
+        }
+      }
+    ]
+  }
+}
+"""
+    assert jibri_control_muc(modern) == "jibribrewery@internal.auth.meet.example.com"
+
+    legacy = '{\n  "brewery_jid": "jibribrewery@internal.auth.meet.example.com"\n}\n'
+    assert jibri_control_muc(legacy) == "jibribrewery@internal.auth.meet.example.com"
+
+    # A commented-out example must not win over the live block.
+    commented = (
+        "# control-muc { domain = \"stale.example.com\" room = \"jibribrewery\" }\n"
+        + modern
+    )
+    assert jibri_control_muc(commented) == "jibribrewery@internal.auth.meet.example.com"
+
+    assert jibri_control_muc("jibri {\n  recording { }\n}\n") is None
+
+
+def test_recording_reports_rooms_the_two_sides_disagree_on() -> None:
+    """Jicofo watching a different room than Jibri joins reads as a busy pool."""
+    document = _document(
+        'jicofo { jibri { brewery-jid = "jibri@internal.auth.meet.example.com" } }'
+    )
+    jibri = (
+        "jibri {\n  xmpp {\n    environments = [\n      {\n"
+        '        control-muc {\n          domain = "internal.auth.meet.example.com"\n'
+        '          room = "jibribrewery"\n        }\n      }\n    ]\n  }\n}\n'
+    )
+    deployment = _deployment(
+        meet_text=RECORDING_CLIENT, prosody_text=PROSODY_WITH_BREWERY, hocon=document
+    )
+    deployment = replace(deployment, jibri_text=jibri)
+    check = next(
+        c for c in check_recording(deployment) if c.id == "recording.jibri.brewery"
+    )
+    assert check.status is Status.FAIL
+    assert "jibri@internal.auth.meet.example.com" in check.summary
+    assert "jibribrewery@internal.auth.meet.example.com" in check.summary
+    # The fix points at what Jibri already does, not at a convention.
+    assert 'brewery-jid = "jibribrewery@internal.auth.meet.example.com"' in check.fix
+
+    # Matching the room clears it.
+    agreeing = _document(
+        'jicofo { jibri { brewery-jid = "jibribrewery@internal.auth.meet.example.com" } }'
+    )
+    deployment = replace(
+        deployment, hocon=agreeing, prosody_text=PROSODY_WITH_BREWERY
+    )
+    check = next(
+        c for c in check_recording(deployment) if c.id == "recording.jibri.brewery"
+    )
+    assert check.status is Status.PASS
 
 
 def test_classify_jicofo_collects_only_the_watched_brewery() -> None:

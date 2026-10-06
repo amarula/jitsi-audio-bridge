@@ -78,6 +78,9 @@ DEFAULT_PROSODY_CONF_AVAIL = Path("/etc/prosody/conf.avail")
 DEFAULT_PROSODY_CONF_D = Path("/etc/prosody/conf.d")
 DEFAULT_MEET_DIR = Path("/etc/jitsi/meet")
 DEFAULT_JVB_CONF = Path("/etc/jitsi/videobridge/jvb.conf")
+DEFAULT_JIBRI_CONF = Path("/etc/jitsi/jibri/jibri.conf")
+#: Jibri before the HOCON configuration; the brewery is a plain key there.
+DEFAULT_JIBRI_LEGACY_CONF = Path("/etc/jitsi/jibri/config.json")
 DEFAULT_PLUGIN_DIRS = (
     Path("/usr/share/jitsi-meet/prosody-plugins"),
     # Modules that ship with Prosody itself, which a config may also enable.
@@ -755,6 +758,8 @@ class Deployment:
     hocon: HoconDocument
     prosody_text: str | None
     meet_text: str | None
+    jibri_config: Path | None = None
+    jibri_text: str | None = None
     notes: list[str] = field(default_factory=list)
 
 
@@ -835,6 +840,14 @@ def load_deployment(args: argparse.Namespace, require_files: bool = True) -> Dep
     if args.jvb_conf and not jvb_conf.is_file():
         raise DiscoveryError(f"--jvb-conf: {jvb_conf} does not exist")
 
+    # Jibri is often on its own host; where its configuration is readable it
+    # settles the one setting Jicofo and Jibri have to agree on.
+    jibri_conf = Path(args.jibri_conf) if args.jibri_conf else DEFAULT_JIBRI_CONF
+    if args.jibri_conf and not jibri_conf.is_file():
+        raise DiscoveryError(f"--jibri-conf: {jibri_conf} does not exist")
+    if not args.jibri_conf and not jibri_conf.is_file():
+        jibri_conf = DEFAULT_JIBRI_LEGACY_CONF
+
     domain = args.domain
     if prosody_config is None or meet_config is None:
         meet = _meet_candidates(DEFAULT_MEET_DIR)
@@ -875,6 +888,8 @@ def load_deployment(args: argparse.Namespace, require_files: bool = True) -> Dep
         hocon=load_hocon(jicofo_path) if jicofo_path else HoconDocument(),
         prosody_text=_read(prosody_config),
         meet_text=_read(meet_config),
+        jibri_config=jibri_conf if jibri_conf.is_file() else None,
+        jibri_text=_read(jibri_conf),
         notes=notes,
     )
 
@@ -1293,18 +1308,49 @@ def js_config_boolean(text: str, name: str) -> bool | None:
     return None if match is None else match.group(1) == "true"
 
 
-def jibri_brewery_from_prosody(prosody_text: str | None) -> str | None:
-    """The brewery MUC Jibri registers in, as the stock Prosody config names it.
+#: Jibri's pre-HOCON configuration, where the same setting is a single JID.
+_JIBRI_LEGACY_BREWERY = re.compile(
+    r"""["']?brewery[_-]?jid["']?\s*[:=]\s*["']([^"']+)["']"""
+)
 
-    Jibri logs in as ``jibri@auth.<domain>`` and announces itself in a MUC on
-    the internal auth component; Jicofo has to be pointed at the same JID, and
-    it is the one setting the two sides have to agree on.
+
+def jibri_control_muc(text: str) -> str | None:
+    """The brewery MUC Jibri itself logs into, read from its configuration.
+
+    Jicofo and Jibri have to name the same room, and nothing else checks that:
+    Jicofo will happily watch a room nobody ever enters, and the empty pool
+    reaches the UI as "all recorders are currently busy".  Two shapes occur —
+    ``control-muc { domain; room }`` in ``jibri.conf``, and the legacy
+    ``"brewery_jid"`` string in ``config.json``.
+    """
+    stripped = _hocon_lines(text)
+    legacy = _JIBRI_LEGACY_BREWERY.search(stripped)
+    if legacy:
+        return legacy.group(1).strip()
+    block = re.search(r"(?<![\w-])control-muc\s*\{([^}]*)\}", stripped)
+    if block is None:
+        return None
+    domain = re.search(r"""(?<![\w.])domain\s*[:=]\s*["']([^"']+)["']""", block.group(1))
+    room = re.search(r"""(?<![\w.])room\s*[:=]\s*["']([^"']+)["']""", block.group(1))
+    if domain is None or room is None:
+        return None
+    return f"{room.group(1)}@{domain.group(1)}"
+
+
+def jibri_brewery_from_prosody(prosody_text: str | None) -> str | None:
+    """The stock brewery JID, derived from the Prosody configuration.
+
+    Jibri logs in as ``jibri@auth.<domain>`` and announces itself in
+    ``jibribrewery`` on the internal auth component — the room name Jicofo's
+    own reference.conf documents.  This is only a fallback for when Jibri's
+    configuration cannot be read (it may run on another host); what Jibri
+    itself logs into always wins.
     """
     if not prosody_text:
         return None
     for block in find_lua_blocks(lua_uncomment(prosody_text)):
         if block.name.startswith("internal.auth."):
-            return f"jibri@{block.name}"
+            return f"jibribrewery@{block.name}"
     return None
 
 
@@ -1357,17 +1403,20 @@ def check_recording(deployment: Deployment) -> list[Check]:
         ))
         return checks
 
+    jibri_muc = jibri_control_muc(deployment.jibri_text or "")
     brewery = hocon_str(deployment.hocon, JIBRI_BREWERY_KEY)
     if deployment.jicofo_conf is None:
         checks.append(Check("recording.jicofo.brewery", Status.SKIP,
                             "no Jicofo configuration to read"))
     elif not brewery:
-        expected = jibri_brewery_from_prosody(deployment.prosody_text)
+        expected = jibri_muc or jibri_brewery_from_prosody(deployment.prosody_text)
         fix = (
-            f'set `{JIBRI_BREWERY_KEY} = "{expected or "jibri@internal.auth.<domain>"}"` '
+            f'set `{JIBRI_BREWERY_KEY} = "{expected or "jibribrewery@internal.auth.<domain>"}"` '
             "and restart Jicofo"
         )
-        if not expected:
+        if jibri_muc:
+            fix += " — the room this host's Jibri logs into"
+        elif not expected:
             fix += (
                 "; no internal.auth component was found in the Prosody configuration "
                 "either, so the brewery MUC is missing too"
@@ -1379,6 +1428,7 @@ def check_recording(deployment: Deployment) -> list[Check]:
             "recorders are currently busy\", however many Jibri instances run",
             fix=fix,
         ))
+        return checks
     else:
         component = brewery.split("/")[0].split("@")[-1]
         blocks = find_lua_blocks(lua_uncomment(deployment.prosody_text or ""))
@@ -1402,6 +1452,29 @@ def check_recording(deployment: Deployment) -> list[Check]:
                     "account in its admins) or point the brewery at the component that "
                     "exists",
             ))
+
+    # The two sides have to name the same room, and a mismatch is invisible
+    # everywhere else: Jicofo watches a room nobody enters and reports it as a
+    # busy pool, so it is worth comparing them directly.
+    if jibri_muc is None:
+        checks.append(Check(
+            "recording.jibri.brewery", Status.SKIP,
+            "no Jibri configuration on this host to compare the brewery with",
+            fix="pass --jibri-conf if Jibri runs elsewhere",
+        ))
+    elif jibri_muc == brewery.split("/")[0]:
+        checks.append(Check(
+            "recording.jibri.brewery", Status.PASS,
+            f"Jibri logs into {jibri_muc}, the room Jicofo watches",
+        ))
+    else:
+        checks.append(Check(
+            "recording.jibri.brewery", Status.FAIL,
+            f"the two sides name different rooms: Jibri logs into {jibri_muc} while "
+            f"Jicofo watches {brewery}, so the pool stays empty however long Jibri runs",
+            fix=f'set `{JIBRI_BREWERY_KEY} = "{jibri_muc}"` (the room this host\'s Jibri '
+                "already uses), or change `control-muc` in Jibri's configuration",
+        ))
     return checks
 
 
@@ -2634,6 +2707,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prosody-config", metavar="PATH")
     parser.add_argument("--meet-config", metavar="PATH")
     parser.add_argument("--jvb-conf", metavar="PATH")
+    parser.add_argument(
+        "--jibri-conf", metavar="PATH",
+        help="Jibri's configuration, when it is not where jibri.conf usually is",
+    )
     parser.add_argument(
         "--plugin-dir", action="append", metavar="PATH",
         help="Prosody plugin_paths directory; repeatable",

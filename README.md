@@ -567,6 +567,12 @@ is occupied. Three things have to line up, and
 `internal.auth.<domain>` component), and a Jibri that actually logs into it —
 `journalctl -u jicofo | grep 'brewery instance'` shows the last one registering.
 
+The **room name** has to match as well, and nothing checks that for you: Jicofo
+watches a room nobody enters and reports it as a busy pool, exactly as if no
+recorder existed. `jibribrewery` is the convention, but what counts is the
+`control-muc` in Jibri's own `jibri.conf` — the checker reads it and compares
+the two sides directly (`--jibri-conf` when Jibri runs on another host).
+
 **A `SIGKILL` left an unreadable WAV.**
 The `wave` module writes the real length into the header only on `close()`. The
 daemon closes every file in a `finally`, so this needs a hard kill; see
