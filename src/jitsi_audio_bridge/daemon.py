@@ -422,35 +422,41 @@ def render_transcript(lines: Sequence[TranscriptLine]) -> str:
     return "\n\n".join(rendered)
 
 
+#: How long to wait before giving the failed turns a second chance.  Their
+#: retries are seconds apart, which covers a service that hiccups; a service
+#: that is busy for longer needs the whole pass to finish first.
+RETRY_PASS_PAUSE_SECONDS = 10.0
+
+
 def _transcribe_turns(
     recording: Path,
     speaker: str,
     turns: Sequence[Any],
     turns_dir: Path,
     config: Config,
-) -> tuple[list[TranscriptLine], int]:
+) -> tuple[list[TranscriptLine], list[tuple[Any, Path]]]:
     """Cut one participant's speaking turns out and transcribe them.
 
-    Returns the lines and how many turns produced nothing, so the caller can
-    tell "this participant said little" from "the service refused everything".
+    Returns the lines it got and the turns it could not, slice and all, so the
+    caller can tell a participant who said little from a service that was
+    refusing everything and give the lost ones another try later.
     """
     lines: list[TranscriptLine] = []
-    failures = 0
+    lost: list[tuple[Any, Path]] = []
     for index, turn in enumerate(turns):
         slice_path = turns_dir / f"{recording.stem}-{index:04d}.wav"
         try:
             slice_wav(recording, turn.offset, turn.duration, slice_path)
         except (OpusError, OSError) as exc:
             logger.warning("cannot cut %s at %.3fs: %s", recording.name, turn.offset, exc)
-            failures += 1
             continue
         text = transcribe_audio(slice_path, config.whisper)
         if text:
             lines.append((turn.start, speaker, text))
         else:
-            failures += 1
             logger.warning("no transcript produced for turn %d of %s", index, speaker)
-    return lines, failures
+            lost.append((turn, slice_path))
+    return lines, lost
 
 
 def transcribe_recordings(
@@ -484,6 +490,10 @@ def transcribe_recordings(
 
     turns_dir = (participant_files[0].parent if participant_files else Path(".")) / TURN_DIR_NAME
     lines: list[TranscriptLine] = []
+    #: Turns whose request failed, kept for a second pass once everything else
+    #: has been tried: an intermittent service is usually back by then, and the
+    #: slices are still on disk.
+    retry: list[tuple[str, Any, Path]] = []
     try:
         for recording in participant_files:
             speaker = attribute_speaker(recording, metadata["id_to_name"])
@@ -498,30 +508,52 @@ def transcribe_recordings(
                         allowance,
                     )
                     turns = merge_turns(list(turns), allowance)
+            pending: list[tuple[str, Any, Path]] = []
             if turns:
                 logger.info("transcribing %d turn(s) of %s", len(turns), speaker)
-                turn_lines, failures = _transcribe_turns(
+                turn_lines, lost = _transcribe_turns(
                     recording, speaker, turns, turns_dir, config
                 )
                 if turn_lines:
                     lines.extend(turn_lines)
+                    retry.extend((speaker, turn, slice_path) for turn, slice_path in lost)
                     continue
-                if failures:
+                if lost:
                     # Every turn failed, which says more about the service than
                     # about this participant: hand it the whole recording, one
-                    # request, the way it worked before turns existed.
+                    # request, the way it worked before turns existed.  If that
+                    # fails too, the slices are still on disk and the retry pass
+                    # gets them.
                     logger.warning(
                         "none of %s's %d turn(s) produced text; transcribing the recording "
                         "whole instead",
                         speaker,
                         len(turns),
                     )
+                    pending = [(speaker, turn, slice_path) for turn, slice_path in lost]
 
             text = transcribe_audio(recording, config.whisper)
             if text:
                 lines.append((None, speaker, text))
             else:
                 logger.warning("no transcript produced for %s", recording.name)
+                retry.extend(pending)
+        if retry:
+            logger.info(
+                "%d turn(s) produced no text; giving them a second chance in %.0fs",
+                len(retry),
+                RETRY_PASS_PAUSE_SECONDS,
+            )
+            time.sleep(RETRY_PASS_PAUSE_SECONDS)
+            recovered = 0
+            for speaker, turn, slice_path in retry:
+                text = transcribe_audio(slice_path, config.whisper)
+                if text:
+                    lines.append((turn.start, speaker, text))
+                    recovered += 1
+            logger.info(
+                "recovered %d of %d lost turn(s)", recovered, len(retry)
+            )
     finally:
         shutil.rmtree(turns_dir, ignore_errors=True)
     return lines

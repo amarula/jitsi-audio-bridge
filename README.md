@@ -687,10 +687,12 @@ daemon closes every file in a `finally`, so this needs a hard kill; see
 - **Sequential transcription.** Participants are transcribed one after another.
   A long meeting is slow, and one Whisper timeout costs that participant's text.
 - **Retries are bounded and narrow.** A 5xx answer from Whisper or Ollama is
-  tried twice more, a second and then three seconds later, and a participant
-  whose every speaking turn failed is handed over as one whole recording
-  instead; anything else — a 4xx, an unreadable file, SMTP — is logged and
-  skipped, as before.
+  tried twice more, a second and then three seconds later; turns that still
+  produced nothing are tried again once the rest of the meeting is done,
+  ten seconds later, because an intermittent service is usually back by then.
+  A participant whose every turn failed is handed over as one whole recording
+  instead — and if that fails too, their turns join the retry pass. Anything
+  else — a 4xx, an unreadable file, SMTP — is logged and skipped, as before.
 - **No retention policy.** Recordings accumulate indefinitely.
 - **Last control frame wins.** Participant metadata is replaced, not merged, so
   someone who left before the final frame may lose their name.

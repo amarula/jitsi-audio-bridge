@@ -1010,6 +1010,46 @@ def test_a_participant_whose_turns_all_failed_is_transcribed_whole(
     assert lines == [(None, "participant-alice", "said something at length")]
 
 
+def test_lost_turns_are_given_a_second_chance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, clean_env: None
+) -> None:
+    """An intermittent service is usually back by the end of the session."""
+    monkeypatch.setattr(config_module, "SEARCH_PATHS", (tmp_path / "nothing.ini",))
+    monkeypatch.setattr(daemon_module, "RETRY_PASS_PAUSE_SECONDS", 0.0)
+    config = load_config()
+
+    recording = tmp_path / "participant-alice.wav"
+    recorder = OpusParticipantRecorder(recording)
+    for packet in _encode_tone(frames=50):
+        recorder.write_packet(packet)
+    recorder.close()
+
+    timeline = SessionTimeline(
+        started_at="now",
+        duration=1.0,
+        recorded={"alice": 1.0},
+        turns=[Turn("alice", 0.0, 0.4, 0.0, 10), Turn("alice", 0.5, 1.0, 0.4, 10)],
+    )
+
+    attempts: dict[str, int] = {}
+
+    def flaky(path: str | Path, endpoint: object) -> str:
+        name = Path(path).name
+        attempts[name] = attempts.get(name, 0) + 1
+        # The first request for each turn is refused; the retry pass gets them.
+        return "" if attempts[name] == 1 else f"text for {name}"
+
+    monkeypatch.setattr(daemon_module, "transcribe_audio", flaky)
+    lines = daemon_module.transcribe_recordings(
+        [recording], {"id_to_name": {}}, timeline, config
+    )
+    assert [text for _, _, text in lines] == [
+        "text for participant-alice-0000.wav",
+        "text for participant-alice-0001.wav",
+    ]
+    assert [start for start, _, _ in lines] == [0.0, 0.5]
+
+
 
 def test_slice_wav_cuts_the_named_window(tmp_path: Path) -> None:
     source = tmp_path / "participant-alice.wav"
