@@ -45,6 +45,11 @@ DEFAULTS: dict[str, dict[str, str]] = {
         "recordings_dir": "/srv/recordings",
         "cleanup_after_send": "false",
         "session_metadata_dir": "",
+        "capture_timeline": "true",
+    },
+    "transcript": {
+        "interleave": "true",
+        "merge_gap_seconds": "1.0",
     },
     "whisper": {
         "url": "https://whisper.omnia.amarulasolutions.com/transcribe-b64",
@@ -97,6 +102,25 @@ class StorageConfig:
     #: the JVB's framing carries no names, addresses or room name, so those
     #: sessions then run entirely on the defaults.
     session_metadata_dir: Path | None = None
+    #: Write ``timeline.json`` for sessions fed by the JVB's media export: who
+    #: spoke when, on the session's own clock.  It can only be captured while
+    #: the meeting is running, so switching it off means those transcripts are
+    #: never interleaved, however they are processed later.
+    capture_timeline: bool = True
+
+
+@dataclass(frozen=True)
+class TranscriptConfig:
+    """How the transcript is assembled from the recordings."""
+
+    #: Merge the participants' speaking turns into one time-ordered document.
+    #: Off means one block per participant, in filename order, which is what
+    #: sessions without a timeline produce either way.
+    interleave: bool
+    #: Silence between two turns of one speaker that still counts as one turn
+    #: when they are transcribed: a pause inside a sentence is shorter than
+    #: this, a reply is usually longer.
+    merge_gap_seconds: float
 
 
 @dataclass(frozen=True)
@@ -136,6 +160,7 @@ class Config:
 
     server: ServerConfig
     storage: StorageConfig
+    transcript: TranscriptConfig
     whisper: EndpointConfig
     ollama: OllamaConfig
     smtp: SmtpConfig
@@ -280,6 +305,11 @@ def load_config(path: str | os.PathLike[str] | None = None) -> Config:
             recordings_dir=resolver.path("storage", "recordings_dir"),
             cleanup_after_send=resolver.boolean("storage", "cleanup_after_send"),
             session_metadata_dir=resolver.optional_path("storage", "session_metadata_dir"),
+            capture_timeline=resolver.boolean("storage", "capture_timeline"),
+        ),
+        transcript=TranscriptConfig(
+            interleave=resolver.boolean("transcript", "interleave"),
+            merge_gap_seconds=resolver.number("transcript", "merge_gap_seconds", minimum=0.0),
         ),
         whisper=EndpointConfig(
             url=resolver.required("whisper", "url"),

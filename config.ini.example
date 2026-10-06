@@ -36,6 +36,19 @@ cleanup_after_send = false
 ; it — room name, participants, and those speakers' names — as its metadata.
 ; Empty disables it and leaves such sessions on the defaults.
 session_metadata_dir =
+; Write timeline.json for sessions fed by the JVB's media export: who spoke
+; when, on the session's own clock.  The timing can only be captured while the
+; meeting is running, and it is what lets the transcript be interleaved.
+capture_timeline = true
+
+[transcript]
+; Merge the participants' speaking turns into one time-ordered document,
+; "[00:03:12] Alice: ...", instead of one block per participant.  Sessions
+; with no timeline keep the per-participant shape either way.
+interleave = true
+; Silence between two turns of one speaker that still counts as one turn when
+; they are transcribed.
+merge_gap_seconds = 1.0
 
 [whisper]
 ; Endpoint accepting {"audio_base64": ..., "filename": ...} and returning

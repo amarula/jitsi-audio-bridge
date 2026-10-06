@@ -25,7 +25,9 @@ from jitsi_audio_bridge.audio import (
     attribute_speaker,
     discover_audio,
     parse_metadata,
+    participant_id_from_path,
     room_name_from_metadata,
+    slice_wav,
 )
 from jitsi_audio_bridge.config import ConfigError, load_config
 from jitsi_audio_bridge.daemon import (
@@ -37,11 +39,19 @@ from jitsi_audio_bridge.daemon import (
     extract_media_json_media,
     extract_session_id,
     parse_media_json_event,
+    render_transcript,
     sanitize_identifier,
     split_frame,
     write_metadata,
 )
 from jitsi_audio_bridge.mailer import _subject_for, _usable_recipients, safe_attachment_name
+from jitsi_audio_bridge.timeline import (
+    SessionTimeline,
+    Turn,
+    TurnTracker,
+    format_offset,
+    merge_turns,
+)
 
 # --------------------------------------------------------------------------
 # Session and participant identifiers
@@ -778,6 +788,222 @@ def test_an_empty_required_value_is_rejected(tmp_path: Path, clean_env: None) ->
     path = tmp_path / "config.ini"
     path.write_text("[whisper]\nurl =\n", encoding="utf-8")
     with pytest.raises(ConfigError, match="must not be empty"):
+        load_config(path)
+
+
+
+# --------------------------------------------------------------------------
+# Speaking turns, the timeline, and the interleaved transcript
+# --------------------------------------------------------------------------
+
+#: One Opus frame as the JVB sends it: 20 ms.
+FRAME = 0.02
+
+
+def _speak(
+    tracker: TurnTracker,
+    participant: str,
+    start: float,
+    seconds: float,
+    *,
+    level: float | None = 0.2,
+    vad: bool | None = None,
+) -> float:
+    """Feed *seconds* of 20 ms packets; returns where they ended."""
+    cursor = start
+    for _ in range(int(seconds / FRAME)):
+        tracker.add(
+            participant,
+            session_offset=cursor,
+            file_offset=cursor,
+            duration=FRAME,
+            level=level,
+            vad=vad,
+        )
+        cursor += FRAME
+    return cursor
+
+
+def test_tracker_turns_continuous_speech_into_one_turn() -> None:
+    tracker = TurnTracker()
+    _speak(tracker, "alice", 0.0, 1.0)
+    _speak(tracker, "alice", 1.0, 0.5, level=0.0)          # comfort noise, not speech
+    (turn,) = tracker.finish()
+    assert turn.participant == "alice"
+    assert (turn.start, turn.end) == (0.0, pytest.approx(1.0, abs=FRAME))
+    assert turn.offset == 0.0
+
+
+def test_tracker_merges_a_pause_and_splits_a_longer_one() -> None:
+    tracker = TurnTracker(merge_gap=0.5)
+    _speak(tracker, "alice", 0.0, 1.0)
+    resumed = _speak(tracker, "alice", 1.0, 0.3, level=0.0)
+    _speak(tracker, "alice", resumed, 1.0)
+    (turn,) = tracker.finish()
+    assert turn.end == pytest.approx(2.3, abs=FRAME)       # one turn across the pause
+
+    tracker = TurnTracker(merge_gap=0.5)
+    _speak(tracker, "alice", 0.0, 1.0)
+    resumed = _speak(tracker, "alice", 1.0, 1.5, level=0.0)
+    _speak(tracker, "alice", resumed, 1.0)
+    assert [round(turn.start, 2) for turn in tracker.finish()] == [0.0, 2.5]
+
+
+def test_tracker_trusts_the_vad_flag_over_the_level() -> None:
+    tracker = TurnTracker()
+    _speak(tracker, "alice", 0.0, 1.0, level=0.0, vad=True)
+    (turn,) = tracker.finish()
+    assert turn.duration == pytest.approx(1.0, abs=FRAME)
+
+    tracker = TurnTracker()
+    _speak(tracker, "alice", 0.0, 1.0, level=0.5, vad=False)
+    assert tracker.finish() == []
+
+
+def test_tracker_treats_a_packet_with_no_hints_as_speech() -> None:
+    """An older sender gives neither a level nor a flag; assume someone talks."""
+    tracker = TurnTracker()
+    _speak(tracker, "alice", 0.0, 0.5, level=None)
+    (turn,) = tracker.finish()
+    assert turn.duration == pytest.approx(0.5, abs=FRAME)
+
+    # But a level that is there and low still means silence.
+    tracker = TurnTracker()
+    _speak(tracker, "alice", 0.0, 0.5, level=0.001)
+    assert tracker.finish() == []
+
+
+def test_tracker_drops_blips_and_splits_monologues() -> None:
+    tracker = TurnTracker(min_turn=0.3)
+    tracker.add("alice", session_offset=0.0, file_offset=0.0, duration=FRAME, level=0.5)
+    assert tracker.finish() == []                          # 20 ms is a click, not speech
+
+    tracker = TurnTracker(max_turn=1.0)
+    _speak(tracker, "alice", 0.0, 3.0)
+    turns = tracker.finish()
+    assert [round(turn.duration, 2) for turn in turns] == [1.0, 1.0, 1.0]
+    assert [round(turn.start, 2) for turn in turns] == [0.0, 1.0, 2.0]
+
+
+def test_tracker_keeps_participants_apart() -> None:
+    tracker = TurnTracker()
+    _speak(tracker, "alice", 0.0, 0.5)
+    _speak(tracker, "bob", 0.0, 0.5)
+    turns = tracker.finish()
+    assert [turn.participant for turn in turns] == ["alice", "bob"]
+    assert all(turn.duration >= 0.3 for turn in turns)
+
+
+@pytest.mark.parametrize(
+    ("seconds", "expected"),
+    [(0, "00:00:00"), (61, "00:01:01"), (3725, "01:02:05"), (-4, "00:00:00")],
+)
+def test_format_offset(seconds: float, expected: str) -> None:
+    assert format_offset(seconds) == expected
+
+
+def test_merging_turns_keeps_the_order_and_loses_resolution() -> None:
+    turns = [
+        Turn("a", 0.0, 1.0, 0.0, 3),
+        Turn("a", 1.2, 2.0, 1.0, 3),      # closest pair: 0.2 s apart
+        Turn("a", 9.0, 10.0, 2.0, 3),
+    ]
+    merged = merge_turns(list(turns), 2)
+    assert [(turn.start, turn.end, turn.offset) for turn in merged] == [
+        (0.0, 2.0, 0.0),
+        (9.0, 10.0, 2.0),
+    ]
+    assert merged[0].samples == 6
+
+    assert merge_turns(list(turns), 5) == turns        # nothing to do
+    assert len(merge_turns(list(turns), 1)) == 1
+
+
+def test_timeline_round_trips_and_survives_junk() -> None:
+    timeline = SessionTimeline(
+        started_at="2026-10-06T18:00:00+00:00",
+        duration=12.5,
+        recorded={"alice": 4.0},
+        turns=[Turn("alice", 0.5, 1.5, 0.0, 1000)],
+    )
+    restored = SessionTimeline.from_json(timeline.to_json())
+    assert restored is not None
+    assert restored.turns_for("alice") == [Turn("alice", 0.5, 1.5, 0.0, 1000)]
+    assert restored.recorded == {"alice": 4.0}
+    assert restored.started_at == timeline.started_at
+
+    assert SessionTimeline.from_json("not json") is None
+    assert SessionTimeline.from_json("[1, 2]") is None
+    # A turn that is not a turn is dropped; the rest of the document survives.
+    partial = SessionTimeline.from_json(
+        '{"turns": [{"participant": "a"}, 5,'
+        ' {"participant": "b", "start": 0, "end": 1, "offset": 0, "samples": 1}]}'
+    )
+    assert partial is not None
+    assert [turn.participant for turn in partial.turns] == ["b"]
+
+
+def test_timeline_write_leaves_no_temporary_file(tmp_path: Path) -> None:
+    timeline = SessionTimeline(started_at="now", duration=1.0, turns=[Turn("a", 0, 1, 0, 1)])
+    path = tmp_path / "timeline.json"
+    assert timeline.write(path)
+    assert [item.name for item in tmp_path.iterdir()] == ["timeline.json"]
+    assert SessionTimeline.load(path) == timeline
+    assert SessionTimeline.load(tmp_path / "absent.json") is None
+
+
+def test_slice_wav_cuts_the_named_window(tmp_path: Path) -> None:
+    source = tmp_path / "participant-alice.wav"
+    recorder = OpusParticipantRecorder(source)
+    for packet in _encode_tone(frames=50):                 # one second of audio
+        recorder.write_packet(packet)
+    recorder.close()
+
+    half = slice_wav(source, 0.5, 0.2, tmp_path / "turns" / "alice-0001.wav")
+    with wave.open(str(half), "rb") as handle:
+        assert handle.getframerate() == 16000
+        assert handle.getnchannels() == 1
+        assert handle.getnframes() == pytest.approx(0.2 * 16000, abs=2)
+    with wave.open(str(source), "rb") as handle:
+        assert handle.getnframes() == pytest.approx(16000, abs=2)
+
+    with pytest.raises(OpusError):
+        slice_wav(source, 5.0, 0.2, tmp_path / "turns" / "past-the-end.wav")
+
+
+def test_participant_id_comes_from_the_file_name() -> None:
+    assert participant_id_from_path(Path("/x/participant-8aa1c4ba-a0.wav")) == "8aa1c4ba-a0"
+    assert participant_id_from_path(Path("/x/alice_audio.wav")) is None
+
+
+def test_render_transcript_orders_by_time_and_leaves_untimed_last() -> None:
+    rendered = render_transcript(
+        [
+            (12.0, "Bob", "second"),
+            (None, "Zoe", "no timeline for this one"),
+            (3.0, "Alice", "first"),
+        ]
+    )
+    assert rendered == (
+        "[00:00:03] Alice: first"
+        "\n\n[00:00:12] Bob: second"
+        "\n\n[Zoe]: no timeline for this one"
+    )
+
+
+def test_new_settings_default_on(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+                                 clean_env: None) -> None:
+    monkeypatch.setattr(config_module, "SEARCH_PATHS", (tmp_path / "nothing.ini",))
+    config = load_config()
+    assert config.storage.capture_timeline is True
+    assert config.transcript.interleave is True
+    assert config.transcript.merge_gap_seconds == 1.0
+
+
+def test_a_malformed_merge_gap_is_rejected(tmp_path: Path, clean_env: None) -> None:
+    path = tmp_path / "config.ini"
+    path.write_text("[transcript]\nmerge_gap_seconds = soon\n", encoding="utf-8")
+    with pytest.raises(ConfigError, match="merge_gap_seconds"):
         load_config(path)
 
 

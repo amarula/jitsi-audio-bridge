@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import re
 import sys
 import time
 import wave
@@ -511,6 +512,22 @@ def main() -> int:
         check("media events never reach metadata.json",
               not (mediajson / "metadata.json").exists())
 
+        timeline_file = mediajson / "timeline.json"
+        wait_for(lambda: timeline_file.exists(), timeout=15)
+        check("a media-json session records a timeline", timeline_file.is_file(),
+              f"contents: {sorted(p.name for p in mediajson.iterdir())}"
+              if mediajson.is_dir() else "no session directory")
+        if timeline_file.is_file():
+            timeline = json.loads(timeline_file.read_text())
+            speakers = {turn["participant"] for turn in timeline.get("turns", [])}
+            check("the timeline has turns for both speakers", len(speakers) == 2,
+                  f"{len(timeline.get('turns', []))} turn(s): {timeline.get('turns')}")
+            check("every turn carries both clocks",
+                  all({"start", "offset"} <= set(turn) for turn in timeline.get("turns", []))
+                  and bool(timeline.get("started_at")),
+                  str(timeline.get("turns"))[:120])
+        check("the turn slices are cleaned up", not (mediajson / ".turns").exists())
+
         alice_json = mediajson / "participant-alice-audio.wav"
         if alice_json.is_file():
             with wave.open(str(alice_json), "rb") as handle:
@@ -531,6 +548,18 @@ def main() -> int:
             # the recording's own filename.
             check("media-json speakers fall back to their tags",
                   "participant-alice-audio" in body, body.strip()[:80])
+            blocks = [block for block in body.split("\n\n") if block.strip()]
+            stamped = bool(blocks) and all(
+                re.match(r"^\[\d\d:\d\d:\d\d\] ", block) for block in blocks
+            )
+            check(
+                "the transcript is interleaved, every line stamped with its time",
+                stamped,
+                body.strip()[:120],
+            )
+            if stamped:
+                stamps = [int(block[1:3]) * 60 + int(block[4:6]) for block in blocks]
+                check("the lines are in speaking order", stamps == sorted(stamps), str(stamps))
         check("a media-json session is transcribed and emailed",
               len(smtp.messages) == before_mediajson + 1,
               f"{len(smtp.messages) - before_mediajson} message(s)")

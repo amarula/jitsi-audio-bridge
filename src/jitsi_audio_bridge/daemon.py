@@ -30,9 +30,11 @@ import json
 import logging
 import os
 import re
+import shutil
 import signal
 import tempfile
-from collections.abc import Iterable
+import time
+from collections.abc import Iterable, Sequence
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -44,15 +46,20 @@ from .ai_client import generate_summary, transcribe_audio
 from .audio import (
     EXTRACTED_AUDIO_NAME,
     METADATA_FILENAME,
+    TIMELINE_FILENAME,
+    TURN_DIR_NAME,
     OpusError,
     OpusParticipantRecorder,
     attribute_speaker,
     discover_audio,
     extract_audio_track,
     parse_metadata,
+    participant_id_from_path,
+    slice_wav,
 )
 from .config import Config, ConfigError, load_config
 from .mailer import send_meeting_email
+from .timeline import SessionTimeline, TurnTracker, format_offset, merge_turns, utc_now
 
 logger = logging.getLogger(__name__)
 
@@ -243,6 +250,20 @@ def describe_media_json_start(event: dict[str, Any]) -> str:
     )
 
 
+def extract_media_json_vad(event: dict[str, Any]) -> bool | None:
+    """The exporter's own voice-activity flag, when it set one.
+
+    It is absent on most export streams, which is why the level of the decoded
+    audio is the fallback — see
+    :class:`~jitsi_audio_bridge.timeline.TurnTracker`.
+    """
+    media = event.get("media")
+    if not isinstance(media, dict):
+        return None
+    vad = media.get("vad")
+    return vad if isinstance(vad, bool) else None
+
+
 def write_metadata(meeting_dir: Path, raw: str) -> bool:
     """Store a control frame as ``metadata.json``, atomically.
 
@@ -349,14 +370,139 @@ def _semaphore() -> asyncio.Semaphore:
     return _PROCESSING_SEMAPHORE
 
 
-def _cleanup(paths: Iterable[Path]) -> None:
-    """Delete processed files.  Only ever called when explicitly enabled."""
+def _cleanup(paths: Iterable[Path | None]) -> None:
+    """Delete processed files.  Only ever called when explicitly enabled.
+
+    ``None`` is a legitimate entry: the caller passes the extraction it may
+    never have made, and an ``AttributeError`` here would abandon the rest of
+    the cleanup.
+    """
     for path in paths:
+        if path is None:
+            continue
         try:
             path.unlink()
             logger.info("removed %s", path.name)
         except OSError as exc:
             logger.warning("could not remove %s: %s", path, exc)
+
+
+#: How many speaking turns one participant is transcribed in.  The request
+#: count is what costs, so past this the closest turns are merged — the order
+#: survives, only the resolution drops — rather than falling back to a
+#: monologue, which is the shape this whole feature exists to replace.
+MAX_TURNS_PER_FILE = 200
+
+#: The same budget for a session, shared out over the participants that spoke.
+MAX_TURNS_PER_SESSION = 600
+
+#: One line of the transcript: when it was said (seconds into the session, or
+#: ``None`` for a recording the timeline does not cover), who, and what.
+TranscriptLine = tuple[float | None, str, str]
+
+
+def render_transcript(lines: Sequence[TranscriptLine]) -> str:
+    """One document, in the order people spoke.
+
+    Lines that carry a session offset are ordered by it and prefixed with it;
+    lines that could not be placed — recordings from a meeting the timeline
+    does not describe, such as one processed in batch mode — keep the original
+    shape and follow them.
+    """
+    timed = sorted(
+        (line for line in lines if line[0] is not None), key=lambda line: line[0] or 0.0
+    )
+    rendered = [
+        f"[{format_offset(start)}] {speaker}: {text}" for start, speaker, text in timed
+    ]
+    rendered.extend(
+        f"[{speaker}]: {text}" for start, speaker, text in lines if start is None
+    )
+    return "\n\n".join(rendered)
+
+
+def _transcribe_turns(
+    recording: Path,
+    speaker: str,
+    turns: Sequence[Any],
+    turns_dir: Path,
+    config: Config,
+) -> list[TranscriptLine]:
+    """Cut one participant's speaking turns out and transcribe them."""
+    lines: list[TranscriptLine] = []
+    for index, turn in enumerate(turns):
+        slice_path = turns_dir / f"{recording.stem}-{index:04d}.wav"
+        try:
+            slice_wav(recording, turn.offset, turn.duration, slice_path)
+        except (OpusError, OSError) as exc:
+            logger.warning("cannot cut %s at %.3fs: %s", recording.name, turn.offset, exc)
+            continue
+        text = transcribe_audio(slice_path, config.whisper)
+        if text:
+            lines.append((turn.start, speaker, text))
+        else:
+            logger.warning("no transcript produced for turn %d of %s", index, speaker)
+    return lines
+
+
+def transcribe_recordings(
+    participant_files: Sequence[Path],
+    metadata: dict[str, Any],
+    timeline: SessionTimeline | None,
+    config: Config,
+) -> list[TranscriptLine]:
+    """Transcribe every recording, turn by turn when the timeline allows it.
+
+    Falls back to whole-file transcription — the shape the transcripts had
+    before any of this — whenever the timeline does not cover a recording or a
+    session simply has too many turns to split.
+    """
+    interleave = config.transcript.interleave and timeline is not None
+    allowance = MAX_TURNS_PER_FILE
+    if interleave and timeline is not None:
+        speakers = [participant_id_from_path(path) for path in participant_files]
+        wanted = sum(len(timeline.turns_for(participant_id or "")) for participant_id in speakers)
+        if wanted > MAX_TURNS_PER_SESSION:
+            speaking = sum(
+                1 for participant_id in speakers if timeline.turns_for(participant_id or "")
+            )
+            allowance = max(1, MAX_TURNS_PER_SESSION // max(1, speaking))
+            logger.info(
+                "%d speaking turns in this session; keeping the %d longest-lived ones per "
+                "participant so the transcript stays in order",
+                wanted,
+                allowance,
+            )
+
+    turns_dir = (participant_files[0].parent if participant_files else Path(".")) / TURN_DIR_NAME
+    lines: list[TranscriptLine] = []
+    try:
+        for recording in participant_files:
+            speaker = attribute_speaker(recording, metadata["id_to_name"])
+            turns: Sequence[Any] = []
+            if interleave and timeline is not None:
+                turns = timeline.turns_for(participant_id_from_path(recording) or "")
+                if len(turns) > allowance:
+                    logger.info(
+                        "%s has %d speaking turns; merging the closest to %d",
+                        speaker,
+                        len(turns),
+                        allowance,
+                    )
+                    turns = merge_turns(list(turns), allowance)
+            if turns:
+                logger.info("transcribing %d turn(s) of %s", len(turns), speaker)
+                lines.extend(_transcribe_turns(recording, speaker, turns, turns_dir, config))
+                continue
+
+            text = transcribe_audio(recording, config.whisper)
+            if text:
+                lines.append((None, speaker, text))
+            else:
+                logger.warning("no transcript produced for %s", recording.name)
+    finally:
+        shutil.rmtree(turns_dir, ignore_errors=True)
+    return lines
 
 
 def process_completed_session(meeting_dir: Path, config: Config) -> bool:
@@ -389,23 +535,28 @@ def process_completed_session(meeting_dir: Path, config: Config) -> bool:
         return False
 
     logger.info("transcribing %d audio file(s)", len(participant_files))
-    transcript_lines: list[str] = []
-    for recording in participant_files:
-        speaker = attribute_speaker(recording, metadata["id_to_name"])
-        text = transcribe_audio(recording, config.whisper)
-        if text:
-            transcript_lines.append(f"[{speaker}]: {text}")
-        else:
-            logger.warning("no transcript produced for %s", recording.name)
+    timeline = SessionTimeline.load(meeting_dir / TIMELINE_FILENAME)
+    if timeline is None:
+        logger.info(
+            "no %s in %s; the transcript keeps the per-participant shape",
+            TIMELINE_FILENAME,
+            meeting_dir,
+        )
+    transcript_lines = transcribe_recordings(participant_files, metadata, timeline, config)
 
     if not transcript_lines:
         logger.warning("nothing was transcribed for %s; skipping the email", meeting_dir)
         return False
 
-    transcript = "\n\n".join(transcript_lines)
+    transcript = render_transcript(transcript_lines)
     transcript_path = meeting_dir / "transcript.txt"
     transcript_path.write_text(transcript, encoding="utf-8")
-    logger.info("wrote %s (%d speakers)", transcript_path.name, len(transcript_lines))
+    logger.info(
+        "wrote %s (%d speaker(s), %d line(s))",
+        transcript_path.name,
+        len({speaker for _, speaker, _ in transcript_lines}),
+        len(transcript_lines),
+    )
 
     summary = generate_summary(
         transcript,
@@ -534,6 +685,13 @@ async def handle_jvb_stream(websocket: Any, config: Config) -> None:
     source_tags: dict[str, str] = {}
     frames = 0
     malformed = 0
+    # The session's own clock, and the turns heard on it.  Only the media-json
+    # path has a clock: the binary framing carries no timing at all, so
+    # sessions fed that way keep the transcript they have always had.
+    session_started = time.monotonic()
+    started_at = utc_now()
+    tracker = TurnTracker(merge_gap=config.transcript.merge_gap_seconds)
+    saw_media_json = False
 
     try:
         async for message in websocket:
@@ -617,8 +775,23 @@ async def handle_jvb_stream(websocket: Any, config: Config) -> None:
                     continue
 
             recorder = _recorder_for(recorders, meeting_dir, participant_id, session_id)
-            if recorder is not None:
-                recorder.write_packet(payload)
+            if recorder is None:
+                continue
+            # The file offset is read before the packet lands in the file, and
+            # the level after it was decoded — the same decode the WAV needed,
+            # so nothing is decoded twice.
+            file_offset = recorder.decoded_samples / recorder.sample_rate
+            if recorder.write_packet(payload):
+                media_json = isinstance(message, str)
+                saw_media_json = saw_media_json or media_json
+                tracker.add(
+                    participant_id,
+                    session_offset=time.monotonic() - session_started,
+                    file_offset=file_offset,
+                    duration=recorder.decoded_samples / recorder.sample_rate - file_offset,
+                    level=recorder.last_level,
+                    vad=extract_media_json_vad(event) if media_json else None,
+                )
     except websockets.ConnectionClosed:
         logger.info("session %s: peer disconnected", session_id)
     finally:
@@ -639,6 +812,29 @@ async def handle_jvb_stream(websocket: Any, config: Config) -> None:
             malformed,
             len(recorders),
         )
+
+        if config.storage.capture_timeline and saw_media_json and recorders:
+            turns = tracker.finish()
+            elapsed = time.monotonic() - session_started
+            timeline = SessionTimeline(
+                started_at=started_at,
+                # A stream that arrived faster than it plays makes the wall
+                # clock shorter than the meeting it describes; the turns know
+                # better, so keep the larger of the two.
+                duration=max(elapsed, turns[-1].end if turns else 0.0),
+                recorded={
+                    participant: recorder.duration_seconds
+                    for participant, recorder in recorders.items()
+                },
+                turns=turns,
+            )
+            if timeline.write(meeting_dir / TIMELINE_FILENAME):
+                logger.info(
+                    "session %s: %d speaking turn(s) written to %s",
+                    session_id,
+                    len(timeline.turns),
+                    TIMELINE_FILENAME,
+                )
 
         # Only run the pipeline when there is actually something to process:
         # a connection that sent nothing must not email an empty meeting.

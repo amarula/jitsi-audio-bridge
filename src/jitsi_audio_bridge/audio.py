@@ -23,10 +23,13 @@ import ctypes
 import ctypes.util
 import json
 import logging
+import math
 import re
 import shutil
 import subprocess
+import sys
 import wave
+from array import array
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -44,6 +47,13 @@ PARTICIPANT_AUDIO_GLOB = "*_audio.wav"
 
 #: The file ffmpeg extracts a single master track into.
 EXTRACTED_AUDIO_NAME = "extracted_audio.wav"
+
+#: Who spoke when, as captured while the meeting was running.
+TIMELINE_FILENAME = "timeline.json"
+
+#: Where the post-processing step cuts a participant's turns out, before
+#: transcribing them one by one.  Removed as soon as they have been read.
+TURN_DIR_NAME = ".turns"
 
 #: Containers a master recording may arrive in, in preference order.
 MASTER_MEDIA_SUFFIXES = (".wav", ".mp4", ".m4a", ".mkv")
@@ -394,6 +404,25 @@ class OpusEncoder:
             self.close()
 
 
+def _rms(pcm: bytes) -> float:
+    """Root-mean-square of interleaved 16-bit PCM, as a fraction of full scale.
+
+    ``audioop`` would do this and is gone from Python 3.13, so the arithmetic
+    is here instead: one packet is a few hundred samples, and the sum of their
+    squares stays exact in a float.
+    """
+    if not pcm:
+        return 0.0
+    samples = array("h")
+    samples.frombytes(pcm[: len(pcm) - len(pcm) % _BYTES_PER_SAMPLE])
+    if sys.byteorder != "little":
+        samples.byteswap()
+    if not samples:
+        return 0.0
+    total = sum(value * value for value in samples)
+    return math.sqrt(total / len(samples)) / 32768.0
+
+
 class OpusParticipantRecorder:
     """Decodes one participant's Opus stream into a mono WAV file.
 
@@ -413,6 +442,10 @@ class OpusParticipantRecorder:
         self.decoded_samples = 0
         #: Packets libopus refused; a few are normal (comfort noise, RED).
         self.dropped_packets = 0
+        #: RMS of the last decoded packet, 0.0 to 1.0 of full scale.  Kept for
+        #: the timeline: whether a packet is speech has to be decided while the
+        #: audio is in hand, and this is the same decode the WAV needed.
+        self.last_level: float | None = None
         self._closed = False
 
         self._decoder = OpusDecoder(sample_rate, channels)
@@ -448,6 +481,7 @@ class OpusParticipantRecorder:
 
         self._wav.writeframes(pcm)
         self.decoded_samples += len(pcm) // (_BYTES_PER_SAMPLE * self.channels)
+        self.last_level = _rms(pcm)
         return True
 
     def close(self) -> None:
@@ -646,6 +680,47 @@ def extract_audio_track(source: str | Path, destination: str | Path) -> Path:
         raise OpusError(f"ffmpeg could not extract audio from {source.name}: {tail[0]}")
     logger.info("extracted %s from %s", destination.name, source.name)
     return destination
+
+
+def participant_id_from_path(audio_path: str | Path) -> str | None:
+    """The participant a recording is named after, or ``None``.
+
+    Live capture names files ``participant-<id>.wav``, and the id is the
+    sanitised source tag the timeline keys on.  Recordings that Jitsi's own
+    recorder wrote are named after the speaker instead, so they have no id to
+    match a timeline with — and no need of one.
+    """
+    stem = Path(audio_path).stem
+    prefix = "participant-"
+    return stem[len(prefix) :] if stem.startswith(prefix) else None
+
+
+def slice_wav(
+    source: str | Path, start: float, duration: float, destination: str | Path
+) -> Path:
+    """Copy *duration* seconds of *source*, from *start*, into *destination*.
+
+    Used to cut one speaking turn out of a participant's recording so Whisper
+    is handed the turn rather than the meeting.  The frame count is clamped to
+    what the file holds, so a timeline that disagrees with a truncated WAV
+    yields a short slice rather than an error.
+    """
+    source_path, destination_path = Path(source), Path(destination)
+    with wave.open(str(source_path), "rb") as reader:
+        params = reader.getparams()
+        rate = reader.getframerate() or 1
+        first = max(0, int(start * rate))
+        if first >= reader.getnframes():
+            raise OpusError(f"{source_path.name}: no audio at {start:.3f}s")
+        reader.setpos(first)
+        wanted = max(1, int(duration * rate))
+        frames = reader.readframes(wanted)
+
+    destination_path.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(destination_path), "wb") as writer:
+        writer.setparams(params)
+        writer.writeframes(frames)
+    return destination_path
 
 
 def attribute_speaker(audio_path: str | Path, id_to_name: dict[str, str]) -> str:

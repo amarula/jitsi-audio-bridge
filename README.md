@@ -150,6 +150,7 @@ The environment layer exists so secrets can be supplied by a systemd
 | `recordings_dir` | path | `/srv/recordings` | `JITSI_AUDIO_BRIDGE_STORAGE_RECORDINGS_DIR` |
 | `cleanup_after_send` | boolean | `false` | `JITSI_AUDIO_BRIDGE_STORAGE_CLEANUP_AFTER_SEND` |
 | `session_metadata_dir` | path | *(empty)* | `JITSI_AUDIO_BRIDGE_STORAGE_SESSION_METADATA_DIR` |
+| `capture_timeline` | boolean | `true` | `JITSI_AUDIO_BRIDGE_STORAGE_CAPTURE_TIMELINE` |
 
 `cleanup_after_send` deletes the audio, transcript and summary once the email
 has been sent. It is off by default deliberately: those files are the only copy
@@ -161,6 +162,25 @@ metadata, keyed by meeting id. A session that has no `metadata.json` of its own
 adopts the file written for it, which is how a stock-Jitsi session gets a room
 name, speaker names and, where the deployment authenticates users, recipients.
 Empty disables it.
+
+`capture_timeline` writes `timeline.json` for sessions fed by the JVB's
+media export: who spoke when, on the session's own clock. It can only be
+captured while the meeting is running — a meeting recorded with this off can
+never be interleaved afterwards — and it costs one small file per session.
+
+### `[transcript]`
+
+| Option | Type | Default | Environment |
+|---|---|---|---|
+| `interleave` | boolean | `true` | `JITSI_AUDIO_BRIDGE_TRANSCRIPT_INTERLEAVE` |
+| `merge_gap_seconds` | seconds | `1.0` | `JITSI_AUDIO_BRIDGE_TRANSCRIPT_MERGE_GAP_SECONDS` |
+
+`interleave` merges the participants' speaking turns into one time-ordered
+document — `[00:03:12] Alice: …` — instead of one block per participant in
+filename order. It needs a timeline: a session without one (the legacy
+framing, or a meeting processed from a directory someone else recorded) keeps
+the per-participant shape whatever this is set to. `merge_gap_seconds` is how
+much silence between two runs of one speaker still counts as the same turn.
 
 ### `[whisper]`
 
@@ -505,11 +525,20 @@ bridge records with what the real sender produces.
 ```
 <srv/recordings>/<sessionId>/
 ├── metadata.json            # the last control frame received — see below
+├── timeline.json            # who spoke when, captured live — see below
 ├── participant-<id>.wav     # 16 kHz, mono, 16-bit PCM, one per participant
 ├── extracted_audio.wav      # only when a master recording had to be extracted
 ├── transcript.txt           # written once post-processing succeeds
 └── summary.md               # the LLM summary, likewise
 ```
+
+`timeline.json` is written for sessions fed by the JVB's media export (the
+binary framing carries no timing): the session's start, how much audio each
+participant produced, and every speaking turn with two clocks — when it began
+on the session, and where it begins in that participant's WAV. It is what
+makes the transcript interleaved; see [Limitations](#limitations) for what it
+cannot do. The `.turns/` directory it is transcribed through is removed
+afterwards.
 
 `metadata.json` is written by the **control frame** path, so it exists only when
 the sender sent one. The stock-Jitsi path has no control frame at all — the
@@ -630,10 +659,12 @@ daemon closes every file in a `finally`, so this needs a hard kill; see
   correlating `sessionId` with the conference elsewhere — which
   [docs/jitsi-integration.md](docs/jitsi-integration.md) §5 does with a Prosody
   module and `[storage] session_metadata_dir`.
-- **No conversational ordering.** No timestamps are recorded, so the transcript
-  is one block per participant in filesystem order, not interleaved by time.
-  This is the single largest quality limitation; recovering it means recording
-  per-packet arrival times and interleaving before transcription.
+- **Ordering is per speaker, not per sentence.** A speaking turn is the unit:
+  two people talking over each other come out as two turns that overlap in
+  time, and one long turn split at 30 seconds keeps only that resolution. The
+  timestamps are offsets from the session start (the wall clock is in
+  `timeline.json`), and a session recorded without `capture_timeline` has no
+  timing at all — that cannot be recovered afterwards.
 - **Sequential transcription.** Participants are transcribed one after another.
   A long meeting is slow, and one Whisper timeout costs that participant's text.
 - **No retries.** A failed Whisper, Ollama, or SMTP call is logged and skipped.

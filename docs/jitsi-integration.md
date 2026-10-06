@@ -574,7 +574,9 @@ the custom binary one are served on the same route without negotiating a mode:
 - `media` events are base64-decoded to one Opus packet each and appended to the
   recorder for the sanitised `tag`, producing `participant-<tag>.wav`. The
   recording is keyed by tag even if it arrives before the source's `start`
-  event.
+  event. Each packet also feeds the timeline: its arrival on the session's
+  clock, its position in the recording, and whether it sounded like speech —
+  which is what the interleaved transcript is built from.
 - `ping` is answered with a matching `pong`, which the JVB requires.
 - `session-end` stops reading and finalises the recording without waiting for
   the TCP close.
@@ -596,6 +598,14 @@ Consequences of this path:
   protocol.
 - **The meeting id is opaque.** `sessionId` is a UUID, so the recording
   directory and anything derived from it are named by UUID, not by room.
+- **Ordering comes from the bridge, not from Jitsi.** The daemon captures each
+  packet as it arrives and writes the speaking turns to `timeline.json`, which
+  is what makes the transcript interleaved rather than one block per
+  participant. The protocol's own `media.timestamp` is *not* used for that:
+  the timestamps of two participants' streams have no common origin, so
+  arrival on one real-time socket is the only shared clock there is. The
+  exporter's `vad` flag is used when it is set; otherwise the decoded audio's
+  own level decides.
 
 Known hazards, already recorded in [REVIEW.md](../REVIEW.md): a reconnecting
 JVB reuses its `sessionId` and the daemon has no idempotency (a reconnect

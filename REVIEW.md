@@ -293,16 +293,20 @@ earlier suggestion to do so was wrong. Work that respects the contract:
 Neither was done here. The first is a contained change; the second alters what
 Whisper is asked to transcribe and deserves its own testing.
 
-### No conversational ordering — **Medium, design**
+### No conversational ordering — **Medium, design** — Fixed
 
-No arrival timestamps are recorded. `process_completed_session` globs
-`participant-*.wav` and concatenates blocks, so the transcript reads as a
-sequence of monologues rather than a conversation, and the order is by
-participant identifier.
+No arrival timestamps were recorded, so the transcript was a sequence of
+monologues in filename order.
 
-*Fix:* record the arrival time of each packet (or each speech run) and
-interleave before transcription. This is the largest single quality improvement
-available, and it is the one that makes a meeting transcript actually readable.
+Speech turns are now captured while the meeting runs, on the session's own
+clock (`src/jitsi_audio_bridge/timeline.py`, written to `timeline.json`), and
+post-processing cuts each participant's recording into those turns and
+interleaves them — `[00:03:12] Alice: …`. What remains: a turn is the unit, so
+overlapping speech comes out as two overlapping turns rather than one ordered
+stream; turns are transcribed in 30-second pieces at most, and a session that
+was recorded with `capture_timeline` off has no timing to recover. The ASR
+service returns no segment times, so the resolution is the turn, not the
+sentence.
 
 ### `metadata.json` is last-write-wins — **Medium**
 
