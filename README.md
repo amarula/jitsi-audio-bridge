@@ -352,7 +352,8 @@ failure prints the fix; exit status is 1 if any check failed.
 
 `--fix --bridge-url bridge.example.com` goes further and writes the remedy as
 `<file>.new` beside the file it would change — Jicofo's transcription block,
-the Prosody module, its enablement and the room-metadata plumbing, the client
+the Prosody module, its enablement, the room-metadata component and the
+`features_identity` entry that publishes it to clients, the client
 configuration — leaving the originals untouched, with the diff/move/restart
 commands printed for each. `--output-dir` stages them elsewhere when `/etc` is
 not writable.

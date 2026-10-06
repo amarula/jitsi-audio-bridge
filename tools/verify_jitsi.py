@@ -611,6 +611,30 @@ def find_main_muc(blocks: Sequence[LuaBlock], domain: str | None) -> LuaBlock | 
     )
 
 
+def find_main_host(
+    blocks: Sequence[LuaBlock], domain: str | None, main_muc: LuaBlock | None = None
+) -> LuaBlock | None:
+    """Pick the VirtualHost clients read their identities from.
+
+    That is the host the conference MUC lives under, which is also the one
+    named after the XMPP domain.  Components announce themselves on it through
+    ``jitsi-add-identity`` (handled by ``mod_features_identity``), and it is
+    the host lib-jitsi-meet queries disco#info for on connect.
+    """
+    hosts = [block for block in blocks if block.kind == "VirtualHost"]
+    if not hosts:
+        return None
+    if domain is not None:
+        named = [block for block in hosts if block.name == domain]
+        if named:
+            return named[0]
+    if main_muc is not None:
+        owners = [block for block in hosts if lua_scalar(block.body, "main_muc") == main_muc.name]
+        if len(owners) == 1:
+            return owners[0]
+    return hosts[0] if len(hosts) == 1 else None
+
+
 def lua_string_list(table: str | None) -> list[str]:
     """Every quoted string inside a Lua table body, in order."""
     if not table:
@@ -1006,6 +1030,22 @@ def forcing_candidates(
     return found
 
 
+def plugin_file_absent(
+    plugin_dirs: Sequence[Path],
+    read: Callable[[Path], str | None],
+    filename: str,
+) -> bool:
+    """Whether *filename* is provably absent from every readable plugin dir.
+
+    ``False`` when the file is there, and also when no plugin directory can be
+    read — the tool cannot tell then, and says so rather than guessing.
+    """
+    readable = [directory for directory in plugin_dirs if directory.is_dir()]
+    return bool(readable) and not any(
+        read(directory / filename) is not None for directory in readable
+    )
+
+
 def lua_publishes_room_metadata(text: str) -> bool:
     """Whether a module publishes its metadata changes.
 
@@ -1095,6 +1135,45 @@ def check_prosody(
                 'Component "metadata.<domain>" "room_metadata_component" block '
                 "(docs/jitsi-integration.md §2)",
         ))
+
+    # The component announces itself with ``jitsi-add-identity``, which only
+    # mod_features_identity turns into a disco#info identity on the main host —
+    # the one place lib-jitsi-meet looks for the component addresses.  Without
+    # it the client rejects every metadata message as coming from an unknown
+    # sender: getMetadata() stays {}, and turning transcription on dials the
+    # Jigasi number instead of setting the metadata flag.
+    if has_component:
+        main_host = find_main_host(blocks, domain, main_muc)
+        host_name = main_host.name if main_host else "the main VirtualHost"
+        if main_host is None:
+            checks.append(Check(
+                "prosody.features_identity", Status.SKIP,
+                "no VirtualHost block to read the advertised identities from",
+                fix="check that the site config is the one Prosody loads",
+            ))
+        elif FEATURES_IDENTITY_MODULE in lua_module_names(main_host.body):
+            checks.append(Check(
+                "prosody.features_identity", Status.PASS,
+                f'"{host_name}" advertises the room metadata component to clients',
+            ))
+        elif plugin_file_absent(plugin_dirs, read_module, FEATURES_IDENTITY_PLUGIN):
+            checks.append(Check(
+                "prosody.features_identity", Status.FAIL,
+                f"{FEATURES_IDENTITY_PLUGIN} is not installed in the Prosody plugin "
+                "paths, so clients are never told where the room metadata component is",
+                fix="upgrade the client packages (apt install --only-upgrade "
+                    "jitsi-meet-prosody) and rerun",
+            ))
+        else:
+            checks.append(Check(
+                "prosody.features_identity", Status.FAIL,
+                f'"{host_name}" does not enable {FEATURES_IDENTITY_MODULE}, so clients '
+                "are never told where the room metadata component is: they drop its "
+                "messages, getMetadata() stays {} and transcription falls back to "
+                "dialling Jigasi",
+                fix=f'add "{FEATURES_IDENTITY_MODULE}"; to modules_enabled on '
+                    f'"{host_name}" (docs/jitsi-integration.md §2)',
+            ))
 
     forcing, missing = module_files_for(modules, plugin_dirs, read_module)
     if forcing:
@@ -1207,6 +1286,11 @@ def check_jvb(deployment: Deployment) -> list[Check]:
 PROPOSAL_SUFFIX = ".new"
 PROPOSAL_BANNER = "Proposal written by jitsi-audio-bridge-verify --fix."
 PROSODY_MODULE_NAME = "force_async_transcription"
+#: ``mod_features_identity`` is what turns a component's ``jitsi-add-identity``
+#: into an entry in the main VirtualHost's disco#info.  Clients cannot see a
+#: component — and drop its messages — without it.
+FEATURES_IDENTITY_MODULE = "features_identity"
+FEATURES_IDENTITY_PLUGIN = "mod_features_identity.lua"
 
 #: The bookkeeping module, verbatim from docs/jitsi-integration.md §2; a test
 #: compares the two so they cannot drift apart.
@@ -1510,10 +1594,7 @@ def missing_room_metadata_plugins(
     component whose module is missing stops Prosody from starting, so this
     gates the proposal.
     """
-    readable = [directory for directory in plugin_dirs if directory.is_dir()]
-    if not readable:
-        return None
-    if not any(read(directory / ROOM_METADATA_PLUGIN) is not None for directory in readable):
+    if plugin_file_absent(plugin_dirs, read, ROOM_METADATA_PLUGIN):
         return ROOM_METADATA_PLUGIN
     return None
 
@@ -1616,21 +1697,46 @@ def propose_prosody_fixes(
                 notes.append(f"verify {ROOM_METADATA_PLUGIN} is installed before restarting "
                              "Prosody")
 
-    # --- the module names on the MUC ---------------------------------------
-    if enable:
-        span = lua_table_span(main_muc.body, "modules_enabled")
+    # --- the identity the main host advertises to clients ------------------
+    # mod_features_identity is what turns the component's jitsi-add-identity
+    # into a disco#info entry; without it lib-jitsi-meet never learns the
+    # component's address, drops every message it sends, and getMetadata()
+    # stays {} on the client.
+    host_enable: list[str] = []
+    main_host = find_main_host(blocks, domain, main_muc)
+    if (
+        (has_component or adding_component)
+        and main_host is not None
+        and FEATURES_IDENTITY_MODULE not in lua_module_names(main_host.body)
+    ):
+        if plugin_file_absent(plugin_dirs, read, FEATURES_IDENTITY_PLUGIN):
+            proposals.append(Proposal(
+                "prosody.features_identity",
+                "cannot advertise the room metadata component to clients",
+                reason=f"{FEATURES_IDENTITY_PLUGIN} is not installed in the Prosody plugin "
+                       "paths; upgrade the package (apt install --only-upgrade "
+                       "jitsi-meet-prosody) and rerun --fix",
+            ))
+        else:
+            host_enable.append(FEATURES_IDENTITY_MODULE)
+
+    # --- the module names, on the MUC and on the main host -----------------
+    for block, names in ((main_muc, enable), (main_host, host_enable)):
+        if not names or block is None:
+            continue
+        span = lua_table_span(block.body, "modules_enabled")
         if span is None:
             proposals.append(Proposal(
-                "prosody.modules_enabled", f'cannot add {", ".join(enable)} automatically',
-                reason=f'"{main_muc.name}" has no modules_enabled table, and creating one '
+                "prosody.modules_enabled", f'cannot add {", ".join(names)} automatically',
+                reason=f'"{block.name}" has no modules_enabled table, and creating one '
                        "would replace Prosody's global module list rather than extend it; "
                        "add the module names by hand",
             ))
         else:
-            absolute = (main_muc.start + span[0], main_muc.start + span[1])
-            edits.append((absolute[1], lambda current, at=absolute, names=tuple(enable):
+            absolute = (block.start + span[0], block.start + span[1])
+            edits.append((absolute[1], lambda current, at=absolute, names=tuple(names):
                           add_lua_modules(current, at, names)))
-            notes.append(f'{", ".join(enable)} on "{main_muc.name}"')
+            notes.append(f'{", ".join(names)} on "{block.name}"')
 
     if not edits:
         return proposals
@@ -1638,7 +1744,12 @@ def propose_prosody_fixes(
     new_text = text
     for _, transform in edits:
         new_text = transform(new_text)
-    check_id = "prosody.room_metadata" if adding_component else "prosody.modules_enabled"
+    if adding_component:
+        check_id = "prosody.room_metadata"
+    elif enable:
+        check_id = "prosody.modules_enabled"
+    else:
+        check_id = "prosody.features_identity"
     proposals.append(Proposal(
         check_id,
         f"edit {deployment.prosody_config.name}: " + ", ".join(notes),
@@ -2102,7 +2213,12 @@ def run_fix_section(
         proposals.extend(propose_jicofo_fix(
             deployment, custom_jicofo_path(deployment), bridge_url=args.bridge_url
         ))
-    if actionable & {"prosody.force_async_transcription", "prosody.muc_meeting_id"}:
+    if actionable & {
+        "prosody.force_async_transcription",
+        "prosody.muc_meeting_id",
+        "prosody.room_metadata",
+        "prosody.features_identity",
+    }:
         proposals.extend(propose_prosody_fixes(deployment, plugin_dirs))
     if "meet.transcription.enabled" in actionable:
         proposals.extend(propose_meet_fix(deployment))

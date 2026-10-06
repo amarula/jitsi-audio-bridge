@@ -183,6 +183,41 @@ Component "conference.example.com" "muc"
 
 Then `systemctl restart prosody`.
 
+#### Clients also need the component advertised
+
+Forcing the flag is not enough for the browser. lib-jitsi-meet accepts messages
+from a component only if it discovered that component's address in the main
+host's `disco#info` when it connected; a client that is never told about
+`metadata.<domain>` drops every metadata message it receives as coming from an
+unknown sender. The visible symptom is
+
+```js
+APP.store.getState()['features/base/conference'].conference
+    .getMetadataHandler().getMetadata()   // {} — forever
+```
+
+and, in the UI, transcription falling back to dialling Jigasi and failing
+("Transcribing failed"). Jicofo is unaffected: it is a MUC occupant, and the
+component sends it the metadata directly.
+
+`mod_room_metadata_component` announces itself with `jitsi-add-identity`, which
+`mod_features_identity` turns into that disco entry. Enable it on the **main**
+VirtualHost — the one with `bosh`/`websocket`, not the MUC component:
+
+```lua
+VirtualHost "example.com"
+    modules_enabled = {
+        -- ... existing modules ...
+        "features_identity";
+    }
+```
+
+Stock configurations generated since June 2025 already list it. An older, hand
+edited or never-regenerated `prosody.cfg.lua` may not: a server upgrade adds the
+module file without touching your site config (dpkg keeps the local version), so
+the two drift apart silently. The checker reports this as
+`prosody.features_identity`.
+
 > **Note.** This only forces `asyncTranscription`. For transcription to start,
 > the room must also have `recording.isTranscribingEnabled` set — normally by a
 > user turning transcription on. To transcribe every room unconditionally,
@@ -407,7 +442,9 @@ It proposes, each only when its check failed:
   removed upstream in June 2026). If `mod_room_metadata_component.lua` is not
   installed, that part is refused with the upgrade command instead of
   proposed, because a component whose module is missing stops Prosody from
-  starting.
+  starting. The same treatment applies to `mod_features_identity.lua`, which
+  puts the component into the client's disco#info — that name goes on the main
+  VirtualHost's `modules_enabled`, not the MUC's.
 - **jitsi-meet** — the client config with `transcription: { enabled: true }`
   inserted; a commented-out sample block is left as it is and a live one added.
 

@@ -212,6 +212,7 @@ plugin_paths = { "/usr/share/jitsi-meet/prosody-plugins/" }
 VirtualHost "meet.example.com"
     modules_enabled = {
         "room_metadata";
+        "features_identity";
     }
 
 Component "conference.meet.example.com" "muc"
@@ -227,6 +228,7 @@ Component "metadata.meet.example.com" "room_metadata_component"
 """
 
 PROSODY_WITHOUT_FORCE = PROSODY.replace('        "force_async_transcription";\n', "")
+PROSODY_WITHOUT_IDENTITY = PROSODY.replace('        "features_identity";\n', "")
 
 FORCE_MODULE = """
 local util = module:require 'util';
@@ -1168,3 +1170,99 @@ def test_prosody_warns_when_the_module_never_publishes_the_metadata(tmp_path: Pa
         _reader({publishing: PROSODY_MODULE_LUA}),
     )
     assert not [c for c in checks if c.id.endswith(".publish")]
+
+
+def test_prosody_requires_features_identity_for_clients_to_see_the_metadata(
+    tmp_path: Path,
+) -> None:
+    """The identity is how clients learn the component exists at all."""
+    plugin_dir = tmp_path / "plugins"
+    plugin_dir.mkdir()
+    identity = plugin_dir / "mod_features_identity.lua"
+    identity.write_text("-- identity\n")
+    reader = _reader({identity: "-- identity\n"})
+
+    checks = check_prosody(
+        _deployment(prosody_text=PROSODY), "meet.example.com", [plugin_dir], reader
+    )
+    assert _status(checks, "prosody.features_identity") is Status.PASS
+
+    checks = check_prosody(
+        _deployment(prosody_text=PROSODY_WITHOUT_IDENTITY), "meet.example.com",
+        [plugin_dir], reader,
+    )
+    check = next(c for c in checks if c.id == "prosody.features_identity")
+    assert check.status is Status.FAIL
+    # The client-side symptom is what an admin sees, so it is in the message.
+    assert "getMetadata() stays {}" in check.summary
+    assert 'modules_enabled on "meet.example.com"' in check.fix
+
+
+def test_prosody_features_identity_reports_a_missing_plugin_file(tmp_path: Path) -> None:
+    plugin_dir = tmp_path / "plugins"
+    plugin_dir.mkdir()  # readable, but the identity module is not installed
+    checks = check_prosody(
+        _deployment(prosody_text=PROSODY_WITHOUT_IDENTITY), "meet.example.com",
+        [plugin_dir], _reader({}),
+    )
+    check = next(c for c in checks if c.id == "prosody.features_identity")
+    assert check.status is Status.FAIL
+    assert "jitsi-meet-prosody" in check.fix
+
+
+def test_prosody_features_identity_is_not_checkable_without_the_component() -> None:
+    """No component, nothing to advertise: the check stays out of the way."""
+    without = PROSODY_WITHOUT_IDENTITY.replace(
+        'Component "metadata.meet.example.com" "room_metadata_component"\n'
+        '    muc_component = "conference.meet.example.com"\n',
+        "",
+    )
+    checks = check_prosody(
+        _deployment(prosody_text=without), "meet.example.com", [], lambda p: None
+    )
+    assert not [c for c in checks if c.id == "prosody.features_identity"]
+
+
+def test_propose_prosody_advertises_the_identity_on_the_main_host(tmp_path: Path) -> None:
+    plugin_dir = tmp_path / "plugins"
+    plugin_dir.mkdir()
+    module = plugin_dir / "mod_force_async_transcription.lua"
+    module.write_text(PROSODY_MODULE_LUA)
+    identity = plugin_dir / "mod_features_identity.lua"
+    identity.write_text("-- identity\n")
+    reader = _reader({module: PROSODY_MODULE_LUA, identity: "-- identity\n"})
+
+    proposals = propose_prosody_fixes(
+        _deployment(prosody_text=PROSODY_WITHOUT_IDENTITY), [plugin_dir], read=reader
+    )
+    (site,) = proposals
+    assert site.check_id == "prosody.features_identity"
+    assert '"features_identity";' in site.new_text
+    # On the host clients query, not on the MUC.
+    host_table = lua_table(
+        lua_uncomment(site.new_text).split("Component")[0], "modules_enabled"
+    )
+    assert "features_identity" in lua_string_list(host_table)
+
+    checks = check_prosody(
+        _deployment(prosody_text=site.new_text), "meet.example.com", [plugin_dir], reader
+    )
+    assert _status(checks, "prosody.features_identity") is Status.PASS
+
+    # Running the builder again on its own output proposes nothing.
+    assert propose_prosody_fixes(
+        _deployment(prosody_text=site.new_text), [plugin_dir], read=reader
+    ) == []
+
+
+def test_propose_prosody_refuses_the_identity_when_its_module_is_missing(
+    tmp_path: Path,
+) -> None:
+    plugin_dir = tmp_path / "plugins"
+    plugin_dir.mkdir()  # readable, module absent: Prosody would log a load error
+    proposals = propose_prosody_fixes(
+        _deployment(prosody_text=PROSODY_WITHOUT_IDENTITY), [plugin_dir], read=_reader({})
+    )
+    blocked = next(p for p in proposals if p.check_id == "prosody.features_identity")
+    assert blocked.target is None
+    assert "jitsi-meet-prosody" in blocked.reason
