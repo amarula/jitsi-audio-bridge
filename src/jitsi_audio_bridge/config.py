@@ -52,6 +52,9 @@ DEFAULTS: dict[str, dict[str, str]] = {
         "interleave": "true",
         "merge_gap_seconds": "1.0",
     },
+    "ai": {
+        "serialize_requests": "true",
+    },
     "whisper": {
         "url": "https://whisper.omnia.amarulasolutions.com/transcribe-b64",
         "timeout": "600",
@@ -118,6 +121,18 @@ class StorageConfig:
 
 
 @dataclass(frozen=True)
+class AiConfig:
+    """How the two AI services are used together."""
+
+    #: Whisper and Ollama usually run on one machine, often on one GPU, where
+    #: a model loaded by one starves the other — the starved service answers
+    #: 5xx until its own model is back.  Sending one request at a time keeps
+    #: the daemon from doing that to itself when two meetings overlap.  Off is
+    #: right when the two services are on separate machines.
+    serialize_requests: bool
+
+
+@dataclass(frozen=True)
 class TranscriptConfig:
     """How the transcript is assembled from the recordings."""
 
@@ -169,6 +184,7 @@ class Config:
     server: ServerConfig
     storage: StorageConfig
     transcript: TranscriptConfig
+    ai: AiConfig
     whisper: EndpointConfig
     ollama: OllamaConfig
     smtp: SmtpConfig
@@ -317,6 +333,9 @@ def load_config(path: str | os.PathLike[str] | None = None) -> Config:
             session_grace_seconds=resolver.number(
                 "storage", "session_grace_seconds", minimum=0.0
             ),
+        ),
+        ai=AiConfig(
+            serialize_requests=resolver.boolean("ai", "serialize_requests"),
         ),
         transcript=TranscriptConfig(
             interleave=resolver.boolean("transcript", "interleave"),

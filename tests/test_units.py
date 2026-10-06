@@ -10,6 +10,8 @@ import base64
 import json
 import math
 import struct
+import threading
+import time
 import wave
 from pathlib import Path
 
@@ -975,6 +977,66 @@ def test_timeline_write_leaves_no_temporary_file(tmp_path: Path) -> None:
     assert [item.name for item in tmp_path.iterdir()] == ["timeline.json"]
     assert SessionTimeline.load(path) == timeline
     assert SessionTimeline.load(tmp_path / "absent.json") is None
+
+
+
+
+def test_ai_requests_are_held_one_at_a_time_by_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, clean_env: None
+) -> None:
+    """Two meetings overlapping must not have one starve the other's model."""
+    from jitsi_audio_bridge import ai_client
+
+    monkeypatch.setattr(config_module, "SEARCH_PATHS", (tmp_path / "nothing.ini",))
+    config = load_config()
+    audio = tmp_path / "participant-x.wav"
+    recorder = OpusParticipantRecorder(audio)
+    for packet in _encode_tone(frames=5):
+        recorder.write_packet(packet)
+    recorder.close()
+
+    live = 0
+    peak = 0
+    lock = threading.Lock()
+
+    class Response:
+        status_code = 200
+        def raise_for_status(self) -> None: ...
+        def json(self) -> dict:
+            return {"text": "hello"}
+
+    def slow_post(*args: object, **kwargs: object) -> Response:
+        nonlocal live, peak
+        with lock:
+            live += 1
+            peak = max(peak, live)
+        time.sleep(0.05)
+        with lock:
+            live -= 1
+        return Response()
+
+    monkeypatch.setattr(ai_client.requests, "post", slow_post)
+
+    def run() -> None:
+        ai_client.transcribe_audio(audio, config.whisper)
+
+    def both() -> int:
+        nonlocal peak
+        peak = 0
+        threads = [threading.Thread(target=run) for _ in range(3)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        return peak
+
+    ai_client.serialize_requests(True)
+    assert both() == 1
+
+    # Split across machines, they may run at once.
+    ai_client.serialize_requests(False)
+    assert both() == 3
+    ai_client.serialize_requests(True)
 
 
 

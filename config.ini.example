@@ -57,6 +57,14 @@ interleave = true
 ; they are transcribed.
 merge_gap_seconds = 1.0
 
+[ai]
+; Whisper and Ollama usually run on the same machine, often on the same GPU,
+; where a model loaded by one starves the other -- the starved service answers
+; 5xx until its own model is back.  With this on, the daemon asks one of them
+; at a time, so two overlapping meetings cannot do that to each other.  Turn
+; it off when the two services are on separate machines.
+serialize_requests = true
+
 [whisper]
 ; Endpoint accepting {"audio_base64": ..., "filename": ...} and returning
 ; {"text": ...}.

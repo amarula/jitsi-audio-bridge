@@ -15,7 +15,9 @@ No path handling beyond reading the file it is handed.
 from __future__ import annotations
 
 import base64
+import contextlib
 import logging
+import threading
 import time
 from pathlib import Path
 
@@ -36,6 +38,20 @@ _LANGUAGE_SAMPLE_CHARS = 1500
 #: retried: the request itself is wrong.
 _ATTEMPT_BACKOFF_SECONDS = (1.0, 3.0)
 
+#: Whisper and Ollama usually share a machine, and often a GPU: a model loaded
+#: by one can starve the other, which then answers 5xx until its own model is
+#: back.  With two sessions in flight — one summarising while the other
+#: transcribes — the daemon would do that to itself, so by default it asks one
+#: service at a time.  See [ai] serialize_requests.
+_AI_LOCK = threading.Lock()
+_serialize_requests = True
+
+
+def serialize_requests(enabled: bool) -> None:
+    """Set whether AI requests are held one at a time (see [ai])."""
+    global _serialize_requests
+    _serialize_requests = enabled
+
 
 def _post_json(url: str, payload: dict[str, object], endpoint: EndpointConfig) -> dict | None:
     """POST *payload* and return the JSON object, retrying a 5xx answer.
@@ -45,13 +61,15 @@ def _post_json(url: str, payload: dict[str, object], endpoint: EndpointConfig) -
     meeting to a service that was busy for a second.
     """
     attempts = len(_ATTEMPT_BACKOFF_SECONDS) + 1
+    guard = _AI_LOCK if _serialize_requests else contextlib.nullcontext()
     for attempt in range(1, attempts + 1):
         if attempt > 1:
             time.sleep(_ATTEMPT_BACKOFF_SECONDS[attempt - 2])
         try:
-            response = requests.post(
-                url, json=payload, verify=endpoint.verify_tls, timeout=endpoint.timeout
-            )
+            with guard:
+                response = requests.post(
+                    url, json=payload, verify=endpoint.verify_tls, timeout=endpoint.timeout
+                )
             if response.status_code >= 500:
                 logger.warning(
                     "%s answered %d (attempt %d/%d)",

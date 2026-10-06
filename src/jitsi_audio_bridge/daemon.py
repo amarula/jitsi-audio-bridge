@@ -43,7 +43,7 @@ from urllib.parse import parse_qs, urlparse
 import websockets
 
 from . import __version__
-from .ai_client import generate_summary, transcribe_audio
+from .ai_client import generate_summary, serialize_requests, transcribe_audio
 from .audio import (
     EXTRACTED_AUDIO_NAME,
     METADATA_FILENAME,
@@ -1115,6 +1115,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         config = load_config(args.config)
+        serialize_requests(config.ai.serialize_requests)
         # Directory mode is handed an existing directory, so the recordings
         # directory is only required when serving.
         if args.process_dir is None:

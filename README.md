@@ -194,6 +194,21 @@ framing, or a meeting processed from a directory someone else recorded) keeps
 the per-participant shape whatever this is set to. `merge_gap_seconds` is how
 much silence between two runs of one speaker still counts as the same turn.
 
+### `[ai]`
+
+| Option | Type | Default | Environment |
+|---|---|---|---|
+| `serialize_requests` | boolean | `true` | `JITSI_AUDIO_BRIDGE_AI_SERIALIZE_REQUESTS` |
+
+Whisper and Ollama usually run on one machine, often on one GPU, where a model
+loaded by one starves the other: the starved service answers 5xx until its own
+model is back, which is what a `503 Service Unavailable` from Whisper means
+while a large Ollama model is resident. With this on — the default — the daemon
+holds one AI request at a time, so two meetings finishing together cannot do
+that to each other: one meeting's summary waits for the other's transcription
+rather than evicting its model. Turn it off when the two services are on
+separate machines.
+
 ### `[whisper]`
 
 | Option | Type | Default | Environment |
