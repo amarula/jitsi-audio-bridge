@@ -584,11 +584,16 @@ marks Jibri unhealthy — a state it does not re-advertise until something chang
 healthy the rest of the deployment is. Give Jibri a tree of its own:
 
 ```sh
+sudo grep -rn "recordings-directory\|recording_directory" /etc/jitsi/jibri/
 sudo install -d -o jibri -g jibri -m 0750 /srv/jibri-recordings
-sudo sed -i 's|^\( *recordings-directory *= *\).*|\1"/srv/jibri-recordings"|' \
-    /etc/jitsi/jibri/jibri.conf
+# set it where the grep found it — recordings-directory in jibri.conf, or the
+# legacy config.json's recording_directory — then:
 sudo systemctl restart jibri
 ```
+
+The two spellings matter: Jibri's own default is `/tmp/recordings`, so a value
+of `/srv/recordings` is always written down somewhere, and on a host upgraded
+from an older Jibri that place is the legacy `config.json`.
 
 The checker reports the collision as `recording.directory`, comparing Jibri's
 setting with this bridge's own `[storage] recordings_dir`.

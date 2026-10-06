@@ -844,12 +844,17 @@ def load_deployment(args: argparse.Namespace, require_files: bool = True) -> Dep
         raise DiscoveryError(f"--jvb-conf: {jvb_conf} does not exist")
 
     # Jibri is often on its own host; where its configuration is readable it
-    # settles the one setting Jicofo and Jibri have to agree on.
+    # settles the settings Jicofo and Jibri have to agree on.  Both files are
+    # read when both exist: a host can carry the current jibri.conf with only
+    # some of its settings in it, and the rest in the legacy config.json.
     jibri_conf = Path(args.jibri_conf) if args.jibri_conf else DEFAULT_JIBRI_CONF
     if args.jibri_conf and not jibri_conf.is_file():
         raise DiscoveryError(f"--jibri-conf: {jibri_conf} does not exist")
-    if not args.jibri_conf and not jibri_conf.is_file():
-        jibri_conf = DEFAULT_JIBRI_LEGACY_CONF
+    jibri_texts = [text for text in (_read(jibri_conf),) if text is not None]
+    if not args.jibri_conf and DEFAULT_JIBRI_LEGACY_CONF.is_file():
+        legacy_text = _read(DEFAULT_JIBRI_LEGACY_CONF)
+        if legacy_text is not None:
+            jibri_texts.append(legacy_text)
 
     domain = args.domain
     if prosody_config is None or meet_config is None:
@@ -892,7 +897,7 @@ def load_deployment(args: argparse.Namespace, require_files: bool = True) -> Dep
         prosody_text=_read(prosody_config),
         meet_text=_read(meet_config),
         jibri_config=jibri_conf if jibri_conf.is_file() else None,
-        jibri_text=_read(jibri_conf),
+        jibri_text="\n".join(jibri_texts) if jibri_texts else None,
         notes=notes,
     )
 
@@ -1316,11 +1321,13 @@ _JIBRI_LEGACY_BREWERY = re.compile(
     r"""["']?brewery[_-]?jid["']?\s*[:=]\s*["']([^"']+)["']"""
 )
 
-#: Both packages default to this tree, which is why a single host needs the
-#: two told apart: the bridge owns it (user jitsi-bridge), and Jibri runs as
-#: user jibri.
+#: Both packages default to the same tree, which is why a single host needs
+#: the two told apart: the bridge owns it (user jitsi-bridge), and Jibri runs
+#: as user jibri.  ``recordings-directory`` is the current spelling and
+#: ``recording_directory`` the legacy ``config.json`` one — a deployment can
+#: hold either, and a reader that knows only one of them sees nothing at all.
 _JIBRI_RECORDINGS_KEY = re.compile(
-    r"""["']?recordings[_-]directory["']?\s*[:=]\s*["']?([^"'\s,}]+)"""
+    r"""["']?recordings?[_-]directory["']?\s*[:=]\s*["']?([^"'\s,}]+)"""
 )
 
 

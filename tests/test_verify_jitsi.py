@@ -1348,7 +1348,9 @@ jibri {
 
 def test_jibri_recordings_directory_reads_both_shapes() -> None:
     assert jibri_recordings_directory(JIBRI_CONF) == "/srv/recordings"
-    legacy = '{\n  "recordings_directory": "/srv/jibri"\n}\n'
+    # The legacy config.json spells it without the plural, and a reader that
+    # knows only the current spelling reports "unknown" on such a host.
+    legacy = '{\n  "recording_directory": "/srv/jibri"\n}\n'
     assert jibri_recordings_directory(legacy) == "/srv/jibri"
     assert jibri_recordings_directory("jibri {\n  recording { }\n}\n") is None
 
