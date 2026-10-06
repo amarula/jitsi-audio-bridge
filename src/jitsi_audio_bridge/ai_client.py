@@ -15,7 +15,6 @@ No path handling beyond reading the file it is handed.
 from __future__ import annotations
 
 import base64
-import contextlib
 import logging
 import threading
 import time
@@ -38,19 +37,19 @@ _LANGUAGE_SAMPLE_CHARS = 1500
 #: retried: the request itself is wrong.
 _ATTEMPT_BACKOFF_SECONDS = (1.0, 3.0)
 
-#: Whisper and Ollama usually share a machine, and often a GPU: a model loaded
-#: by one can starve the other, which then answers 5xx until its own model is
-#: back.  With two sessions in flight — one summarising while the other
-#: transcribes — the daemon would do that to itself, so by default it asks one
-#: service at a time.  See [ai] serialize_requests.
-_AI_LOCK = threading.Lock()
-_serialize_requests = True
+#: Whisper and Ollama usually share a machine, and often a GPU, whose queue
+#: holds one request at a time.  Asking for more than the device serves is
+#: what produces 5xx answers while one model evicts another — including when
+#: two meetings overlap and one summarises while the other transcribes — so
+#: the daemon holds its own requests to the same depth.  See
+#: [ai] max_concurrent_requests.
+_AI_SLOTS = threading.Semaphore(1)
 
 
-def serialize_requests(enabled: bool) -> None:
-    """Set whether AI requests are held one at a time (see [ai])."""
-    global _serialize_requests
-    _serialize_requests = enabled
+def set_concurrency(limit: int) -> None:
+    """Set how many AI requests may be in flight at once (see [ai])."""
+    global _AI_SLOTS
+    _AI_SLOTS = threading.Semaphore(max(1, limit))
 
 
 def _post_json(url: str, payload: dict[str, object], endpoint: EndpointConfig) -> dict | None:
@@ -61,12 +60,13 @@ def _post_json(url: str, payload: dict[str, object], endpoint: EndpointConfig) -
     meeting to a service that was busy for a second.
     """
     attempts = len(_ATTEMPT_BACKOFF_SECONDS) + 1
-    guard = _AI_LOCK if _serialize_requests else contextlib.nullcontext()
     for attempt in range(1, attempts + 1):
         if attempt > 1:
             time.sleep(_ATTEMPT_BACKOFF_SECONDS[attempt - 2])
         try:
-            with guard:
+            # Held for the whole request, response and all: the device is busy
+            # until the answer is in, so waiting here is the point.
+            with _AI_SLOTS:
                 response = requests.post(
                     url, json=payload, verify=endpoint.verify_tls, timeout=endpoint.timeout
                 )

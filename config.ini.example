@@ -58,12 +58,13 @@ interleave = true
 merge_gap_seconds = 1.0
 
 [ai]
-; Whisper and Ollama usually run on the same machine, often on the same GPU,
-; where a model loaded by one starves the other -- the starved service answers
-; 5xx until its own model is back.  With this on, the daemon asks one of them
-; at a time, so two overlapping meetings cannot do that to each other.  Turn
-; it off when the two services are on separate machines.
-serialize_requests = true
+; How many requests the daemon may have in flight against Whisper and Ollama
+; together.  They usually share one machine, often one GPU, whose queue takes
+; one request at a time -- asking for more is what makes one model evict
+; another and the starved service answer 5xx.  1 matches a single GPU: the
+; daemon then waits for each request to finish before sending the next.  Raise
+; it when the two services are on separate machines.
+max_concurrent_requests = 1
 
 [whisper]
 ; Endpoint accepting {"audio_base64": ..., "filename": ...} and returning

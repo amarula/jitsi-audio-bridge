@@ -981,7 +981,7 @@ def test_timeline_write_leaves_no_temporary_file(tmp_path: Path) -> None:
 
 
 
-def test_ai_requests_are_held_one_at_a_time_by_default(
+def test_ai_requests_are_held_to_the_configured_depth(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, clean_env: None
 ) -> None:
     """Two meetings overlapping must not have one starve the other's model."""
@@ -1030,13 +1030,16 @@ def test_ai_requests_are_held_one_at_a_time_by_default(
             thread.join()
         return peak
 
-    ai_client.serialize_requests(True)
+    # The default matches a single GPU, which queues one at a time.
+    ai_client.set_concurrency(1)
     assert both() == 1
 
-    # Split across machines, they may run at once.
-    ai_client.serialize_requests(False)
+    # Split across machines, or a device that takes more, they may run at once.
+    ai_client.set_concurrency(3)
     assert both() == 3
-    ai_client.serialize_requests(True)
+    ai_client.set_concurrency(2)
+    assert both() == 2
+    ai_client.set_concurrency(1)
 
 
 
@@ -1159,6 +1162,15 @@ def test_new_settings_default_on(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     assert config.storage.capture_timeline is True
     assert config.transcript.interleave is True
     assert config.transcript.merge_gap_seconds == 1.0
+    # One at a time: what a single GPU queues.
+    assert config.ai.max_concurrent_requests == 1
+
+
+def test_a_concurrency_below_one_is_rejected(tmp_path: Path, clean_env: None) -> None:
+    path = tmp_path / "config.ini"
+    path.write_text("[ai]\nmax_concurrent_requests = 0\n", encoding="utf-8")
+    with pytest.raises(ConfigError, match="max_concurrent_requests"):
+        load_config(path)
 
 
 def test_a_malformed_merge_gap_is_rejected(tmp_path: Path, clean_env: None) -> None:

@@ -198,16 +198,17 @@ much silence between two runs of one speaker still counts as the same turn.
 
 | Option | Type | Default | Environment |
 |---|---|---|---|
-| `serialize_requests` | boolean | `true` | `JITSI_AUDIO_BRIDGE_AI_SERIALIZE_REQUESTS` |
+| `max_concurrent_requests` | 1–64 | `1` | `JITSI_AUDIO_BRIDGE_AI_MAX_CONCURRENT_REQUESTS` |
 
-Whisper and Ollama usually run on one machine, often on one GPU, where a model
-loaded by one starves the other: the starved service answers 5xx until its own
-model is back, which is what a `503 Service Unavailable` from Whisper means
-while a large Ollama model is resident. With this on — the default — the daemon
-holds one AI request at a time, so two meetings finishing together cannot do
-that to each other: one meeting's summary waits for the other's transcription
-rather than evicting its model. Turn it off when the two services are on
-separate machines.
+Whisper and Ollama usually run on one machine, often on one GPU, and a GPU's
+queue takes one request at a time. Asking for more than the device serves is
+what makes one model evict another, and the starved service answers 5xx until
+its own model is back — that is what a `503 Service Unavailable` from Whisper
+means while a large Ollama model is resident. `1` matches a single GPU: the
+daemon waits for each request to complete before sending the next, so two
+meetings finishing together cannot do that to each other — one meeting's
+summary waits for the other's transcription. Raise it when the two services
+are on separate machines and the device underneath can take more.
 
 ### `[whisper]`
 

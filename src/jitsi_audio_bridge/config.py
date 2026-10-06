@@ -53,7 +53,7 @@ DEFAULTS: dict[str, dict[str, str]] = {
         "merge_gap_seconds": "1.0",
     },
     "ai": {
-        "serialize_requests": "true",
+        "max_concurrent_requests": "1",
     },
     "whisper": {
         "url": "https://whisper.omnia.amarulasolutions.com/transcribe-b64",
@@ -124,12 +124,13 @@ class StorageConfig:
 class AiConfig:
     """How the two AI services are used together."""
 
-    #: Whisper and Ollama usually run on one machine, often on one GPU, where
-    #: a model loaded by one starves the other — the starved service answers
-    #: 5xx until its own model is back.  Sending one request at a time keeps
-    #: the daemon from doing that to itself when two meetings overlap.  Off is
-    #: right when the two services are on separate machines.
-    serialize_requests: bool
+    #: How many requests the daemon may have in flight against Whisper and
+    #: Ollama together.  Whisper and Ollama usually share one machine, and
+    #: often one GPU, which queues what it is given — one at a time, usually.
+    #: Asking for more than the device serves is what produces 5xx answers
+    #: while one model evicts another, so this defaults to the queue depth of
+    #: a single GPU.  Raise it when the services run on separate machines.
+    max_concurrent_requests: int
 
 
 @dataclass(frozen=True)
@@ -335,7 +336,9 @@ def load_config(path: str | os.PathLike[str] | None = None) -> Config:
             ),
         ),
         ai=AiConfig(
-            serialize_requests=resolver.boolean("ai", "serialize_requests"),
+            max_concurrent_requests=resolver.integer(
+                "ai", "max_concurrent_requests", minimum=1, maximum=64
+            ),
         ),
         transcript=TranscriptConfig(
             interleave=resolver.boolean("transcript", "interleave"),
