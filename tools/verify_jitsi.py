@@ -1724,11 +1724,12 @@ local function write_metadata(room)
         return;
     end
 
+    local participants = collect(room);
     local encoded = json.encode({
         room_name = jid.node(room.jid);
         meeting_id = meeting_id;
         source = 'audio_bridge_metadata';
-        participants = collect(room);
+        participants = participants;
     });
     if not encoded then
         module:log('error', 'cannot encode the metadata of %s', room.jid);
@@ -1754,7 +1755,11 @@ local function write_metadata(room)
     if not moved then
         module:log('error', 'cannot move %s into place: %s', temporary,
             move_err or 'unknown error');
+        return;
     end
+
+    module:log('info', 'Wrote metadata for %s: %d participant(s), meeting id %s',
+        room.jid, #participants, meeting_id);
 end
 
 local function remember_email(room, occupant, session)
