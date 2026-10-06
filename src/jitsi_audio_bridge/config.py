@@ -54,6 +54,7 @@ DEFAULTS: dict[str, dict[str, str]] = {
     },
     "ai": {
         "max_concurrent_requests": "1",
+        "max_attempts": "5",
     },
     "whisper": {
         "url": "https://whisper.omnia.amarulasolutions.com/transcribe-b64",
@@ -131,6 +132,11 @@ class AiConfig:
     #: while one model evicts another, so this defaults to the queue depth of
     #: a single GPU.  Raise it when the services run on separate machines.
     max_concurrent_requests: int
+    #: How many times one request may be tried before it is given up on: the
+    #: first attempt plus this many minus one retries, each waiting twice as
+    #: long as the one before.  Five spans about fifteen seconds, which is the
+    #: scale of a model being evicted from a shared GPU and loaded again.
+    max_attempts: int
 
 
 @dataclass(frozen=True)
@@ -339,6 +345,7 @@ def load_config(path: str | os.PathLike[str] | None = None) -> Config:
             max_concurrent_requests=resolver.integer(
                 "ai", "max_concurrent_requests", minimum=1, maximum=64
             ),
+            max_attempts=resolver.integer("ai", "max_attempts", minimum=1, maximum=10),
         ),
         transcript=TranscriptConfig(
             interleave=resolver.boolean("transcript", "interleave"),

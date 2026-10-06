@@ -31,11 +31,18 @@ logger = logging.getLogger(__name__)
 _LANGUAGE_SAMPLE_CHARS = 1500
 
 #: A 5xx answer means the service is there but not serving — restarting,
-#: reloading a model, momentarily overloaded — and the same request usually
-#: works a moment later.  Transcription is now one request per speaking turn,
-#: so a brief outage used to cost every turn in flight.  A 4xx is never
-#: retried: the request itself is wrong.
-_ATTEMPT_BACKOFF_SECONDS = (1.0, 3.0)
+#: reloading a model, or waiting for the GPU its model shares — and the same
+#: request usually works a moment later.  Transcription is one request per
+#: speaking turn, so a brief outage used to cost every turn in flight.  A 4xx
+#: is never retried: the request itself is wrong.
+#:
+#: Each wait is twice the one before it — 1s, 2s, 4s, 8s, … — because the
+#: thing being waited for is a model being loaded, which takes seconds and
+#: then takes them all at once.  The ceiling keeps a long schedule sane.
+_BACKOFF_BASE_SECONDS = 1.0
+_BACKOFF_CEILING_SECONDS = 30.0
+DEFAULT_MAX_ATTEMPTS = 5
+_attempts = DEFAULT_MAX_ATTEMPTS
 
 #: Whisper and Ollama usually share a machine, and often a GPU, whose queue
 #: holds one request at a time.  Asking for more than the device serves is
@@ -46,10 +53,18 @@ _ATTEMPT_BACKOFF_SECONDS = (1.0, 3.0)
 _AI_SLOTS = threading.Semaphore(1)
 
 
-def set_concurrency(limit: int) -> None:
-    """Set how many AI requests may be in flight at once (see [ai])."""
-    global _AI_SLOTS
-    _AI_SLOTS = threading.Semaphore(max(1, limit))
+def set_ai_limits(max_concurrent_requests: int, max_attempts: int) -> None:
+    """Apply the AI limits from the configuration (see [ai])."""
+    global _AI_SLOTS, _attempts
+    _AI_SLOTS = threading.Semaphore(max(1, max_concurrent_requests))
+    _attempts = max(1, max_attempts)
+
+
+def backoff_seconds(attempt: int) -> float:
+    """How long to wait before *attempt*, counting from 1.  0 for the first."""
+    if attempt < 2:
+        return 0.0
+    return min(_BACKOFF_CEILING_SECONDS, _BACKOFF_BASE_SECONDS * 2 ** (attempt - 2))
 
 
 def _post_json(url: str, payload: dict[str, object], endpoint: EndpointConfig) -> dict | None:
@@ -59,42 +74,39 @@ def _post_json(url: str, payload: dict[str, object], endpoint: EndpointConfig) -
     the same contract the callers had before, only with fewer ways to lose a
     meeting to a service that was busy for a second.
     """
-    attempts = len(_ATTEMPT_BACKOFF_SECONDS) + 1
+    attempts = _attempts
     for attempt in range(1, attempts + 1):
-        if attempt > 1:
-            time.sleep(_ATTEMPT_BACKOFF_SECONDS[attempt - 2])
+        pause = backoff_seconds(attempt)
+        if pause:
+            time.sleep(pause)
         try:
-            # Held for the whole request, response and all: the device is busy
-            # until the answer is in, so waiting here is the point.
+            # Held for the whole request: the device is busy until the answer
+            # is in, so waiting here is the point.
             with _AI_SLOTS:
                 response = requests.post(
                     url, json=payload, verify=endpoint.verify_tls, timeout=endpoint.timeout
                 )
-            if response.status_code >= 500:
-                logger.warning(
-                    "%s answered %d (attempt %d/%d)",
-                    url,
-                    response.status_code,
-                    attempt,
-                    attempts,
-                )
-                continue
-            response.raise_for_status()
-            body = response.json()
         except requests.RequestException as exc:
             logger.warning(
                 "request to %s failed (attempt %d/%d): %s", url, attempt, attempts, exc
             )
             continue
-        except ValueError as exc:  # a non-JSON body
-            logger.warning(
-                "%s returned a malformed response (attempt %d/%d): %s",
-                url,
-                attempt,
-                attempts,
-                exc,
-            )
+
+        status = response.status_code
+        if status >= 500:
+            # The service is there and cannot serve right now.
+            logger.warning("%s answered %d (attempt %d/%d)", url, status, attempt, attempts)
             continue
+        if status >= 400:
+            # The request itself is wrong: asking it again changes nothing.
+            logger.error("%s answered %d; not retrying", url, status)
+            return None
+
+        try:
+            body = response.json()
+        except ValueError as exc:  # a non-JSON body, on a status that looked fine
+            logger.error("%s returned a malformed response: %s", url, exc)
+            return None
         if not isinstance(body, dict):
             logger.error("%s returned %s, expected a JSON object", url, type(body).__name__)
             return None

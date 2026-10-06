@@ -1031,15 +1031,89 @@ def test_ai_requests_are_held_to_the_configured_depth(
         return peak
 
     # The default matches a single GPU, which queues one at a time.
-    ai_client.set_concurrency(1)
+    ai_client.set_ai_limits(1, 3)
     assert both() == 1
 
     # Split across machines, or a device that takes more, they may run at once.
-    ai_client.set_concurrency(3)
+    ai_client.set_ai_limits(3, 3)
     assert both() == 3
-    ai_client.set_concurrency(2)
+    ai_client.set_ai_limits(2, 3)
     assert both() == 2
-    ai_client.set_concurrency(1)
+    ai_client.set_ai_limits(1, ai_client.DEFAULT_MAX_ATTEMPTS)
+
+
+
+
+def test_retries_double_their_wait_and_stop_at_the_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, clean_env: None
+) -> None:
+    """A model being evicted takes seconds, then takes them all at once."""
+    from jitsi_audio_bridge import ai_client
+
+    monkeypatch.setattr(config_module, "SEARCH_PATHS", (tmp_path / "nothing.ini",))
+    config = load_config()
+    assert config.ai.max_attempts == 5
+    ai_client.set_ai_limits(config.ai.max_concurrent_requests, config.ai.max_attempts)
+    audio = tmp_path / "participant-x.wav"
+    audio.write_bytes(b"not really audio, but never sent")
+
+    waits: list[float] = []
+    attempts = 0
+
+    class Response:
+        status_code = 503
+        def raise_for_status(self) -> None: ...
+        def json(self) -> dict:
+            return {}
+
+    def always_503(*args: object, **kwargs: object) -> Response:
+        nonlocal attempts
+        attempts += 1
+        return Response()
+
+    monkeypatch.setattr(ai_client.requests, "post", always_503)
+    monkeypatch.setattr(ai_client.time, "sleep", waits.append)
+
+    assert ai_client.transcribe_audio(audio, config.whisper) == ""
+    assert attempts == 5
+    assert waits == [1.0, 2.0, 4.0, 8.0]
+
+    # The schedule is capped, so a large limit cannot sleep for hours.
+    assert ai_client.backoff_seconds(12) == 30.0
+    assert ai_client.backoff_seconds(1) == 0.0
+
+
+def test_a_client_error_is_not_retried(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, clean_env: None
+) -> None:
+    """A 4xx says the request is wrong; asking again changes nothing."""
+    from jitsi_audio_bridge import ai_client
+
+    monkeypatch.setattr(config_module, "SEARCH_PATHS", (tmp_path / "nothing.ini",))
+    config = load_config()
+    ai_client.set_ai_limits(config.ai.max_concurrent_requests, config.ai.max_attempts)
+    audio = tmp_path / "participant-x.wav"
+    audio.write_bytes(b"payload")
+
+    calls = 0
+
+    class Response:
+        status_code = 400
+        def raise_for_status(self) -> None:
+            raise ai_client.requests.HTTPError("400 Client Error", response=self)
+        def json(self) -> dict:
+            return {}
+
+    def bad_request(*args: object, **kwargs: object) -> Response:
+        nonlocal calls
+        calls += 1
+        return Response()
+
+    monkeypatch.setattr(ai_client.requests, "post", bad_request)
+    monkeypatch.setattr(ai_client.time, "sleep", lambda _: None)
+
+    assert ai_client.transcribe_audio(audio, config.whisper) == ""
+    assert calls == 1
 
 
 

@@ -199,6 +199,7 @@ much silence between two runs of one speaker still counts as the same turn.
 | Option | Type | Default | Environment |
 |---|---|---|---|
 | `max_concurrent_requests` | 1–64 | `1` | `JITSI_AUDIO_BRIDGE_AI_MAX_CONCURRENT_REQUESTS` |
+| `max_attempts` | 1–10 | `5` | `JITSI_AUDIO_BRIDGE_AI_MAX_ATTEMPTS` |
 
 Whisper and Ollama usually run on one machine, often on one GPU, and a GPU's
 queue takes one request at a time. Asking for more than the device serves is
@@ -209,6 +210,13 @@ daemon waits for each request to complete before sending the next, so two
 meetings finishing together cannot do that to each other — one meeting's
 summary waits for the other's transcription. Raise it when the two services
 are on separate machines and the device underneath can take more.
+
+`max_attempts` is how many times one request may be tried before it is given
+up on, waiting twice as long before each retry — 1 s, 2 s, 4 s, 8 s — because
+what is being waited for is a model being loaded, which takes seconds and then
+takes them all at once. Five attempts span about fifteen seconds; the wait is
+capped at 30 s whatever the limit. Only a 5xx or a failed connection is
+retried: a 4xx means the request itself is wrong.
 
 ### `[whisper]`
 
@@ -702,10 +710,11 @@ daemon closes every file in a `finally`, so this needs a hard kill; see
   timing at all — that cannot be recovered afterwards.
 - **Sequential transcription.** Participants are transcribed one after another.
   A long meeting is slow, and one Whisper timeout costs that participant's text.
-- **Retries are bounded and narrow.** A 5xx answer from Whisper or Ollama is
-  tried twice more, a second and then three seconds later; turns that still
-  produced nothing are tried again once the rest of the meeting is done,
-  ten seconds later, because an intermittent service is usually back by then.
+- **Retries are bounded and narrow.** A 5xx answer or a failed connection is
+  retried up to `[ai] max_attempts` times, waiting twice as long each time
+  (1 s, 2 s, 4 s, 8 s); turns that still produced nothing are tried again once
+  the rest of the meeting is done, ten seconds later, because an intermittent
+  service is usually back by then.
   A participant whose every turn failed is handed over as one whole recording
   instead — and if that fails too, their turns join the retry pass. Anything
   else — a 4xx, an unreadable file, SMTP — is logged and skipped, as before.

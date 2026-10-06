@@ -43,7 +43,7 @@ from urllib.parse import parse_qs, urlparse
 import websockets
 
 from . import __version__
-from .ai_client import generate_summary, set_concurrency, transcribe_audio
+from .ai_client import generate_summary, set_ai_limits, transcribe_audio
 from .audio import (
     EXTRACTED_AUDIO_NAME,
     METADATA_FILENAME,
@@ -1115,7 +1115,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         config = load_config(args.config)
-        set_concurrency(config.ai.max_concurrent_requests)
+        set_ai_limits(config.ai.max_concurrent_requests, config.ai.max_attempts)
         # Directory mode is handed an existing directory, so the recordings
         # directory is only required when serving.
         if args.process_dir is None:

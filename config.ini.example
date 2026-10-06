@@ -65,6 +65,11 @@ merge_gap_seconds = 1.0
 ; daemon then waits for each request to finish before sending the next.  Raise
 ; it when the two services are on separate machines.
 max_concurrent_requests = 1
+; How many times one request may be tried before it is given up on, waiting
+; twice as long each time: 1s, 2s, 4s, 8s...  Five spans about fifteen seconds
+; in all, which is the scale of a model being evicted from a shared GPU and
+; loaded again.  1 disables retrying.
+max_attempts = 5
 
 [whisper]
 ; Endpoint accepting {"audio_base64": ..., "filename": ...} and returning
