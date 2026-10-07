@@ -661,6 +661,30 @@ def test_safe_attachment_name_keeps_an_ordinary_room_name() -> None:
 
 
 
+
+def test_the_language_rule_follows_the_transcript() -> None:
+    """A software meeting is full of English words whatever language it is in."""
+    from jitsi_audio_bridge.ai_client import build_summary_prompt
+
+    prompt = build_summary_prompt(
+        "[michael]: il fix e' merged, guarda il file name dello widget",
+        "panicking", ["michael"], "Italian",
+    )
+    after_transcript = prompt.split("Meeting Transcript:", 1)[1]
+    assert "answer in ITALIAN" in after_transcript
+    assert "Do not reply in English" in after_transcript
+    # And the instruction is not only at the top, where the transcript buries it.
+    assert prompt.index("answer in ITALIAN") > prompt.index("Meeting Transcript:")
+
+
+def test_the_sign_off_follows_the_language_too() -> None:
+    from jitsi_audio_bridge.mailer import mail_strings
+
+    assert mail_strings("Italian")[3].startswith("Cordiali saluti")
+    assert mail_strings("english")[3].startswith("Best regards")
+    assert mail_strings("Klingon")[3] == mail_strings("English")[3]
+
+
 def test_correction_is_off_unless_it_is_asked_for(clean_env: None) -> None:
     config = load_config()
     assert config.ollama.correct_transcript is False
@@ -787,9 +811,10 @@ def test_the_mail_is_written_in_the_meetings_language() -> None:
     """An Italian meeting should not be headed in English."""
     from jitsi_audio_bridge.mailer import _subject_for, mail_strings
 
-    subject, heading, introduction = mail_strings("Italian")
+    subject, heading, introduction, sign_off = mail_strings("Italian")
     assert heading == "RIEPILOGO DELLA RIUNIONE"
     assert "riunione" in introduction.format(room="Weekly")
+    assert sign_off.startswith("Cordiali saluti")
     assert _subject_for("Weekly", "", None, "Italian") == (
         "Riepilogo e trascrizione della riunione: Weekly"
     )

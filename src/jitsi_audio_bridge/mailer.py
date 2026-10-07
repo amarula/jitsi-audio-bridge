@@ -86,42 +86,47 @@ def _format_when(started_at: str | None) -> str:
 #: summary and its headings come from the model, already in the meeting's
 #: language — and a language that is not in the table is mailed in English
 #: rather than in nothing.
-_MAIL_STRINGS: dict[str, tuple[str, str, str]] = {
+_MAIL_STRINGS: dict[str, tuple[str, str, str, str]] = {
     "english": (
         "Meeting Summary & Transcript",
         "MEETING SUMMARY",
         "Please find the automated summary and raw transcript for room "
         "'{room}' attached below.",
+        "Best regards,\nAutomated meeting transcription",
     ),
     "italian": (
         "Riepilogo e trascrizione della riunione",
         "RIEPILOGO DELLA RIUNIONE",
         "In allegato il riepilogo automatico e la trascrizione della riunione "
         "'{room}'.",
+        "Cordiali saluti,\nTrascrizione automatica della riunione",
     ),
     "spanish": (
         "Resumen y transcripción de la reunión",
         "RESUMEN DE LA REUNIÓN",
         "Adjunto encontrará el resumen automático y la transcripción de la "
         "sala '{room}'.",
+        "Un saludo,\nTranscripción automática de la reunión",
     ),
     "french": (
         "Résumé et transcription de la réunion",
         "RÉSUMÉ DE LA RÉUNION",
         "Veuillez trouver ci-joint le résumé automatique et la transcription "
         "de la salle '{room}'.",
+        "Cordialement,\nTranscription automatique de la réunion",
     ),
     "german": (
         "Zusammenfassung und Transkript des Meetings",
         "ZUSAMMENFASSUNG DES MEETINGS",
         "Im Anhang finden Sie die automatische Zusammenfassung und das "
         "Transkript des Raums '{room}'.",
+        "Mit freundlichen Grüßen,\nAutomatische Meeting-Transkription",
     ),
 }
 
 
-def mail_strings(language: str | None) -> tuple[str, str, str]:
-    """Subject prefix, heading and introduction for *language*.
+def mail_strings(language: str | None) -> tuple[str, str, str, str]:
+    """Subject prefix, heading, introduction and sign-off for *language*.
 
     The language is the one the summary was written in, so the whole mail
     reads in one voice.  Anything not in the table falls back to English.
@@ -200,7 +205,7 @@ def send_meeting_email(
         message["To"] = ", ".join(targets)
         # The model wrote the summary in the meeting's language; the mail
         # around it is written in the same one, so it reads in one voice.
-        _, heading, introduction = mail_strings(language)
+        _, heading, introduction, sign_off = mail_strings(language)
         when = _format_when(started_at)
         message.set_content(
             introduction.format(room=room_name)
@@ -211,8 +216,8 @@ def send_meeting_email(
             + "\n"
             + f"{'-' * 50}\n\n"
             + f"{summary_text}\n\n"
-            + "Best regards,\n"
-            + "Automated meeting transcription\n"
+            + sign_off
+            + "\n"
         )
 
         # Both are attached: the transcript is the record, the summary is what

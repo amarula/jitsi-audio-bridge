@@ -252,6 +252,15 @@ def build_summary_prompt(transcript_text: str, room_name: str, participants: lis
         "\n"
         "Meeting Transcript:\n"
         f"{transcript_text}\n"
+        "\n"
+        # Last, and after the transcript, on purpose: a meeting about software
+        # is full of English words whatever language it is held in, and a
+        # model answers in the language of what it has just read.  Told once
+        # at the top, this instruction loses to the transcript.
+        f"REMINDER — answer in {language.upper()}. Write every heading, bullet and "
+        f"sentence of your answer in {language}: the transcript is in {language} too, "
+        "and the English words inside it are technical terms to keep as they are, not "
+        f"a language to answer in. Do not reply in English.\n"
     )
 
 

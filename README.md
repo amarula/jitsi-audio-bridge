@@ -166,7 +166,12 @@ headings (the model's) and the subject line, the heading and the introduction
 (the daemon's) all follow the detected language, so an Italian meeting is not
 mailed under an English title. English, Italian, Spanish, French and German
 have their own words; anything else is mailed in English, which is also the
-fallback when detection fails. The subject and heading also carry the
+fallback when detection fails. The rule is also stated *after* the transcript,
+not only before it: a meeting about software is full of English words whatever
+language it is held in, and a model answers in the language of what it read
+last — a transcript of Italian speech salted with "file name" and "widget
+preview" produced an English summary under an Italian heading until the
+instruction was repeated last. The subject and heading also carry the
 meeting's local date and time, because a room keeps its name and two meetings
 in it would otherwise be labelled identically.
 
