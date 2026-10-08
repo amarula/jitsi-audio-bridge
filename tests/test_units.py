@@ -7,21 +7,28 @@ encoding a tone and decoding it back through the recorder.
 from __future__ import annotations
 
 import base64
+import http.server
 import json
 import math
+import os
 import struct
+import tempfile
 import threading
 import time
+import urllib.parse
 import wave
 from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
 from jitsi_audio_bridge import config as config_module
 from jitsi_audio_bridge import daemon as daemon_module
+from jitsi_audio_bridge import s3_upload
 from jitsi_audio_bridge.audio import (
     EXTRACTED_AUDIO_NAME,
+    TIMELINE_FILENAME,
     OpusDecoder,
     OpusEncoder,
     OpusError,
@@ -1633,6 +1640,549 @@ def test_stereo_stream_decodes_into_a_mono_recording(tmp_path: Path) -> None:
     with wave.open(str(wav_path), "rb") as handle:
         assert handle.getnchannels() == 1
         assert handle.getnframes() == 4 * 320
+
+
+# --------------------------------------------------------------------------
+# Uploading the meeting's video to an S3-compatible endpoint
+# --------------------------------------------------------------------------
+
+#: A fixed past moment to hang recording timestamps on.
+_MEETING_EPOCH = 1_760_000_000.0
+
+
+def _s3_config(tmp_path: Path, **overrides: object):
+    """The default configuration with an [s3] section pointed at a test tree.
+
+    Only the endpoint and the bucket turn the feature on, so a test that wants
+    it off simply does not pass them.
+    """
+    base = load_config()
+    settings: dict[str, object] = {
+        "endpoint": "http://127.0.0.1:1",
+        "bucket": "meetings-recordings",
+        "prefix": "",
+        "access_key": "test-access-key",
+        "secret_key": "test-secret-key",
+        "jibri_dir": tmp_path / "jibri",
+        "wait_seconds": 0.0,
+        "settle_seconds": 0.0,
+    }
+    settings.update(overrides)
+    return replace(
+        base,
+        storage=replace(base.storage, recordings_dir=tmp_path / "recordings"),
+        s3=replace(base.s3, **settings),  # type: ignore[arg-type]
+    )
+
+
+#: The moment the meetings in these tests started, on both clocks.
+_MEETING_STARTED_AT = datetime.fromtimestamp(_MEETING_EPOCH, UTC).isoformat(timespec="seconds")
+
+
+def _meeting_dir(
+    tmp_path: Path,
+    room: str = "Standup",
+    session: str = "abcd",
+    *,
+    started_at: str | None = _MEETING_STARTED_AT,
+) -> Path:
+    """A meeting directory as post-processing finds it.
+
+    With a timeline by default: it is what tells the video search when the
+    meeting began, and a real one has it — the tests that deliberately do
+    without pass ``started_at=None``.
+    """
+    meeting = tmp_path / "recordings" / session
+    meeting.mkdir(parents=True, exist_ok=True)
+    (meeting / "metadata.json").write_text(
+        json.dumps({"room_name": room, "participants": []}), encoding="utf-8"
+    )
+    if started_at is not None:
+        SessionTimeline(started_at=started_at, duration=600.0).write(
+            meeting / TIMELINE_FILENAME
+        )
+    return meeting
+
+
+def _jibri_recording(
+    root: Path,
+    room: str,
+    when: float = _MEETING_EPOCH,
+    *,
+    session: str = "jibri-session",
+    filename: str | None = None,
+    meeting_url: str | None = None,
+) -> Path:
+    """One directory of Jibri's recordings tree, as Jibri leaves it."""
+    directory = root / session
+    directory.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y-%m-%d-%H-%M-%S", time.gmtime(when))
+    path = directory / (filename or f"{room}_{stamp}.mp4")
+    path.write_bytes(b"\x00" * 32)
+    os.utime(path, (when, when))
+    if meeting_url is not False:
+        (directory / "metadata.json").write_text(
+            json.dumps({"meeting_url": meeting_url or f"https://jitsi.example.com/{room}"}),
+            encoding="utf-8",
+        )
+    return path
+
+
+class _StubS3:
+    """Enough of an S3 endpoint to prove the client is wired up correctly.
+
+    A mocked client would hide the things that actually break: the address a
+    request goes to, the shape of the path, and whether it arrived signed at
+    all.  A real boto3 client talking to this is the smallest test that
+    catches those.
+    """
+
+    def __init__(self) -> None:
+        self.objects: dict[str, bytes] = {}
+        self.requests: list[tuple[str, str, str]] = []
+        self._parts: dict[str, dict[int, bytes]] = {}
+        stub = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *args: object) -> None:  # noqa: ARG002 - quiet
+                pass
+
+            def _query(self) -> dict[str, list[str]]:
+                return urllib.parse.parse_qs(
+                    urllib.parse.urlparse(self.path).query, keep_blank_values=True
+                )
+
+            def _key(self) -> str:
+                path = urllib.parse.urlparse(self.path).path.lstrip("/")
+                return path.split("/", 1)[1] if "/" in path else path
+
+            def _note(self, method: str) -> None:
+                stub.requests.append(
+                    (method, self.path, self.headers.get("Authorization", ""))
+                )
+
+            def _body(self) -> bytes:
+                return self.rfile.read(int(self.headers.get("Content-Length") or 0))
+
+            def _reply(
+                self,
+                status: int,
+                body: bytes = b"",
+                length: int | None = None,
+                etag: str | None = None,
+            ) -> None:
+                self.send_response(status)
+                if etag is not None:
+                    self.send_header("ETag", etag)
+                self.send_header("Content-Length", str(len(body) if length is None else length))
+                self.end_headers()
+                if body and self.command != "HEAD":
+                    self.wfile.write(body)
+
+            def do_PUT(self) -> None:
+                self._note("PUT")
+                query = self._query()
+                body = self._body()
+                if "partNumber" in query:
+                    parts = stub._parts.setdefault(query.get("uploadId", [""])[0], {})
+                    parts[int(query["partNumber"][0])] = body
+                    # A real server returns each part's ETag in a header, and
+                    # the client needs them back to complete the upload.
+                    self._reply(200, etag=f'"part-{query["partNumber"][0]}"')
+                    return
+                stub.objects[self._key()] = body
+                self._reply(200, etag='"whole"')
+
+            def do_POST(self) -> None:
+                self._note("POST")
+                query = self._query()
+                self._body()
+                if "uploads" in query:
+                    upload_id = f"upload-{len(stub._parts)}"
+                    stub._parts[upload_id] = {}
+                    body = (
+                        "<InitiateMultipartUploadResult>"
+                        f"<UploadId>{upload_id}</UploadId>"
+                        "</InitiateMultipartUploadResult>"
+                    ).encode()
+                else:
+                    parts = stub._parts.pop(query.get("uploadId", [""])[0], {})
+                    stub.objects[self._key()] = b"".join(
+                        parts[number] for number in sorted(parts)
+                    )
+                    body = (
+                        b"<CompleteMultipartUploadResult>"
+                        b"<ETag>\"stub\"</ETag></CompleteMultipartUploadResult>"
+                    )
+                self._reply(200, body)
+
+            def do_HEAD(self) -> None:
+                self._note("HEAD")
+                stored = stub.objects.get(self._key())
+                self._reply(
+                    200 if stored is not None else 404, length=len(stored or b"")
+                )
+
+        self._server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self._server.daemon_threads = True
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+
+    @property
+    def url(self) -> str:
+        host, port = self._server.server_address[:2]
+        return f"http://{host}:{port}"
+
+    def close(self) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+
+
+def test_a_recording_is_matched_by_room_and_by_time() -> None:
+    root = Path(tempfile.mkdtemp())
+    _jibri_recording(root, "Standup", _MEETING_EPOCH - 7200, session="old")
+    latest = _jibri_recording(root, "Standup", _MEETING_EPOCH + 60, session="new")
+    _jibri_recording(root, "Retrospective", _MEETING_EPOCH + 30, session="other")
+
+    found = s3_upload.find_recording(
+        root,
+        "Standup",
+        not_before=_MEETING_EPOCH,
+        settled_before=_MEETING_EPOCH + 120,
+    )
+    assert found == latest
+
+
+def test_a_recording_still_being_written_is_left_alone() -> None:
+    """An ffmpeg flushing its last frames must not be uploaded half-made."""
+    root = Path(tempfile.mkdtemp())
+    _jibri_recording(root, "Standup", _MEETING_EPOCH + 100)
+
+    assert (
+        s3_upload.find_recording(
+            root,
+            "Standup",
+            not_before=_MEETING_EPOCH,
+            settled_before=_MEETING_EPOCH + 99,
+        )
+        is None
+    )
+
+
+def test_a_recording_from_before_the_meeting_is_not_this_meeting_s() -> None:
+    """The previous meeting in the same room left its own recording behind."""
+    root = Path(tempfile.mkdtemp())
+    _jibri_recording(root, "Standup", _MEETING_EPOCH - 3600)
+
+    assert (
+        s3_upload.find_recording(
+            root,
+            "Standup",
+            not_before=_MEETING_EPOCH,
+            settled_before=_MEETING_EPOCH + 600,
+        )
+        is None
+    )
+
+
+def test_the_room_is_read_from_jibris_own_metadata_first() -> None:
+    """A name Jibri was told to use still matches the room it recorded."""
+    root = Path(tempfile.mkdtemp())
+    recording = _jibri_recording(
+        root, "Standup", _MEETING_EPOCH, filename="recording_123.mp4", meeting_url=None
+    )
+    # The filename says nothing; only the metadata knows the room.
+    directory = recording.parent
+    (directory / "metadata.json").write_text(
+        json.dumps({"meeting_url": "https://jitsi.example.com/Standup?jwt=abc#config"}),
+        encoding="utf-8",
+    )
+
+    assert (
+        s3_upload.find_recording(
+            root,
+            "Standup",
+            not_before=_MEETING_EPOCH - 60,
+            settled_before=_MEETING_EPOCH + 600,
+        )
+        == recording
+    )
+
+
+def test_rooms_are_compared_without_case_or_punctuation() -> None:
+    root = Path(tempfile.mkdtemp())
+    recording = _jibri_recording(root, "Daily-Standup", _MEETING_EPOCH)
+
+    assert (
+        s3_upload.find_recording(
+            root,
+            "daily standup",
+            not_before=_MEETING_EPOCH - 60,
+            settled_before=_MEETING_EPOCH + 600,
+        )
+        == recording
+    )
+
+
+def test_a_recording_another_meeting_already_took_is_not_taken_again(
+    tmp_path: Path,
+) -> None:
+    config = _s3_config(tmp_path)
+    recording = _jibri_recording(config.s3.jibri_dir, "Standup", _MEETING_EPOCH)
+    earlier = _meeting_dir(tmp_path, session="earlier")
+    s3_upload.write_claim(
+        earlier, {"source": str(recording), "bucket": "b", "key": "k"}
+    )
+
+    claimed = s3_upload.claimed_recordings(config.storage.recordings_dir)
+    assert claimed == {recording}
+    assert (
+        s3_upload.find_recording(
+            config.s3.jibri_dir,
+            "Standup",
+            not_before=_MEETING_EPOCH - 60,
+            settled_before=_MEETING_EPOCH + 600,
+            claimed=claimed,
+        )
+        is None
+    )
+
+
+def test_the_object_key_keeps_the_room_and_jibris_filename() -> None:
+    assert (
+        s3_upload.object_key(
+            "meetings", "Daily Standup", Path("/x/Daily Standup_2026-01-02-03-04-05.mp4")
+        )
+        == "meetings/Daily_Standup/Daily_Standup_2026-01-02-03-04-05.mp4"
+    )
+    assert s3_upload.object_key("", "Standup", Path("/x/s.mp4")) == "Standup/s.mp4"
+    assert s3_upload.object_key("/a/b/", "Room", Path("/x/s.mp4")) == "a/b/Room/s.mp4"
+
+
+def test_a_room_name_cannot_climb_out_of_the_prefix() -> None:
+    """A room name reaches us from the meeting; a key is a path."""
+    key = s3_upload.object_key("meetings", "../../etc", Path("/x/../../passwd.mp4"))
+    assert key.startswith("meetings/")
+    assert ".." not in key
+    assert key.count("/") == 2
+
+
+def test_the_upload_writes_the_object_and_a_claim_beside_the_transcript(
+    tmp_path: Path,
+) -> None:
+    pytest.importorskip("boto3")
+    stub = _StubS3()
+    try:
+        config = _s3_config(tmp_path, endpoint=stub.url, prefix="videos")
+        meeting = _meeting_dir(tmp_path)
+        recording = _jibri_recording(config.s3.jibri_dir, "Standup", _MEETING_EPOCH + 10)
+
+        assert s3_upload.upload_meeting_video(meeting, config, wait=False)
+
+        key = f"videos/Standup/{recording.name}"
+        assert stub.objects[key] == recording.read_bytes()
+        methods = [method for method, _, _ in stub.requests]
+        assert methods == ["PUT", "HEAD"]
+        # Signed, at the path the endpoint gave, with the configured credentials.
+        assert all(auth.startswith("AWS4-HMAC-SHA256") for _, _, auth in stub.requests)
+        assert all(path == f"/meetings-recordings/{key}" for _, path, _ in stub.requests)
+
+        claim = s3_upload.read_claim(meeting / s3_upload.CLAIM_FILENAME)
+        assert claim["bucket"] == "meetings-recordings"
+        assert claim["key"] == key
+        assert claim["source"] == str(recording)
+        assert claim["size"] == len(recording.read_bytes())
+        assert claim["confirmed_size"] == claim["size"]
+        assert claim["url"] == f"{stub.url}/meetings-recordings/{key}"
+    finally:
+        stub.close()
+
+
+def test_a_recording_larger_than_the_multipart_threshold_is_uploaded_in_parts(
+    tmp_path: Path,
+) -> None:
+    """What every real recording does: boto3 multiparts anything over 8 MiB."""
+    pytest.importorskip("boto3")
+    stub = _StubS3()
+    try:
+        config = _s3_config(tmp_path, endpoint=stub.url, prefix="videos")
+        meeting = _meeting_dir(tmp_path)
+        recording = _jibri_recording(config.s3.jibri_dir, "Standup", _MEETING_EPOCH + 10)
+        recording.write_bytes(b"mp4" * ((9 << 20) // 3))  # 9 MiB, so two parts
+
+        assert s3_upload.upload_meeting_video(meeting, config, wait=False)
+
+        key = f"videos/Standup/{recording.name}"
+        assert stub.objects[key] == recording.read_bytes()
+        methods = [method for method, _, _ in stub.requests]
+        assert methods.count("POST") == 2, methods  # initiated, then completed
+        posts = [path for method, path, _ in stub.requests if method == "POST"]
+        assert any("uploads" in path for path in posts)
+        assert sum(1 for method, _, _ in stub.requests if method == "PUT") >= 2
+    finally:
+        stub.close()
+
+
+def test_an_uploaded_recording_is_not_uploaded_twice(tmp_path: Path) -> None:
+    pytest.importorskip("boto3")
+    stub = _StubS3()
+    try:
+        config = _s3_config(tmp_path, endpoint=stub.url)
+        meeting = _meeting_dir(tmp_path)
+        _jibri_recording(config.s3.jibri_dir, "Standup", _MEETING_EPOCH + 10)
+
+        assert s3_upload.upload_meeting_video(meeting, config, wait=False)
+        assert s3_upload.upload_meeting_video(meeting, config, wait=False)
+        assert [method for method, _, _ in stub.requests] == ["PUT", "HEAD"]
+    finally:
+        stub.close()
+
+
+def test_nothing_is_uploaded_when_no_endpoint_is_configured(tmp_path: Path) -> None:
+    config = _s3_config(tmp_path, endpoint="", bucket="")
+    meeting = _meeting_dir(tmp_path)
+    _jibri_recording(config.s3.jibri_dir, "Standup", _MEETING_EPOCH + 10)
+
+    assert not s3_upload.upload_meeting_video(meeting, config, wait=False)
+    assert not (meeting / s3_upload.CLAIM_FILENAME).exists()
+
+
+def test_a_meeting_with_no_recording_claims_nothing(tmp_path: Path, caplog) -> None:
+    config = _s3_config(tmp_path, jibri_dir=tmp_path / "jibri-is-not-there")
+    meeting = _meeting_dir(tmp_path)
+
+    with caplog.at_level("INFO"):
+        assert not s3_upload.upload_meeting_video(meeting, config, wait=False)
+    assert not (meeting / s3_upload.CLAIM_FILENAME).exists()
+    assert "no recording" in caplog.text
+
+
+def test_a_recording_that_is_not_there_yet_is_waited_for(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Jibri finalizes the recording after the meeting ends, not with it."""
+    pytest.importorskip("boto3")
+    stub = _StubS3()
+    try:
+        config = _s3_config(tmp_path, endpoint=stub.url, wait_seconds=30.0)
+        meeting = _meeting_dir(tmp_path)
+        monkeypatch.setattr(s3_upload, "POLL_SECONDS", 0.01)
+
+        # The recording appears only once the daemon has started looking,
+        # which is what a Jibri taking its time over the finalize looks like.
+        def appear() -> None:
+            time.sleep(0.05)
+            _jibri_recording(config.s3.jibri_dir, "Standup", _MEETING_EPOCH + 10)
+
+        writer = threading.Thread(target=appear)
+        writer.start()
+        try:
+            assert s3_upload.upload_meeting_video(meeting, config)
+        finally:
+            writer.join()
+        assert (meeting / s3_upload.CLAIM_FILENAME).exists()
+    finally:
+        stub.close()
+
+
+def test_a_broken_endpoint_costs_the_video_and_nothing_else(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config = _s3_config(tmp_path)
+    meeting = _meeting_dir(tmp_path)
+    _jibri_recording(config.s3.jibri_dir, "Standup", _MEETING_EPOCH + 10)
+
+    def explode(s3: object):
+        raise OSError("connection refused")
+
+    monkeypatch.setattr(s3_upload, "_client", explode)
+    assert not s3_upload.upload_meeting_video(meeting, config, wait=False)
+    assert not (meeting / s3_upload.CLAIM_FILENAME).exists()
+
+
+def test_the_local_recording_is_kept_unless_the_endpoint_confirms_it(
+    tmp_path: Path,
+) -> None:
+    pytest.importorskip("boto3")
+    stub = _StubS3()
+    try:
+        config = _s3_config(
+            tmp_path, endpoint=stub.url, delete_after_upload=True
+        )
+        meeting = _meeting_dir(tmp_path)
+        recording = _jibri_recording(config.s3.jibri_dir, "Standup", _MEETING_EPOCH + 10)
+
+        assert s3_upload.upload_meeting_video(meeting, config, wait=False)
+        assert not recording.exists(), "a confirmed upload should free the disk"
+        # The directory Jibri made is left behind; only the recording was ours.
+        assert recording.parent.is_dir()
+    finally:
+        stub.close()
+
+
+def test_a_local_recording_that_grew_after_the_upload_is_kept(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The endpoint's copy is not the whole recording, so the file stays."""
+    config = _s3_config(tmp_path, delete_after_upload=True)
+    meeting = _meeting_dir(tmp_path)
+    recording = _jibri_recording(config.s3.jibri_dir, "Standup", _MEETING_EPOCH + 10)
+
+    class ShortOne:
+        def upload_file(self, path: str, bucket: str, key: str) -> None:
+            pass
+
+        def head_object(self, **kwargs: object) -> dict:
+            return {"ContentLength": 4}  # fewer bytes than the file holds
+
+    monkeypatch.setattr(s3_upload, "_client", lambda s3: ShortOne())
+    assert s3_upload.upload_meeting_video(meeting, config, wait=False)
+    assert recording.exists()
+
+
+def test_the_log_says_what_was_there_instead(tmp_path: Path, caplog) -> None:
+    config = _s3_config(tmp_path)
+    _jibri_recording(config.s3.jibri_dir, "Retrospective", _MEETING_EPOCH)
+    _jibri_recording(config.s3.jibri_dir, "Old", _MEETING_EPOCH - 86400, session="old")
+    meeting = _meeting_dir(tmp_path, room="Standup")
+
+    with caplog.at_level("INFO"):
+        assert not s3_upload.upload_meeting_video(meeting, config, wait=False)
+    assert "Retrospective" in caplog.text
+    assert "outside the meeting" in caplog.text
+
+
+def test_the_meeting_start_comes_from_the_timeline_when_there_is_one(
+    tmp_path: Path,
+) -> None:
+    meeting = _meeting_dir(tmp_path)
+    timeline = SessionTimeline(
+        started_at="2026-01-02T03:04:05+00:00", duration=60.0, turns=[]
+    )
+    expected = datetime.fromisoformat("2026-01-02T03:04:05+00:00").timestamp()
+    assert s3_upload.meeting_started_epoch(meeting, timeline) == expected
+    # Without one, the directory's own timestamp stands in for the meeting's.
+    assert s3_upload.meeting_started_epoch(meeting, None) == pytest.approx(
+        meeting.stat().st_mtime
+    )
+
+
+def test_the_upload_command_needs_an_endpoint(tmp_path: Path) -> None:
+    config = _s3_config(tmp_path, endpoint="", bucket="")
+    assert daemon_module.upload_directory_video(tmp_path, config) == 2
+    assert daemon_module.upload_directory_video(tmp_path / "nope", config) == 2
+
+
+def test_the_upload_command_reports_what_it_did(tmp_path: Path, monkeypatch) -> None:
+    config = _s3_config(tmp_path)
+    monkeypatch.setattr(
+        daemon_module, "upload_meeting_video", lambda *a, **k: True
+    )
+    assert daemon_module.upload_directory_video(tmp_path, config) == 0
+    monkeypatch.setattr(daemon_module, "upload_meeting_video", lambda *a, **k: False)
+    assert daemon_module.upload_directory_video(tmp_path, config) == 1
 
 
 # --------------------------------------------------------------------------

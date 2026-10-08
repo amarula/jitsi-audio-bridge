@@ -1,8 +1,9 @@
-"""Stub Whisper, Ollama and SMTP services.
+"""Stub Whisper, Ollama, SMTP and S3 services.
 
-These stand in for the three external dependencies so the whole pipeline can be
-exercised without a GPU, a model download, or a mail relay. Each one records
-what it was asked, which is usually more useful than the answer it gives.
+These stand in for the external dependencies so the whole pipeline can be
+exercised without a GPU, a model download, a mail relay, or a bucket. Each one
+records what it was asked, which is usually more useful than the answer it
+gives.
 
 Start all three and print where they landed:
 
@@ -25,10 +26,11 @@ import logging
 import socket
 import threading
 import wave
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from io import BytesIO
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 
 logger = logging.getLogger("tools.stubs")
 
@@ -286,6 +288,129 @@ class SmtpStub:
         self._socket.close()
 
 
+class S3Stub:
+    """Enough of an S3-compatible endpoint to accept an uploaded recording.
+
+    It keeps the body of every PUT and answers HEAD with its length, which is
+    all the daemon asks of an endpoint before it writes its claim — and it
+    keeps the Authorization header, because a request that arrived unsigned
+    would be refused by a real server and must not pass here either.
+
+    Multipart is part of that: a recording over 8 MiB — which every real one
+    is — is uploaded in pieces, and an endpoint that only understands a single
+    PUT would let a client bug hide until the first real meeting.
+    """
+
+    def __init__(self) -> None:
+        self.port = free_port()
+        #: Object key -> the bytes that were uploaded as it.
+        self.objects: dict[str, bytes] = {}
+        #: (method, path, Authorization) for every request that arrived.
+        self.requests: list[tuple[str, str, str]] = []
+        #: Upload id -> part number -> body, until the upload is completed.
+        self._parts: dict[str, dict[int, bytes]] = {}
+        outer = self
+
+        class Handler(_QuietHandler):
+            protocol_version = "HTTP/1.1"
+
+            def _query(self) -> dict[str, list[str]]:
+                # keep_blank_values: "?uploads" is a key with an empty value, and the
+                # default drops it, which is the whole multipart trigger.
+                return parse_qs(urlparse(self.path).query, keep_blank_values=True)
+
+            def _key(self) -> str:
+                path = urlparse(self.path).path.lstrip("/")
+                return path.split("/", 1)[1] if "/" in path else path
+
+            def _note(self, method: str) -> None:
+                outer.requests.append(
+                    (method, self.path, self.headers.get("Authorization", ""))
+                )
+
+            def _reply(self, status: int, body: bytes = b"", headers: tuple = ()) -> None:
+                self.send_response(status)
+                for name, value in headers:
+                    self.send_header(name, value)
+                if not any(name.lower() == "content-length" for name, _ in headers):
+                    self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                if body and self.command != "HEAD":
+                    self.wfile.write(body)
+
+            def _body(self) -> bytes:
+                return self.rfile.read(int(self.headers.get("Content-Length") or 0))
+
+            def do_PUT(self) -> None:  # noqa: N802 - required name
+                self._note("PUT")
+                query = self._query()
+                body = self._body()
+                if "partNumber" in query:
+                    upload_id = query.get("uploadId", [""])[0]
+                    parts = outer._parts.setdefault(upload_id, {})
+                    parts[int(query["partNumber"][0])] = body
+                else:
+                    outer.objects[self._key()] = body
+                self._reply(200, headers=(("ETag", '"stub-part"'),))
+
+            def do_POST(self) -> None:  # noqa: N802 - required name
+                self._note("POST")
+                query = self._query()
+                self._body()
+                if "uploads" in query:
+                    upload_id = f"stub-upload-{len(outer._parts)}"
+                    outer._parts[upload_id] = {}
+                    body = (
+                        '<?xml version="1.0" encoding="UTF-8"?>'
+                        "<InitiateMultipartUploadResult><Bucket>stub</Bucket>"
+                        f"<Key>{self._key()}</Key>"
+                        f"<UploadId>{upload_id}</UploadId>"
+                        "</InitiateMultipartUploadResult>"
+                    ).encode()
+                else:
+                    upload_id = query.get("uploadId", [""])[0]
+                    parts = outer._parts.pop(upload_id, {})
+                    outer.objects[self._key()] = b"".join(
+                        parts[number] for number in sorted(parts)
+                    )
+                    body = (
+                        '<?xml version="1.0" encoding="UTF-8"?>'
+                        "<CompleteMultipartUploadResult><Location>stub</Location>"
+                        f"<Key>{self._key()}</Key><ETag>\"stub-etag\"</ETag>"
+                        "</CompleteMultipartUploadResult>"
+                    ).encode()
+                self._reply(200, body)
+
+            def do_HEAD(self) -> None:  # noqa: N802 - required name
+                self._note("HEAD")
+                stored = outer.objects.get(self._key())
+                self._reply(
+                    200 if stored is not None else 404,
+                    headers=(("Content-Length", str(len(stored or b""))),),
+                )
+
+        self._server = ThreadingHTTPServer(("127.0.0.1", self.port), Handler)
+        self._server.daemon_threads = True
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> S3Stub:
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+        return self
+
+    def stop(self) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+
+    @property
+    def url(self) -> str:
+        return f"http://127.0.0.1:{self.port}"
+
+    def keys(self) -> list[str]:
+        """The object keys that were uploaded, in arrival order."""
+        return list(self.objects)
+
+
 def write_config(
     path: Path,
     *,
@@ -295,10 +420,35 @@ def write_config(
     recordings_dir: Path,
     bridge_port: int,
     host: str = "127.0.0.1",
+    s3: S3Stub | None = None,
+    jibri_dir: Path | None = None,
 ) -> Path:
-    """Write a config.ini pointing the bridge at the given stubs."""
+    """Write a config.ini pointing the bridge at the given stubs.
+
+    The [s3] section is written only when a stub endpoint is given; without
+    one the daemon uploads nothing, which is how every other caller of this
+    runs.
+    """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    s3_section = (
+        f"""
+[s3]
+endpoint = {s3.url}
+bucket = stub-recordings
+prefix = videos
+access_key = stub-key
+secret_key = stub-secret
+path_style = true
+jibri_dir = {jibri_dir}
+; A recording is uploaded once it has been left alone this long; the smoke
+; test plants its recording already older than this.
+settle_seconds = 30
+wait_seconds = 10
+"""
+        if s3 is not None and jibri_dir is not None
+        else ""
+    )
     path.write_text(
         f"""; Generated by tools/stubs.py — points the bridge at stub services.
 [server]
@@ -328,7 +478,7 @@ port = {smtp.port}
 sender = bridge@example.com
 fallback_recipient = fallback@example.com
 use_starttls = false
-""",
+{s3_section}""",
         encoding="utf-8",
     )
     return path
@@ -337,7 +487,7 @@ use_starttls = false
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python3 -m tools.stubs",
-        description="Run stub Whisper, Ollama and SMTP services.",
+        description="Run stub Whisper, Ollama, SMTP and S3 services.",
     )
     parser.add_argument("--write-config", metavar="PATH", help="write a matching config.ini here")
     parser.add_argument(

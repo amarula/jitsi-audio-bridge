@@ -22,6 +22,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Archiving the recordings and video Jibri produced needs an S3 client. It is
+# an extra rather than a dependency because most deployments never configure
+# an endpoint, and boto3 is a large thing to install for something unused.
+s3 = [
+    "boto3>=1.34",
+]
 dev = [
     "pytest>=8",
     "ruff>=0.6",

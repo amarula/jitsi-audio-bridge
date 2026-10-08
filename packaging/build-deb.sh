@@ -49,7 +49,10 @@ install -d "$PKGROOT/DEBIAN" "$PKGROOT/usr/bin" "$PKGROOT/usr/lib/$PKG" \
 
 echo "==> creating the bundled virtualenv (python3 $PYTHON_MINOR, $ARCH)"
 python3 -m venv "$VENV"
-"$VENV/bin/pip" install --quiet --no-cache-dir "$ROOT"
+# The [s3] extra brings boto3 in: a package installed on a host that never
+# configures an endpoint would otherwise fail at the first upload, which is
+# the one moment nobody wants to discover a missing dependency.
+"$VENV/bin/pip" install --quiet --no-cache-dir "$ROOT[s3]"
 # Stamped so the launcher can explain itself when the package is installed on
 # a host whose python3 differs from the one it was built for.
 printf '%s\n' "$PYTHON_MINOR" > "$VENV/BUILT-FOR"
@@ -67,7 +70,7 @@ rm -rf "$VENV"/lib/python*/site-packages/pip \
        "$VENV"/lib/python*/site-packages/distutils-precedence.pth \
        "$VENV"/bin/pip "$VENV"/bin/pip3 "$VENV"/bin/pip3.* \
        "$VENV"/.gitignore
-"$VENV/bin/python" -c 'import jitsi_audio_bridge, websockets, requests'
+"$VENV/bin/python" -c 'import jitsi_audio_bridge, websockets, requests, boto3'
 
 # The deployment tools travel with the package: the verifier is meant to run
 # on the Jitsi host, which may have nothing but this .deb, and the sender lets

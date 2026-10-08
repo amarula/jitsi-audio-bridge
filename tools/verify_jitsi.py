@@ -46,6 +46,7 @@ import re
 import shutil
 import socket
 import ssl
+import stat
 import subprocess
 import sys
 import time
@@ -1355,6 +1356,45 @@ def bridge_recordings_dir() -> Path:
     return Path("/srv/recordings")
 
 
+def bridge_s3_config() -> tuple[str, str, str] | None:
+    """The bridge's ``[s3]`` section, when it is set up to archive recordings.
+
+    Returns ``(endpoint, bucket, jibri_dir)``, or ``None`` when the bridge does
+    not upload anything — an empty endpoint or bucket is what turns it off.
+    """
+    if not DEFAULT_BRIDGE_CONF.is_file():
+        return None
+    parser = configparser.ConfigParser(interpolation=None)
+    try:
+        parser.read(DEFAULT_BRIDGE_CONF)
+    except (OSError, configparser.Error):
+        return None
+    endpoint = parser.get("s3", "endpoint", fallback="").strip()
+    bucket = parser.get("s3", "bucket", fallback="").strip()
+    if not endpoint or not bucket:
+        return None
+    return endpoint, bucket, parser.get("s3", "jibri_dir", fallback="").strip()
+
+
+def readable_by_another_user(path: Path) -> bool | None:
+    """Whether a user who does not own *path* could open it.
+
+    The bridge runs as its own user and reads Jibri's recordings, which Jibri
+    writes as the ``jibri`` user.  ``os.access`` cannot answer this when the
+    checker runs as root — it says yes to everything — so the permission bits
+    are read instead.  Group access counts as possible, since the bridge's user
+    may well be in that group and this cannot see who is; only owner-only
+    permissions are reported, because those can never work.  ``None`` means the
+    path could not be examined.
+    """
+    try:
+        mode = stat.S_IMODE(path.stat().st_mode)
+    except OSError:
+        return None
+    # Readable by group or by other, and the directory traversable by the same.
+    return bool(mode & 0o040 or mode & 0o004) and bool(mode & 0o010 or mode & 0o001)
+
+
 def jibri_control_muc(text: str) -> str | None:
     """The brewery MUC Jibri itself logs into, read from its configuration.
 
@@ -1393,6 +1433,62 @@ def jibri_brewery_from_prosody(prosody_text: str | None) -> str | None:
         if block.name.startswith("internal.auth."):
             return f"jibribrewery@{block.name}"
     return None
+
+
+def check_recording_archive(jibri_dir: str | None) -> list[Check]:
+    """Whether the bridge can find what Jibri recorded, when it archives videos.
+
+    Two things go wrong quietly here: the bridge is pointed at a directory
+    Jibri does not write to — so it finds nothing and uploads nothing, with one
+    line in a log nobody reads — or it points at the right directory and cannot
+    read it, because the tree belongs to the jibri user and the bridge runs as
+    its own.
+    """
+    s3 = bridge_s3_config()
+    if s3 is None:
+        return [Check(
+            "recording.archive", Status.SKIP,
+            "the bridge does not archive recordings ([s3] endpoint and bucket are unset)",
+        )]
+    endpoint, bucket, configured_dir = s3
+    if jibri_dir is None:
+        return [Check(
+            "recording.archive", Status.SKIP,
+            f"{bucket} at {endpoint}: no Jibri configuration to compare "
+            f"[s3] jibri_dir = {configured_dir or '(unset)'} with",
+            fix="pass --jibri-conf if Jibri runs elsewhere",
+        )]
+    if configured_dir and Path(configured_dir) != Path(jibri_dir):
+        return [Check(
+            "recording.archive", Status.WARN,
+            f"the bridge looks for recordings in {configured_dir}, but this host's Jibri "
+            f"writes them to {jibri_dir}: nothing would ever be uploaded",
+            fix=f"set `[s3] jibri_dir = {jibri_dir}` in {DEFAULT_BRIDGE_CONF} and restart "
+                "the bridge",
+        )]
+
+    directory = Path(configured_dir or jibri_dir)
+    if not directory.is_dir():
+        return [Check(
+            "recording.archive", Status.WARN,
+            f"the bridge archives to {bucket} at {endpoint}, but {directory} does not "
+            "exist here, so it will find no recording to upload",
+            fix="check [s3] jibri_dir; a recording is only there once Jibri has made one",
+        )]
+
+    readable = readable_by_another_user(directory)
+    if readable is False:
+        return [Check(
+            "recording.archive", Status.WARN,
+            f"{bucket} at {endpoint}: {directory} is readable only by its owner, and the "
+            "bridge reads it as a different user",
+            fix=f"make it readable (chmod 0755 {directory}) or put the bridge's user in "
+                "the jibri group; the session directories inside need it too",
+        )]
+    return [Check(
+        "recording.archive", Status.PASS,
+        f"{bucket} at {endpoint}, reading {directory}",
+    )]
 
 
 def check_recording(deployment: Deployment) -> list[Check]:
@@ -1460,6 +1556,8 @@ def check_recording(deployment: Deployment) -> list[Check]:
         ))
     else:
         checks.append(Check("recording.directory", Status.PASS, f"Jibri records into {jibri_dir}"))
+
+    checks.extend(check_recording_archive(jibri_dir))
 
     if offered is not True:
         checks.append(Check(

@@ -68,6 +68,7 @@ from .audio import (
 )
 from .config import Config, ConfigError, load_config
 from .mailer import send_meeting_email
+from .s3_upload import upload_meeting_video
 from .timeline import SessionTimeline, TurnTracker, format_offset, merge_turns, utc_now
 
 logger = logging.getLogger(__name__)
@@ -708,7 +709,28 @@ def process_directory(meeting_dir: Path, config: Config) -> int:
     except Exception:
         logger.exception("processing failed for %s", meeting_dir)
         return 1
+
+    if config.s3.enabled:
+        # A directory processed in batch is an old meeting: its recording is
+        # either there already or was never made, so nothing is waited for.
+        upload_meeting_video(meeting_dir, config, wait=False)
     return 0 if sent else 1
+
+
+def upload_directory_video(meeting_dir: Path, config: Config) -> int:
+    """Upload one existing meeting directory's recording, and nothing else.
+
+    The videos of meetings processed before an endpoint was configured are
+    still on disk; this is how they are archived without transcribing them
+    again.  Returns a process exit status.
+    """
+    if not meeting_dir.is_dir():
+        logger.error("not a directory: %s", meeting_dir)
+        return 2
+    if not config.s3.enabled:
+        logger.error("[s3] endpoint and bucket are both required to upload a recording")
+        return 2
+    return 0 if upload_meeting_video(meeting_dir, config) else 1
 
 
 def _schedule_finalisation(state: SessionState, config: Config) -> None:
@@ -750,6 +772,22 @@ async def _run_post_processing(meeting_dir: Path, config: Config) -> None:
         except Exception:
             # A failed pipeline must not propagate into the connection handler.
             logger.exception("post-processing failed for %s", meeting_dir)
+
+    if not config.s3.enabled:
+        return
+    try:
+        # Outside the semaphore: a long recording is minutes of uploading, and
+        # the next meeting's transcript should not wait for it.  A recording
+        # that has not been finished yet is not waited for either, once the
+        # daemon is on its way out — nothing is lost by leaving it, the video
+        # is not ours to lose.
+        await asyncio.to_thread(
+            upload_meeting_video, meeting_dir, config, wait=not _SHUTDOWN.is_set()
+        )
+    except Exception:
+        # Whatever went wrong, it was not the meeting: the transcript and the
+        # mail are already out.
+        logger.exception("uploading the recording of %s failed", meeting_dir)
 
 
 @dataclass
@@ -1076,6 +1114,17 @@ def check_storage(config: Config) -> None:
             f"the recordings directory {directory} is not writable by uid {os.getuid()}"
         )
 
+    if config.s3.enabled and not config.s3.jibri_dir.is_dir():
+        # Not fatal: Jibri may be installed later, or the recordings may be
+        # mounted after this service starts.  But it is the likeliest reason
+        # for finding no recording, and saying so now beats saying it after
+        # the first meeting has already ended.
+        logger.warning(
+            "[s3] is configured, but %s does not exist: recordings will not be found "
+            "until Jibri writes one there",
+            config.s3.jibri_dir,
+        )
+
 
 async def serve(config: Config) -> None:
     """Run the WebSocket server until a termination signal arrives."""
@@ -1144,6 +1193,15 @@ def build_argument_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--upload-video",
+        metavar="PATH",
+        help=(
+            "upload the recording that belongs to an existing meeting directory "
+            "and exit, without transcribing anything. Needs [s3] endpoint and "
+            "bucket."
+        ),
+    )
+    parser.add_argument(
         "--log-level",
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
@@ -1165,9 +1223,9 @@ def main(argv: list[str] | None = None) -> int:
     try:
         config = load_config(args.config)
         set_ai_limits(config.ai.max_concurrent_requests, config.ai.max_attempts)
-        # Directory mode is handed an existing directory, so the recordings
-        # directory is only required when serving.
-        if args.process_dir is None:
+        # Both one-shot modes are handed an existing directory, so the
+        # recordings directory is only required when serving.
+        if args.process_dir is None and args.upload_video is None:
             check_storage(config)
     except ConfigError as exc:
         logger.error("%s", exc)
@@ -1175,6 +1233,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.process_dir is not None:
         return process_directory(Path(args.process_dir), config)
+
+    if args.upload_video is not None:
+        return upload_directory_video(Path(args.upload_video), config)
 
     try:
         asyncio.run(serve(config))

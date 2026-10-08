@@ -548,6 +548,58 @@ email — the transcript goes to the participants instead of
 directory only holds the meetings still running. Sessions that did send a
 control frame are untouched: their own `metadata.json` always wins.
 
+### 6. Optional — archive the recordings
+
+The video is the one product of a meeting the bridge cannot make itself: Jibri
+makes it, when a user presses Record, and the bridge only copies it out
+afterwards — to an S3-compatible bucket, if `[s3]` says where. That leaves the
+bridge to work out *which* recording belongs to the meeting it has just
+transcribed, and Jitsi tells it only two things:
+
+* **the room**, which Jibri puts in the filename it builds
+  (`<callName>_<yyyy-MM-dd-HH-mm-ss>.<ext>`) and again in the `metadata.json`
+  it writes beside the recording, as the call URL it joined with. With the
+  module in §5 in place, this is the same room name the bridge has;
+* **the time the recording stopped**, which is the timestamp on the filename
+  and the file's own mtime. The recording ends when somebody stops it, which
+  is after the meeting — so the bridge keeps looking for `[s3] wait_seconds`
+  after the transcript is written.
+
+Two rules follow for the deployment:
+
+```ini
+[s3]
+; Jibri's recording.recordings-directory, and *not* [storage] recordings_dir:
+; Jibri creates a session directory per recording, and a tree it cannot write
+; to is what makes it report itself unhealthy — the "all recorders are
+; currently busy" failure.
+jibri_dir = /srv/jibri-recordings
+```
+
+and the bridge's user has to be able to read that tree — it runs as
+`jitsi-bridge` while Jibri writes as `jibri`:
+
+```sh
+sudo chmod 0755 /srv/jibri-recordings
+# or, when the tree stays group-only (0750):
+sudo usermod -aG jibri jitsi-bridge
+```
+
+`jitsi-audio-bridge-verify` checks both, and says so by name when the bridge is
+pointed at a directory this host's Jibri does not write to — which is otherwise
+a silent failure, with one line in the log at the end of every meeting. If
+`delete_after_upload` is on, the bridge also writes there: add the directory to
+`ReadWritePaths` in the unit.
+
+The endpoint itself is one more outbound connection to whitelist, like the
+Whisper and Ollama ones — same host, same tunnel — and it is the failure that
+shows up last, because an upload that cannot connect costs a meeting nothing
+but its video. All of it goes to the one hostname the endpoint names, to
+`/<bucket>/<prefix>/<room>/<file>` on whatever port that URL carries; the
+README's [Network access](../README.md#network-access) has the request-by-request
+table to write a proxy rule from, including the hostname change that
+`path_style = false` brings.
+
 ## What arrives on the socket
 
 The JVB→service protocol is JSON text frames in a format derived from

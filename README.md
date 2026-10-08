@@ -36,6 +36,7 @@ and emails the result.
 ## Contents
 
 - [Requirements](#requirements)
+- [Network access](#network-access)
 - [Install](#install)
 - [Debian package](#debian-package)
 - [Configuration](#configuration)
@@ -59,9 +60,119 @@ and emails the result.
 | Whisper | Any HTTP endpoint accepting `{"audio_base64": ..., "filename": ...}` and returning `{"text": ...}` |
 | Ollama | Any HTTP endpoint accepting the `/api/generate` request shape |
 | SMTP | Any relay |
+| S3 | Optional: any S3-compatible endpoint, and Jibri's recordings directory readable — see [`[s3]`](#s3) |
 
 ffmpeg is **not** required. Audio is decoded in-process through libopus, which
 is both faster and less fragile than piping packets to a subprocess.
+
+## Network access
+
+Everything the daemon connects to is **outbound**, from the host it runs on, to
+an endpoint named in `config.ini`. Nothing needs to be opened towards it: the
+WebSocket server listens on `[server] host`/`port` (loopback by default) and the
+JVB connects to that.
+
+| Destination | Port | When | Configured by |
+|---|---|---|---|
+| Whisper endpoint | `443` (as written in its URL) | Every meeting, once per turn or recording | `[whisper] url` |
+| Ollama endpoint | `443` | Every meeting: language probe, summary, and the correction pass if enabled | `[ollama] url` |
+| SMTP relay | `25` by default, `587` for a relay that wants STARTTLS submission | When a meeting's summary is ready | `[smtp] host`, `[smtp] port` |
+| S3-compatible endpoint | `443` for TLS, `9000` for a MinIO reached directly | After the mail, when `[s3] endpoint` and `bucket` are set | `[s3] endpoint` |
+| Jibri's recordings | *(no network)* | Reading the meeting's video | `[s3] jibri_dir`, on this host |
+
+Port `465` is not on that list and will not work: it expects TLS from the first
+byte, while this daemon opens a plain connection and upgrades it with STARTTLS
+(`[smtp] use_starttls`), which is what `25` and `587` are for.
+
+Every URL in that table carries its own port, so what has to be reachable is
+whatever `[whisper] url`, `[ollama] url` and `[s3] endpoint` actually name —
+there is nothing else to read, and nothing is contacted that `config.ini` does
+not mention. The shipped defaults point at two external hostnames,
+`whisper.omnia.amarulasolutions.com` and `ollama.omnia.amarulasolutions.com`,
+so outbound `443` has to be open to those, and the same for whatever the S3
+endpoint turns out to be. Where the services sit behind a reverse proxy or a
+tunnel — Pangolin fronts both of the above — that is one hop more to whitelist:
+the daemon reaches them no other way, and a blocked connection is a per-request
+retry and then a failed meeting, not a startup error.
+
+Three things that catch people out:
+
+- **`path_style = false` moves the request to another hostname.** The bucket
+  becomes a subdomain of the endpoint — `https://bucket.minio.example.com/...`
+  — so a whitelist entry for the endpoint's own name is not enough, and the
+  certificate has to cover that name too. The default (`true`) keeps
+  everything on the one host.
+- **An empty `[s3] access_key`/`secret_key` makes botocore search for
+  credentials**, and on an EC2 instance that search ends at the instance
+  metadata service on `169.254.169.254:80`. Set the two keys explicitly (or in
+  `/etc/jitsi-audio-bridge/env`) to keep that lookup from happening at all.
+- **DNS has to work too**, including for whatever the tunnel carries; the
+  systemd unit already allows the address families name resolution needs
+  (`AF_INET`, `AF_INET6`, `AF_UNIX`, `AF_NETLINK`).
+
+### What the S3 upload asks for, request by request
+
+A proxy or firewall rule has to match something, so this is the whole of what
+leaves the daemon. With
+
+```ini
+[s3]
+endpoint = https://minio.omnia.amarulasolutions.com
+bucket = meetings
+prefix = videos
+path_style = true
+```
+
+every request goes to **one host** — `minio.omnia.amarulasolutions.com`, on the
+port written in that URL — and to a path of this shape, where only the room and
+the filename vary:
+
+```
+/meetings/videos/<room>/<room>_<yyyy-MM-dd-HH-mm-ss>.<ext>
+└─ bucket ─┘└ prefix ┘
+```
+
+| Method | URL | When |
+|---|---|---|
+| `POST` | `…?uploads` | opens a multipart upload |
+| `PUT` | `…?uploadId=…&partNumber=N` | one 8 MiB piece; several go at once |
+| `POST` | `…?uploadId=…` | completes the upload |
+| `PUT` | `…` — no query | the whole object, when it is under 8 MiB |
+| `HEAD` | `…` — no query | reads the size back before the claim is written |
+
+So **one resource for the hostname, with the path matched as `^/meetings/`**
+covers every request for every meeting; `/meetings/videos/**` is the narrower
+version of the same rule. The bucket is the first path segment and the prefix
+the second — a rule written for `/videos/` matches nothing at all.
+
+Three details worth knowing while writing that rule:
+
+- **Almost every request is a multipart one.** Boto3 switches at 8 MiB, and a
+  recording is far past that, so the single `PUT` is the rare case in a proxy
+  log, not the normal one.
+- **The query string is not part of the path**, and a rule anchored on the
+  filename (`…\.mp4$`) will not match the multipart requests, which carry on
+  past it with `?uploads` or `?partNumber=`.
+- **A path in `endpoint` is kept**: `https://gateway.example.com/minio` puts
+  everything under `/minio/meetings/…`, which is then the path to match.
+
+With `path_style = false` the same requests move to another hostname —
+`https://meetings.minio.omnia.amarulasolutions.com/videos/…` — which in a proxy
+means a wildcard resource and, for TLS, a certificate covering
+`*.minio.omnia.amarulasolutions.com`. The default (`true`) keeps everything on
+the one name.
+
+To see what a given installation actually talks to, read it off its own
+configuration rather than this table:
+
+```sh
+grep -E '^\[|url|endpoint|host|port' /etc/jitsi-audio-bridge/config.ini
+```
+
+A wrong Whisper or Ollama endpoint is visible at the first meeting; a wrong S3
+endpoint only ever produces a log line, because a failed upload is deliberately
+not allowed to cost a meeting its transcript — see
+[Archiving the video](#archiving-the-video).
 
 ## Install
 
@@ -74,10 +185,14 @@ git clone <this repo> /opt/jitsi-audio-bridge
 cd /opt/jitsi-audio-bridge
 
 python3 -m venv .venv
-.venv/bin/pip install .
+.venv/bin/pip install '.[s3]'          # drop [s3] to leave boto3 out
 cp config.ini.example config.ini
 $EDITOR config.ini
 ```
+
+The `s3` extra is what brings in boto3, which only
+[`[s3]`](#s3) uses; without it the daemon runs normally and says so if an
+upload is ever attempted.
 
 Install into `/opt`, **not** `/home`: the shipped systemd unit sets
 `ProtectHome=yes`, which makes `/home` inaccessible to the service.
@@ -285,6 +400,53 @@ a meeting is never mailed half-repaired.
 | `use_starttls` | boolean | `true` | `JITSI_AUDIO_BRIDGE_SMTP_USE_STARTTLS` |
 | `subject_suffix` | string | *(empty)* | `JITSI_AUDIO_BRIDGE_SMTP_SUBJECT_SUFFIX` |
 
+### `[s3]`
+
+Uploads the meeting's recording — the video Jibri made, if somebody pressed
+Record — to an S3-compatible endpoint once the meeting has been transcribed and
+mailed. Off unless both `endpoint` and `bucket` are set. The section does
+nothing on its own: Jibri has to be running and recording for there to be a
+video, and its recordings directory has to be readable from this host.
+
+| Option | Type | Default | Environment |
+|---|---|---|---|
+| `endpoint` | URL | *(empty)* | `JITSI_AUDIO_BRIDGE_S3_ENDPOINT` |
+| `bucket` | string | *(empty)* | `JITSI_AUDIO_BRIDGE_S3_BUCKET` |
+| `prefix` | string | *(empty)* | `JITSI_AUDIO_BRIDGE_S3_PREFIX` |
+| `region` | string | `us-east-1` | `JITSI_AUDIO_BRIDGE_S3_REGION` |
+| `access_key` | string | *(empty)* | `JITSI_AUDIO_BRIDGE_S3_ACCESS_KEY` |
+| `secret_key` | string | *(empty)* | `JITSI_AUDIO_BRIDGE_S3_SECRET_KEY` |
+| `path_style` | boolean | `true` | `JITSI_AUDIO_BRIDGE_S3_PATH_STYLE` |
+| `verify_tls` | boolean | `true` | `JITSI_AUDIO_BRIDGE_S3_VERIFY_TLS` |
+| `jibri_dir` | path | `/srv/jibri-recordings` | `JITSI_AUDIO_BRIDGE_S3_JIBRI_DIR` |
+| `wait_seconds` | seconds | `900` | `JITSI_AUDIO_BRIDGE_S3_WAIT_SECONDS` |
+| `settle_seconds` | seconds | `30` | `JITSI_AUDIO_BRIDGE_S3_SETTLE_SECONDS` |
+| `delete_after_upload` | boolean | `false` | `JITSI_AUDIO_BRIDGE_S3_DELETE_AFTER_UPLOAD` |
+
+Objects are stored as `<prefix>/<room>/<Jibri's own filename>`, so a bucket
+reads as one directory per room. Empty `access_key` and `secret_key` fall back
+to botocore's own credential chain — the environment, a shared credentials
+file, an instance profile — and `AWS_CA_BUNDLE` names a CA for an endpoint with
+a certificate of its own.
+
+`endpoint` is the one host that has to be reachable from this daemon for the
+upload to work, outbound, on whatever port it names — see
+[Network access](#network-access) for what to whitelist and what changes when
+`path_style` is off.
+
+`jibri_dir` must be Jibri's `recordings_directory` and must not be this
+daemon's `recordings_dir`: Jibri creates a session directory per recording, and
+a bridge-owned directory it cannot write to is what makes Jibri report itself
+unhealthy. See [Jitsi integration](docs/jitsi-integration.md) for how the two
+trees end up apart.
+
+The daemon finds the recording by room name and by time: Jibri names each file
+after the call and stamps the moment the recording stopped onto it, and it
+leaves a `metadata.json` holding the call URL beside it. A recording that
+stopped too long before the meeting began, or that another meeting has already
+uploaded, is not a candidate. See [Output layout](#output-layout) for what the
+meeting directory records about the upload.
+
 Booleans accept `true/false`, `yes/no`, `on/off` and `1/0`. Values are validated
 at startup and a bad one names the exact setting and where it came from:
 
@@ -334,6 +496,7 @@ however it was installed.
 |---|---|
 | `--config PATH` | Configuration file to read |
 | `--process-dir PATH` | Process an existing meeting directory and exit, instead of serving — see [Batch mode](#batch-mode) |
+| `--upload-video PATH` | Upload the recording that belongs to an existing meeting directory, and nothing else — see [Archiving the video](#archiving-the-video) |
 | `--log-level LEVEL` | `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` (default `INFO`) |
 | `--version` | Print the version and exit |
 
@@ -558,7 +721,7 @@ the environment stays up and prints the URL to point the sender at.
 |---|---|
 | `tools.testenv` | Starts the stubs and the real daemon together, wired with a generated `config.ini` |
 | `tools.send_meeting` | The sender simulator: speaks the wire protocol from the [Wire protocol](#wire-protocol) section |
-| `tools.stubs` | Stub Whisper, Ollama and SMTP, each runnable on its own |
+| `tools.stubs` | Stub Whisper, Ollama, SMTP and S3, each runnable on its own |
 | `tools.sample_audio` | Synthesises speech WAVs with ffmpeg, for the replay path |
 
 ### Driving it by hand
@@ -603,7 +766,8 @@ bridge records with what the real sender produces.
 ├── extracted_audio.wav      # only when a master recording had to be extracted
 ├── transcript.txt           # written once post-processing succeeds
 ├── transcript.corrected.txt # only with [ollama] correct_transcript
-└── summary.md               # the LLM summary, likewise
+├── summary.md               # the LLM summary, likewise
+└── video.json               # only with [s3]: where the recording went
 ```
 
 `timeline.json` is written for sessions fed by the JVB's media export (the
@@ -639,6 +803,51 @@ Where a control frame did arrive, `transcript.txt` is attributed by name:
 
 Note that blocks are ordered by participant, not by time — see
 [Limitations](#limitations).
+
+### Archiving the video
+
+If Jibri recorded the meeting and `[s3]` is configured, the recording is
+uploaded after the mail has gone out — never before it, because a long upload
+should not delay a transcript, and never *instead* of it, because a broken
+endpoint must not cost a meeting its summary. What was uploaded is recorded in
+the meeting directory, which is what makes the upload idempotent and what stops
+a second meeting in the same room from claiming the same file:
+
+```json
+{
+  "source": "/srv/jibri-recordings/<jibri-session>/Room_2026-10-08-10-11-12.mp4",
+  "bucket": "meetings",
+  "key": "videos/Room/Room_2026-10-08-10-11-12.mp4",
+  "url": "https://minio.example.com/meetings/videos/Room/Room_2026-10-08-10-11-12.mp4",
+  "size": 104857600,
+  "confirmed_size": 104857600,
+  "room_name": "Room",
+  "uploaded_at": "2026-10-08T10:15:00+00:00"
+}
+```
+
+`confirmed_size` is what the endpoint itself reports for the object, and
+`delete_after_upload` only removes the local file when it matches both the size
+that was uploaded and the size on disk: an upload that half-finished must not
+take the only copy with it.
+
+The recording is looked for by room name and by time, and it is given up to
+`wait_seconds` to appear, because the file does not exist until somebody stops
+the recording — which is usually after the meeting, and can be well after the
+transcript is written. If nothing matches, the log says which rooms *were*
+found, which is usually enough to see why:
+
+```
+no recording of 'Standup' in /srv/jibri-recordings; found 'Retrospective', 'Daily' (outside the meeting)
+```
+
+To archive the videos of meetings that were processed before an endpoint was
+configured, point the daemon at the directory and let it upload without
+transcribing anything again:
+
+```sh
+jitsi-audio-bridge --upload-video /srv/recordings/<sessionId>
+```
 
 ## Troubleshooting
 
@@ -756,7 +965,16 @@ daemon closes every file in a `finally`, so this needs a hard kill; see
   A participant whose every turn failed is handed over as one whole recording
   instead — and if that fails too, their turns join the retry pass. Anything
   else — a 4xx, an unreadable file, SMTP — is logged and skipped, as before.
-- **No retention policy.** Recordings accumulate indefinitely.
+- **No retention policy.** Recordings accumulate indefinitely, here and in the
+  bucket. `[s3] delete_after_upload` frees the local copy once the endpoint has
+  confirmed it; nothing prunes either side after that.
+- **The video is matched by room and time, not by identity.** Jibri does not
+  tell the daemon which meeting it recorded, so a recording is the one whose
+  room name and ending time fit this meeting's. Two meetings in one room at
+  once — or a recording started by hand well before the meeting — can be
+  matched wrongly, and a recording already uploaded by another meeting is
+  deliberately not a candidate. `video.json` records what was chosen, so a
+  wrong match is visible after the fact.
 - **Last control frame wins.** Participant metadata is replaced, not merged, so
   someone who left before the final frame may lose their name.
 
@@ -793,6 +1011,7 @@ Modules are deliberately isolated:
 | `audio` | Decode Opus, parse metadata | libopus |
 | `ai_client` | Talk to Whisper and Ollama | HTTP |
 | `mailer` | Send the summary | SMTP |
+| `s3_upload` | Archive the meeting's recording | S3, Jibri's recordings |
 | `daemon` | Serve WebSockets, run the pipeline | asyncio |
 
 `config` is the only module that reads the environment or parses a config file;

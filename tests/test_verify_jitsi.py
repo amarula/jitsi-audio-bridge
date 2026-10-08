@@ -39,6 +39,7 @@ from tools.verify_jitsi import (
     check_meet_config,
     check_prosody,
     check_recording,
+    check_recording_archive,
     classify_jicofo,
     classify_jvb,
     exit_code,
@@ -1390,6 +1391,128 @@ def test_recording_warns_when_jibri_writes_into_the_bridge_tree(
     )
     check = next(c for c in check_recording(into_moved) if c.id == "recording.directory")
     assert check.status is Status.WARN
+
+
+def _bridge_s3_conf(
+    tmp_path: Path,
+    jibri_dir: str,
+    *,
+    endpoint: str = "https://minio.example.com",
+    bucket: str = "meetings",
+) -> Path:
+    path = tmp_path / "bridge-config.ini"
+    path.write_text(
+        "[storage]\n"
+        "recordings_dir = /srv/recordings\n"
+        "\n"
+        "[s3]\n"
+        f"endpoint = {endpoint}\n"
+        f"bucket = {bucket}\n"
+        f"jibri_dir = {jibri_dir}\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_the_archive_check_is_skipped_unless_the_bridge_uploads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(verify_jitsi, "DEFAULT_BRIDGE_CONF", tmp_path / "absent.ini")
+    checks = check_recording_archive("/srv/jibri-recordings")
+    assert _status(checks, "recording.archive") is Status.SKIP
+
+    # An endpoint with no bucket is not an upload either.
+    monkeypatch.setattr(
+        verify_jitsi, "DEFAULT_BRIDGE_CONF", _bridge_s3_conf(tmp_path, "/srv/jibri", bucket="")
+    )
+    checks = check_recording_archive("/srv/jibri-recordings")
+    assert _status(checks, "recording.archive") is Status.SKIP
+
+
+def test_the_archive_check_catches_a_directory_jibri_does_not_write_to(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The likeliest misconfiguration, and the quietest: nothing is uploaded."""
+    jibri_dir = tmp_path / "jibri-recordings"
+    jibri_dir.mkdir()
+    monkeypatch.setattr(
+        verify_jitsi,
+        "DEFAULT_BRIDGE_CONF",
+        _bridge_s3_conf(tmp_path, str(tmp_path / "somewhere-else")),
+    )
+    check = next(
+        c for c in check_recording_archive(str(jibri_dir)) if c.id == "recording.archive"
+    )
+    assert check.status is Status.WARN
+    assert str(jibri_dir) in check.fix
+
+    monkeypatch.setattr(
+        verify_jitsi, "DEFAULT_BRIDGE_CONF", _bridge_s3_conf(tmp_path, str(jibri_dir))
+    )
+    check = next(
+        c for c in check_recording_archive(str(jibri_dir)) if c.id == "recording.archive"
+    )
+    assert check.status is Status.PASS
+    assert "meetings" in check.summary
+
+
+def test_the_archive_check_notices_a_tree_the_bridge_cannot_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Jibri's tree belongs to the jibri user; the bridge runs as its own."""
+    jibri_dir = tmp_path / "jibri-recordings"
+    jibri_dir.mkdir()
+    monkeypatch.setattr(
+        verify_jitsi, "DEFAULT_BRIDGE_CONF", _bridge_s3_conf(tmp_path, str(jibri_dir))
+    )
+
+    jibri_dir.chmod(0o700)
+    check = next(
+        c for c in check_recording_archive(str(jibri_dir)) if c.id == "recording.archive"
+    )
+    assert check.status is Status.WARN
+    assert "chmod" in check.fix
+
+    jibri_dir.chmod(0o755)
+    check = next(
+        c for c in check_recording_archive(str(jibri_dir)) if c.id == "recording.archive"
+    )
+    assert check.status is Status.PASS
+
+
+def test_the_archive_check_reports_a_directory_that_is_not_there(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        verify_jitsi,
+        "DEFAULT_BRIDGE_CONF",
+        _bridge_s3_conf(tmp_path, str(tmp_path / "not-created-yet")),
+    )
+    check = next(
+        c
+        for c in check_recording_archive(str(tmp_path / "not-created-yet"))
+        if c.id == "recording.archive"
+    )
+    assert check.status is Status.WARN
+    assert "does not exist" in check.summary
+
+
+def test_readable_by_another_user_reads_the_permission_bits(tmp_path: Path) -> None:
+    """os.access says yes to everything when the checker runs as root."""
+    directory = tmp_path / "tree"
+    directory.mkdir()
+    directory.chmod(0o700)
+    assert verify_jitsi.readable_by_another_user(directory) is False
+    # Group-readable is "maybe": the bridge user may be in that group, which
+    # this cannot see, so it is not reported as a problem.
+    directory.chmod(0o750)
+    assert verify_jitsi.readable_by_another_user(directory) is True
+    # Readable but not traversable is still unreachable for a directory.
+    directory.chmod(0o704)
+    assert verify_jitsi.readable_by_another_user(directory) is False
+    directory.chmod(0o755)
+    assert verify_jitsi.readable_by_another_user(directory) is True
+    assert verify_jitsi.readable_by_another_user(tmp_path / "absent") is None
 
 
 def test_classify_jicofo_collects_only_the_watched_brewery() -> None:

@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import os
 import re
 import sys
 import time
@@ -30,7 +31,14 @@ if str(ROOT) not in sys.path:
 
 from tools.send_meeting import Participant  # noqa: E402
 from tools.send_meeting import main as send_main  # noqa: E402
-from tools.stubs import OllamaStub, SmtpStub, WhisperStub, free_port, write_config  # noqa: E402
+from tools.stubs import (  # noqa: E402
+    OllamaStub,
+    S3Stub,
+    SmtpStub,
+    WhisperStub,
+    free_port,
+    write_config,
+)
 from tools.testenv import Bridge  # noqa: E402
 from tools.verify_jitsi import main as verify_main  # noqa: E402
 
@@ -326,16 +334,45 @@ def build_master_recording(meeting_dir: Path) -> Path | None:
     return master if muxed.returncode == 0 else None
 
 
+def plant_jibri_recording(
+    jibri_dir: Path, room: str, age_seconds: float = 60, size: int = 9 << 20
+) -> Path:
+    """A recording Jibri has already finished, waiting to be picked up.
+
+    Jibri's own layout, down to the layout inside the directory: a session
+    directory holding the recording — named after the room, stamped with the
+    moment it stopped — and the metadata Jibri leaves beside it.
+
+    The size is above boto3's 8 MiB multipart threshold by default, because
+    that is the path every real recording takes; a smaller one would test a
+    branch no meeting ever reaches.
+    """
+    session = jibri_dir / "jibri-session-smoke"
+    session.mkdir(parents=True, exist_ok=True)
+    stopped = time.time() - age_seconds
+    recording = session / f"{room}_{time.strftime('%Y-%m-%d-%H-%M-%S', time.gmtime(stopped))}.mp4"
+    recording.write_bytes(b"\x00\x00\x00\x18ftypmp42" + b"\x00" * (size - 8))
+    os.utime(recording, (stopped, stopped))
+    (session / "metadata.json").write_text(
+        json.dumps({"meeting_url": f"https://jitsi.example.com/{room}", "participants": []}),
+        encoding="utf-8",
+    )
+    return recording
+
+
 def main() -> int:
-    whisper, ollama, smtp = WhisperStub(), OllamaStub(), SmtpStub()
+    whisper, ollama, smtp, s3 = WhisperStub(), OllamaStub(), SmtpStub(), S3Stub()
     whisper.start()
     ollama.start()
     smtp.start()
+    s3.start()
 
     workdir = Path("/tmp") / f"jitsi-bridge-smoke-{int(time.time())}"
     recordings = workdir / "recordings"
     mail_dir = workdir / "mail"
+    jibri_dir = workdir / "jibri-recordings"
     recordings.mkdir(parents=True)
+    jibri_dir.mkdir(parents=True)
     smtp.mail_dir = mail_dir  # keep the delivered message for inspection
     mail_dir.mkdir(exist_ok=True)
     port = free_port()
@@ -347,6 +384,8 @@ def main() -> int:
         smtp=smtp,
         recordings_dir=recordings,
         bridge_port=port,
+        s3=s3,
+        jibri_dir=jibri_dir,
     )
     bridge = Bridge(config_path, port, workdir).start()
     url = f"ws://127.0.0.1:{port}/transcribe"
@@ -665,7 +704,50 @@ def main() -> int:
         check("the deployment probe fails on a path the bridge does not serve",
               refused == 1, f"exit {refused}")
 
-        print("\n10. directory mode (--process-dir)")
+        print("\n10. the meeting's recording is archived to S3")
+        # Jibri's tree is empty until now: the recording appears when somebody
+        # stops it, which is around when the meeting ends, so planting it just
+        # before sending the meeting is what the daemon actually sees.
+        planted = plant_jibri_recording(jibri_dir, "Video-Test-Room")
+        send_meeting(
+            url,
+            session_id="s3video",
+            participants=1,
+            duration=2,
+            room_name="Video Test Room",
+            fast=True,
+            participant=["erin:Erin:erin@example.com"],
+        )
+
+        video_session = recordings / "s3video"
+        claim = video_session / "video.json"
+        wait_for(claim.exists, timeout=60)
+        check("a finished recording is uploaded and claimed", claim.is_file(),
+              f"contents: {sorted(p.name for p in video_session.iterdir())}"
+              if video_session.is_dir() else "no session directory")
+        key = f"videos/Video-Test-Room/{planted.name}"
+        check("the recording reached the bucket under the room's prefix",
+              s3.objects.get(key) == planted.read_bytes(),
+              f"keys: {s3.keys()}")
+        check("the upload was signed",
+              bool(s3.requests) and all(
+                  auth.startswith("AWS4-HMAC-SHA256") for _, _, auth in s3.requests
+              ),
+              str(s3.requests)[:160])
+        # Over 8 MiB, so this is the multipart path: initiated, part-uploaded
+        # and completed, which is what a real recording does.
+        multipart = [path for method, path, _ in s3.requests if method == "POST"]
+        check("a recording the size of a real one is uploaded in parts",
+              len(multipart) == 2 and any("uploads" in path for path in multipart),
+              str([(m, p) for m, p, _ in s3.requests])[:200])
+        if claim.is_file():
+            written = json.loads(claim.read_text())
+            check("the claim names where it went and where it came from",
+                  written.get("key") == key and written.get("source") == str(planted),
+                  json.dumps(written))
+        check("the local recording is kept unless asked otherwise", planted.is_file())
+
+        print("\n11. directory mode (--process-dir)")
         check_directory_mode(config_path, workdir, smtp, ollama)
 
     finally:
@@ -673,6 +755,7 @@ def main() -> int:
         whisper.stop()
         ollama.stop()
         smtp.stop()
+        s3.stop()
 
     failed = [name for name, ok, _ in CHECKS if not ok]
     print(f"\n{len(CHECKS) - len(failed)}/{len(CHECKS)} checks passed")

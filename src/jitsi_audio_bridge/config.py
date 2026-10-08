@@ -79,6 +79,27 @@ DEFAULTS: dict[str, dict[str, str]] = {
         # Appended to the subject line, e.g. " - Amarula Solutions".
         "subject_suffix": "",
     },
+    "s3": {
+        # Empty endpoint or bucket turns the whole feature off.
+        "endpoint": "",
+        "bucket": "",
+        "prefix": "",
+        "region": "us-east-1",
+        # Empty credentials fall back to botocore's own resolution: the
+        # environment, a shared credentials file, or an instance profile.
+        "access_key": "",
+        "secret_key": "",
+        "path_style": "true",
+        # Set to false only for an endpoint with a self-signed certificate.
+        "verify_tls": "true",
+        # Where Jibri writes its recordings.
+        "jibri_dir": "/srv/jibri-recordings",
+        # How long to wait for the recording to appear after the meeting ends.
+        "wait_seconds": "900",
+        # How long a recording must have been untouched before it is uploaded.
+        "settle_seconds": "30",
+        "delete_after_upload": "false",
+    },
 }
 
 
@@ -191,6 +212,47 @@ class SmtpConfig:
 
 
 @dataclass(frozen=True)
+class S3Config:
+    """Where a finished meeting's video is uploaded, and how.
+
+    An S3-compatible endpoint holds the video, which is the one product of a
+    meeting this daemon cannot make itself: Jibri records it, and only when
+    somebody asked it to.  Everything here is empty by default, so a
+    deployment that does not archive its recordings uploads nothing.
+    """
+
+    endpoint: str
+    bucket: str
+    #: Key prefix, e.g. ``meetings``.  Empty puts the videos at the root.
+    prefix: str
+    region: str
+    access_key: str
+    secret_key: str
+    #: Address the bucket as ``endpoint/bucket`` rather than
+    #: ``bucket.endpoint``.  Nearly every self-hosted S3-compatible server
+    #: wants the former, and AWS accepts both.
+    path_style: bool
+    verify_tls: bool
+    #: Where Jibri writes its recordings; the video for a meeting is found
+    #: here.  It must not be the bridge's own recordings directory.
+    jibri_dir: Path
+    #: How long to keep looking for a recording that has not appeared yet.
+    #: The recording ends when somebody stops it, which can be after the
+    #: meeting and after its transcript has been written.
+    wait_seconds: float = 900.0
+    #: How long a recording must have been untouched before it is uploaded,
+    #: so that an ffmpeg still writing its last frames is left alone.
+    settle_seconds: float = 30.0
+    #: Remove the local recording once the endpoint has confirmed it.
+    delete_after_upload: bool = False
+
+    @property
+    def enabled(self) -> bool:
+        """Whether an endpoint and a bucket were configured."""
+        return bool(self.endpoint and self.bucket)
+
+
+@dataclass(frozen=True)
 class Config:
     """Fully resolved configuration."""
 
@@ -201,6 +263,7 @@ class Config:
     whisper: EndpointConfig
     ollama: OllamaConfig
     smtp: SmtpConfig
+    s3: S3Config
     #: The file the values came from, or ``None`` if only defaults applied.
     source: Path | None = None
 
@@ -380,6 +443,22 @@ def load_config(path: str | os.PathLike[str] | None = None) -> Config:
             fallback_recipient=resolver.text("smtp", "fallback_recipient"),
             use_starttls=resolver.boolean("smtp", "use_starttls"),
             subject_suffix=resolver.text("smtp", "subject_suffix"),
+        ),
+        s3=S3Config(
+            # endpoint and bucket are optional: empty ones are what turns the
+            # upload off, so a missing endpoint is not a configuration error.
+            endpoint=resolver.text("s3", "endpoint"),
+            bucket=resolver.text("s3", "bucket"),
+            prefix=resolver.text("s3", "prefix"),
+            region=resolver.text("s3", "region"),
+            access_key=resolver.text("s3", "access_key"),
+            secret_key=resolver.text("s3", "secret_key"),
+            path_style=resolver.boolean("s3", "path_style"),
+            verify_tls=resolver.boolean("s3", "verify_tls"),
+            jibri_dir=resolver.path("s3", "jibri_dir"),
+            wait_seconds=resolver.number("s3", "wait_seconds", minimum=0.0),
+            settle_seconds=resolver.number("s3", "settle_seconds", minimum=0.0),
+            delete_after_upload=resolver.boolean("s3", "delete_after_upload"),
         ),
         source=source,
     )

@@ -91,6 +91,58 @@ model = qwen2.5:14b-instruct
 timeout = 600
 verify_tls = true
 
+[s3]
+; Copy the meeting's Jibri recording -- the video -- to an S3-compatible
+; endpoint once the meeting has been transcribed.  Empty endpoint and bucket
+; (the defaults) turn the whole thing off.
+;
+; The video is the one product of a meeting this daemon does not make itself:
+; Jibri makes it, when somebody pressed Record, and writes it into its own
+; recordings directory.  The two have to be readable from here -- give the
+; jitsi-bridge user access to that directory, and add it to ReadWritePaths in
+; /lib/systemd/system/jitsi-audio-bridge.service if delete_after_upload is on.
+; The endpoint is the one host that has to be reachable from this daemon for
+; the upload to work -- outbound, on the port written here (443 for TLS, 9000
+; for a MinIO reached directly), through a tunnel or proxy if that is how the
+; other services are reached.  Everything goes to <endpoint>/<bucket>/<prefix>/
+; <room>/<filename>, so that is the path a proxy rule has to match -- and a
+; path in the endpoint itself is kept.  See "Network access" in the README for
+; the request-by-request table; with path_style = false the request moves to
+; <bucket>.<endpoint>, which a rule for the endpoint's own name would not cover.
+endpoint =
+bucket =
+; Key prefix, e.g. meetings.  Objects are stored as
+; <prefix>/<room>/<jibri's own filename>.
+prefix =
+region = us-east-1
+; Leave both blank to use botocore's own credential chain: the environment
+; (AWS_ACCESS_KEY_ID and friends), a shared credentials file, or an instance
+; profile.  The environment variables JITSI_AUDIO_BRIDGE_S3_ACCESS_KEY and
+; JITSI_AUDIO_BRIDGE_S3_SECRET_KEY work here too, which is how they are kept
+; out of this file in the shipped deployment.
+access_key =
+secret_key =
+; Address the bucket as endpoint/bucket rather than bucket.endpoint.
+; Nearly every self-hosted S3-compatible server wants this; AWS accepts both.
+path_style = true
+; Set to false only for an endpoint with a self-signed certificate.  Name a CA
+; bundle in AWS_CA_BUNDLE instead when there is one.
+verify_tls = true
+; Where Jibri writes its recordings.  Must not be the same directory as
+; [storage] recordings_dir: Jibri's session directories collide with meetings
+; and Jibri reports itself unhealthy when it cannot create one.
+jibri_dir = /srv/jibri-recordings
+; How long to keep looking for the recording after the meeting ends.  The
+; recording stops when somebody stops it, which can be well after the meeting
+; itself, and its file does not exist until then.
+wait_seconds = 900
+; How long the recording must have been untouched before it is uploaded, so
+; that an ffmpeg still flushing its last frames is left alone.
+settle_seconds = 30
+; Delete the local recording once the endpoint has confirmed it, byte for
+; byte.  Off by default: the recording is the only copy until then.
+delete_after_upload = false
+
 [smtp]
 host = 127.0.0.1
 port = 25

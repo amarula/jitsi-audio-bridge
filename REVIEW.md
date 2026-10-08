@@ -347,6 +347,33 @@ second live connection with the same identifier and refusing to re-process a
 finished one. A `session.json` recording the state would also make an
 interrupted run detectable.
 
+### The recording is matched to a meeting by name and time — **Medium**
+
+Jibri is told which room to record but never tells anyone which conference it
+recorded — it names the file after the call, stamps the moment the recording
+stopped onto it, and writes the call URL into a `metadata.json` beside it. That
+is all `[s3]` has to go on, so a recorded meeting is matched to a recording by
+room name (normalised, metadata first) and by time: of that room's recordings,
+the most recent one that stopped after the meeting began and that no other
+meeting has claimed.
+
+Two meetings in one room at the same time, or a recording started by hand long
+before the meeting, can be matched wrongly; a recording that is still being
+written is deliberately left alone until `settle_seconds` have passed. What was
+chosen is written into `video.json`, so a wrong match is visible after the fact
+rather than silent.
+
+*Fix, if it matters:* have Jicofo pass `file_recording_metadata` — Jibri
+flattens it into that same `metadata.json`, so a `meeting_id` put there would
+be an exact key instead of a heuristic. That requires a Jicofo/Jibri
+configuration this repository does not own.
+
+The upload itself is one `upload_file` call under botocore's retries: no
+resume, no checksum beyond the size the endpoint reports back, and a claim
+that lives in the meeting directory — delete that directory and a later run
+can upload the same recording again (to the same key, so nothing is
+duplicated in the bucket).
+
 ### `wave` header only finalises on close — **Low**
 
 `Wave_write.close()` is what writes the true lengths into the RIFF header. A
