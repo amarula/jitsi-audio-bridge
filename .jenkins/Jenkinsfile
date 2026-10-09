@@ -52,7 +52,11 @@ pipeline {
 
     options {
         disableConcurrentBuilds(abortPrevious: true)
-        buildDiscarder(logRotator(numToKeepStr: '30', artifactNumToKeepStr: '5'))
+        // Thirty builds or thirty days, which is the org's documented habit
+        // for a verification job; the artifacts go with their build.
+        buildDiscarder(
+            logRotator(daysToKeepStr: '30', numToKeepStr: '30', artifactNumToKeepStr: '5')
+        )
         // The whole build is minutes.  Anything near this is a hung pull
         // holding an executor, not work.
         timeout(time: 45, unit: 'MINUTES')
