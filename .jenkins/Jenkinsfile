@@ -1,0 +1,215 @@
+// SPDX-FileCopyrightText: 2026 Amarula Solutions
+// SPDX-License-Identifier: AGPL-3.0-only
+//
+// The same verification the GitHub Action runs, for whoever builds this on
+// Jenkins: lint, the unit suite on every python the project claims, the daemon
+// end to end, and a Debian package per distribution — each of them in the
+// container that distribution's build needs.
+//
+// Setup, once: a Multibranch Pipeline job pointed at the repository, with
+// Script Path `.jenkins/Jenkinsfile`, an agent label that can run `docker`,
+// and tag discovery switched on if the version guard is to mean anything.
+// Nothing is published from here — the packages are archived as build
+// artifacts and releasing stays with the GitHub workflow — so exactly one
+// thing creates a release.
+//
+// All of the work happens in .jenkins/steps/*.sh, run by .jenkins/container.sh,
+// which mounts this workspace read-only and copies the tree into the container:
+// a Jenkins agent is long-lived, and root-owned files left in a workspace break
+// the next build's checkout.  That is also why every `sh` string below is
+// single-quoted and every variable in it belongs to the shell — a Groovy
+// double-quoted string would interpolate `$PYTHON` on the controller, where it
+// means nothing, and the mistake would look like an empty image name.
+
+def pythonVersions = ['3.11', '3.12', '3.13', '3.14']
+def distributions = ['debian:12', 'debian:13', 'ubuntu:24.04']
+// Not a job parameter's default resolution order to rely on: on the very first
+// build of a multibranch job the parameters do not exist yet.
+def registry = (params.REGISTRY ?: '')
+def agentLabel = (params.AGENT_LABEL ?: 'debian')
+
+pipeline {
+    // Never an executor for the whole build: the matrices want seven of their
+    // own, and a pipeline-level agent would be held while they wait for one.
+    agent none
+
+    parameters {
+        string(
+            name: 'AGENT_LABEL',
+            // `debian` is one of the labels the Amarula Jenkins already uses;
+            // whichever is chosen must be a node with docker, git and a route
+            // to the registry or Docker Hub.  A label matching no node leaves
+            // the build queued forever, which is why it is not detected here.
+            defaultValue: 'debian',
+            description: 'Label of the agent this runs on; it must have docker and git',
+        )
+        string(
+            name: 'REGISTRY',
+            defaultValue: '',
+            description: 'Prefix for every image, e.g. registry.example.com/library/ — empty means Docker Hub',
+        )
+    }
+
+    options {
+        disableConcurrentBuilds(abortPrevious: true)
+        buildDiscarder(logRotator(numToKeepStr: '30', artifactNumToKeepStr: '5'))
+        // The whole build is minutes.  Anything near this is a hung pull
+        // holding an executor, not work.
+        timeout(time: 45, unit: 'MINUTES')
+        // Each stage checks out what it needs; an implicit checkout per stage
+        // would do it twice for the cells that also read their step scripts.
+        skipDefaultCheckout(true)
+    }
+
+    environment {
+        // Debian wants a person in the package's Maintainer field, not a
+        // company.  .jenkins/container.sh passes it into the container.
+        DEB_MAINTAINER = 'Michael Trimarchi <michael@amarulasolutions.com>'
+        // A mirror, or nothing: "${IMAGE_REGISTRY}python:3.13-slim" is a
+        // Docker Hub name when this is empty.
+        IMAGE_REGISTRY = "${registry}"
+    }
+
+    stages {
+        stage('Preflight') {
+            agent { label agentLabel }
+            steps {
+                checkout scm
+                // Both, before anything else waits on them: a missing docker
+                // or git on the agent is otherwise reported by seven cells at
+                // once, in the least helpful way.
+                sh 'docker version --format "docker {{.Server.Version}}"'
+                sh 'git --version'
+            }
+        }
+
+        stage('Pull base images') {
+            agent { label agentLabel }
+            steps {
+                checkout scm
+                script {
+                    // Once, with retries, rather than seven times in parallel:
+                    // anonymous Docker Hub pulls for a matrix are a rate limit
+                    // waiting to happen.
+                    (pythonVersions.collect { "python:${it}-slim" } + distributions).each { image ->
+                        retry(3) {
+                            sh "docker pull '${registry}${image}'"
+                        }
+                    }
+                }
+            }
+        }
+
+        // Jenkins cannot stop the GitHub release — it fires on the same tag
+        // push — so this is the early warning, not a gate.  `beforeAgent`
+        // keeps it free on the branch builds it has nothing to say about.
+        stage('Version guard') {
+            when { beforeAgent true; buildingTag() }
+            agent { label agentLabel }
+            steps {
+                checkout scm
+                sh 'sh .jenkins/steps/version.sh'
+            }
+        }
+
+        stage('Lint') {
+            agent { label agentLabel }
+            steps {
+                checkout scm
+                sh './.jenkins/container.sh "${IMAGE_REGISTRY}python:3.13-slim" reports/lint "$(cat .jenkins/steps/lint.sh)"'
+            }
+        }
+
+        stage('Unit tests') {
+            matrix {
+                agent { label agentLabel }
+                axes {
+                    axis {
+                        name 'PYTHON'
+                        values '3.11', '3.12', '3.13', '3.14'
+                    }
+                }
+                stages {
+                    stage('pytest') {
+                        steps {
+                            checkout scm
+                            script {
+                                // returnStatus rather than a failing step, so
+                                // the report is published either way: the
+                                // reason a cell is red is usually in it.
+                                def status = sh(
+                                    returnStatus: true,
+                                    script: '''
+                                        export CONTAINER_ENV="DEB_MAINTAINER PYTEST_PREFIX"
+                                        export PYTEST_PREFIX="py$(printf '%s' "$PYTHON" | tr -d '.')"
+                                        ./.jenkins/container.sh "${IMAGE_REGISTRY}python:${PYTHON}-slim" reports "$(cat .jenkins/steps/test.sh)"
+                                    ''',
+                                )
+                                junit testResults: 'reports/*.xml', allowEmptyResults: true
+                                if (status != 0) {
+                                    error("pytest failed on python ${PYTHON} (exit ${status})")
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Smoke test') {
+            agent { label agentLabel }
+            steps {
+                checkout scm
+                sh './.jenkins/container.sh "${IMAGE_REGISTRY}python:3.14-slim" reports/smoke "$(cat .jenkins/steps/smoke.sh)"'
+                // The run's own work directory, which is the first thing
+                // anybody wants when a check failed.
+                archiveArtifacts artifacts: 'reports/smoke/**', allowEmptyArchive: true
+            }
+        }
+
+        stage('Package') {
+            matrix {
+                agent { label agentLabel }
+                axes {
+                    axis {
+                        name 'DISTRO'
+                        values 'debian:12', 'debian:13', 'ubuntu:24.04'
+                    }
+                }
+                stages {
+                    stage('Build the .deb') {
+                        steps {
+                            checkout scm
+                            script {
+                                def status = sh(
+                                    returnStatus: true,
+                                    script: '''
+                                        slug="$(printf '%s' "$DISTRO" | tr -d ':.')"
+                                        export CONTAINER_ENV="DEB_MAINTAINER SLUG"
+                                        export SLUG="$slug"
+                                        ./.jenkins/container.sh "${IMAGE_REGISTRY}${DISTRO}" "dist/$slug" "$(cat .jenkins/steps/package.sh)"
+                                    ''',
+                                )
+                                archiveArtifacts artifacts: 'dist/**/*.deb', allowEmptyArchive: true
+                                if (status != 0) {
+                                    error("the .deb build failed on ${DISTRO} (exit ${status})")
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // No node is allocated here — `agent none` means there is nothing to
+    // archive from either, which is why each cell publishes its own results.
+    post {
+        success {
+            echo 'verified; nothing is published from here — see .github/workflows/release.yml'
+        }
+        failure {
+            echo 'a cell failed; the workspace was mounted read-only, so it holds no root-owned files'
+        }
+    }
+}

@@ -267,6 +267,55 @@ The package job is on every push on purpose: the bundled virtualenv, the
 copyright guard and the launcher rewrite only fail at build time, and finding
 that out while tagging a release is finding out too late.
 
+### On Jenkins
+
+`.jenkins/Jenkinsfile` runs the same eight cells for whoever builds this on
+the Amarula Jenkins, where the repository is mirrored. Nothing lives in the job
+configuration: the pipeline, the four step scripts and the container runner are
+all in the repository, so a change to what "verified" means is a reviewable
+commit.
+
+| File | What it is |
+|---|---|
+| `.jenkins/Jenkinsfile` | The pipeline: a stage per check, a matrix over four interpreters and one over three distributions |
+| `.jenkins/steps/*.sh` | What each cell actually runs, inside its container — `lint`, `test`, `smoke`, `package`, `version` |
+| `.jenkins/container.sh` | Runs one cell in one container, and is where the workspace discipline is enforced |
+
+Setting it up once:
+
+- a **Multibranch Pipeline** job, Script Path `.jenkins/Jenkinsfile`, named
+  `<Customer>/<Project>/<job>` like the rest of the org's jobs —
+  `amarula/jitsi-audio-bridge/jitsiAudioBridgeVerifier` follows the convention;
+- an agent whose label is given by the `AGENT_LABEL` parameter, `debian` by
+  default, and which has **docker**, **git** and a route to the registry or to
+  Docker Hub;
+- **tag discovery** switched on (the branch source's *Discover Tags* behaviour
+  plus a tag build strategy), or the version guard never runs;
+- the `REGISTRY` parameter only if the images cannot come from Docker Hub
+  directly — `registry.amarulasolutions.com:443/` with the `amarula-docker`
+  credential is what the other jobs use.
+
+The pipeline **publishes nothing**: it archives the three `.deb`s, the JUnit
+report of each interpreter and the smoke test's work directory, and leaves
+releasing to the GitHub workflow. Two things about it are worth knowing before
+changing it:
+
+- **The workspace is never written to.** Containers run as root, a Jenkins
+  agent outlives the build, and a root-owned `build/` or `.egg-info` left in a
+  workspace makes the next build's `git clean` fail — permanently, until
+  somebody removes it by hand. So `container.sh` mounts the workspace
+  read-only, copies the tree inside the container, and brings artifacts out
+  with `docker cp`. The test suite follows from that: it has to pass when run
+  as root, which is why the one test that asks what happens in an unwritable
+  directory skips itself there.
+- **The version guard warns, it does not gate.** It runs on a tag and fails
+  the build when the tag and `__version__` disagree — but the GitHub release
+  fires on the same push of the same tag, so Jenkins cannot stop it.
+
+Announcements are not wired up: the org's other jobs report through the
+`ci_scripts` library to Mattermost or Teams, and this one has no endpoint of
+its own to send to.
+
 ### Releasing
 
 The version lives in one place, `__version__` in

@@ -13,6 +13,9 @@ dist/
 .venv/
 venv/
 
+# Jenkins job outputs, written into the workspace by .jenkins/container.sh.
+reports/
+
 # Tooling caches
 .pytest_cache/
 .ruff_cache/

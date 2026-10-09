@@ -198,6 +198,60 @@ def test_the_workflows_check_the_things_that_break() -> None:
     assert "does not match __version__" in release
 
 
+def _jenkins_text() -> str:
+    """The Jenkinsfile and the step scripts it runs, as one string."""
+    jenkins = ROOT / ".jenkins"
+    return (jenkins / "Jenkinsfile").read_text(encoding="utf-8") + "".join(
+        path.read_text(encoding="utf-8")
+        for path in sorted((jenkins / "steps").glob("*.sh"))
+    )
+
+
+def test_the_jenkins_pipeline_checks_what_the_workflows_check() -> None:
+    """Two pipelines, one list of things that has to be true.
+
+    They are allowed to differ in how; the test is about one of them quietly
+    losing a check the other still has, which is how two CIs drift apart.
+    """
+    jenkinsfile = (ROOT / ".jenkins" / "Jenkinsfile").read_text(encoding="utf-8")
+    everything = _jenkins_text()
+
+    assert "values '3.11', '3.12', '3.13', '3.14'" in jenkinsfile, "the python axis lost a cell"
+    assert "values 'debian:12', 'debian:13', 'ubuntu:24.04'" in jenkinsfile, (
+        "the distribution axis lost a cell"
+    )
+
+    assert "ruff check src tests tools" in everything
+    assert "pytest --junitxml=/out/report.xml" in everything
+    assert "python tests/smoke_test.py" in everything
+    assert "packaging/build-deb.sh /out" in everything
+    assert "lintian --fail-on error" in everything
+    # The packaged payload, run from where it would be installed.
+    assert "-m jitsi_audio_bridge --version" in everything
+    # The same version guard the release workflow applies to a tag.
+    assert "__version__" in everything and "TAG_NAME" in everything
+
+
+def test_the_jenkins_helper_keeps_the_workspace_clean() -> None:
+    """The one rule the whole Jenkins design hangs on."""
+    helper = (ROOT / ".jenkins" / "container.sh").read_text(encoding="utf-8")
+    # Read-only mount, and the tree copied inside the container instead.
+    assert '-v "$workspace:/src:ro"' in helper
+    assert "cp -a" not in helper, "the copy happens inside the container, not here"
+    assert "tar -C /src" in helper and "tar -C /build" in helper
+    # Artifacts come back through docker cp, which writes as this user.
+    assert 'docker cp "$container:/out/."' in helper
+    # And the container is removed whatever happened.
+    assert "trap" in helper and "docker rm -f" in helper
+
+
+def test_the_jenkins_pipeline_publishes_nothing() -> None:
+    """Releasing stays with the GitHub workflow: one publisher, not two."""
+    jenkinsfile = (ROOT / ".jenkins" / "Jenkinsfile").read_text(encoding="utf-8")
+    for forbidden in ("gh release", "release create", "withCredentials", "twine"):
+        assert forbidden not in jenkinsfile, f"the Jenkins pipeline should not {forbidden}"
+
+
 def test_templates_use_the_substitutions_the_builder_provides() -> None:
     control = (ROOT / "packaging" / "deb" / "control.in").read_text(encoding="utf-8")
     for token in ("@VERSION@", "@ARCH@", "@MAINTAINER@", "@INSTALLED_SIZE@", "@PYTHON_MINOR@"):

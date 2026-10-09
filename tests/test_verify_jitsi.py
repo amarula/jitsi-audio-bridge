@@ -14,6 +14,7 @@ The two fixtures that matter most are the traps the tool exists to catch: a
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
 from dataclasses import replace
@@ -950,6 +951,13 @@ def test_writer_uses_the_output_dir_and_reports_an_unwritable_one(tmp_path: Path
     staging = tmp_path / "staging"
     result = write_proposal(_proposal_for(target), output_dir=staging)
     assert result.path == staging / "jicofo.conf.new"
+
+    if os.geteuid() == 0:
+        # The second half asks what happens when the directory cannot be
+        # written to, and root can write to one that is mode 0500 — the
+        # question has no answer here, rather than a wrong one.  Jenkins runs
+        # these tests inside a container, which is root.
+        pytest.skip("running as root: an unwritable directory is writable anyway")
 
     locked = tmp_path / "locked"
     locked.mkdir()
