@@ -3,7 +3,7 @@ Version: @VERSION@
 Section: net
 Priority: optional
 Architecture: @ARCH@
-Depends: python3 (>= 3.11), libopus0, init-system-helpers (>= 1.18)
+Depends: python3 (>= 3.11), adduser, libc6, libopus0, init-system-helpers (>= 1.18)
 Recommends: ffmpeg
 Installed-Size: @INSTALLED_SIZE@
 Maintainer: @MAINTAINER@

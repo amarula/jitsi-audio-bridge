@@ -136,6 +136,68 @@ def test_the_build_refuses_a_dependency_it_cannot_account_for() -> None:
     assert 'install -m 0644 "$ROOT/LICENSE"' in builder
 
 
+def test_the_unit_lands_where_modern_systemd_reads_it() -> None:
+    """On every supported distribution /lib is an alias for /usr/lib."""
+    builder = (ROOT / "packaging" / "build-deb.sh").read_text(encoding="utf-8")
+    assert '"$PKGROOT/usr/lib/systemd/system/$PKG.service"' in builder
+    assert "$PKGROOT/lib/systemd" not in builder
+    # Nothing may be installed through the alias, but the permissions of what
+    # is installed still have to be normalised.
+    assert 'chmod -R u=rwX,go=rX "$PKGROOT"' in builder
+
+
+def test_the_build_ships_the_changelog_and_the_lintian_overrides() -> None:
+    """Policy wants a changelog; lintian wants to be told what is deliberate."""
+    builder = (ROOT / "packaging" / "build-deb.sh").read_text(encoding="utf-8")
+    assert "changelog.Debian.gz" in builder
+    assert '"$DEB_VERSION"' in builder
+    assert "usr/share/lintian/overrides/$PKG" in builder
+
+    overrides = (ROOT / "packaging" / "deb" / "lintian-overrides").read_text(encoding="utf-8")
+    tags = [
+        line.split(":", 1)[1].strip()
+        for line in overrides.splitlines()
+        if line.startswith("jitsi-audio-bridge:")
+    ]
+    assert tags, "the overrides file names no tags"
+    # Every override is a tag this package means to keep, so each one has to
+    # carry the reason it is acceptable above it.
+    for tag in tags:
+        assert tag in overrides
+
+
+def test_the_build_cleans_up_after_the_last_thing_that_imports() -> None:
+    """Bytecode written by the import checks must not reach the package."""
+    lines = (ROOT / "packaging" / "build-deb.sh").read_text(encoding="utf-8").splitlines()
+    checks = [index for index, line in enumerate(lines) if "-c 'import " in line]
+    cleanups = [
+        index for index, line in enumerate(lines) if "'__pycache__' -prune" in line
+    ]
+    assert checks and cleanups
+    # The last import is the one that matters: anything before it is tidying
+    # what the copy brought in, and anything after would still be built.
+    assert max(cleanups) > max(checks), "nothing removes the bytecode the imports wrote"
+
+
+def test_the_workflows_check_the_things_that_break() -> None:
+    """A workflow that quietly stops testing something is worse than none."""
+    ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    assert "ruff check src tests tools" in ci
+    assert "python -m pytest tests/ -q" in ci
+    assert "python tests/smoke_test.py" in ci
+    assert "lintian --fail-on error" in ci
+    for image in ("debian:12", "debian:13", "ubuntu:24.04"):
+        assert image in ci, f"the package matrix no longer builds for {image}"
+    assert 'python: ["3.11", "3.12", "3.13", "3.14"]' in ci
+
+    release = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+    assert 'tags: ["v*"]' in release
+    # A release publishes what CI verified, not a second build of its own.
+    assert "uses: ./.github/workflows/ci.yml" in release
+    assert "gh release create" in release
+    assert "does not match __version__" in release
+
+
 def test_templates_use_the_substitutions_the_builder_provides() -> None:
     control = (ROOT / "packaging" / "deb" / "control.in").read_text(encoding="utf-8")
     for token in ("@VERSION@", "@ARCH@", "@MAINTAINER@", "@INSTALLED_SIZE@", "@PYTHON_MINOR@"):

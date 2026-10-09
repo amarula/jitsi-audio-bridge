@@ -45,7 +45,7 @@ PKGROOT="$STAGE/$PKG"
 VENV="$PKGROOT/usr/lib/$PKG/venv"
 
 install -d "$PKGROOT/DEBIAN" "$PKGROOT/usr/bin" "$PKGROOT/usr/lib/$PKG" \
-    "$PKGROOT/usr/share/doc/$PKG" "$PKGROOT/lib/systemd/system" "$PKGROOT$CONF_DIR"
+    "$PKGROOT/usr/share/doc/$PKG" "$PKGROOT/usr/lib/systemd/system" "$PKGROOT$CONF_DIR"
 
 echo "==> creating the bundled virtualenv (python3 $PYTHON_MINOR, $ARCH)"
 python3 -m venv "$VENV"
@@ -57,9 +57,8 @@ python3 -m venv "$VENV"
 # a host whose python3 differs from the one it was built for.
 printf '%s\n' "$PYTHON_MINOR" > "$VENV/BUILT-FOR"
 
-# The venv is a runtime, not a development environment: drop the caches and
-# the installer, then prove the payload still imports.
-find "$PKGROOT" -type d -name '__pycache__' -prune -exec rm -rf {} + 2>/dev/null || true
+# The venv is a runtime, not a development environment: drop the installer,
+# then prove the payload still imports.
 rm -rf "$VENV"/lib/python*/site-packages/pip \
        "$VENV"/lib/python*/site-packages/pip-* \
        "$VENV"/lib/python*/site-packages/setuptools \
@@ -103,9 +102,14 @@ cp -r "$ROOT/tools" "$SITE_PACKAGES/tools"
 find "$SITE_PACKAGES/tools" -name '__pycache__' -prune -exec rm -rf {} + 2>/dev/null || true
 "$VENV/bin/python" -c 'import tools.verify_jitsi, tools.send_meeting'
 
+# After every import check, never before: importing writes bytecode, and a
+# package that ships __pycache__ directories is a Debian error rather than a
+# saving.  Nothing has imported anything since.
+find "$PKGROOT" -type d -name '__pycache__' -prune -exec rm -rf {} + 2>/dev/null || true
+
 # The build's umask must not leak into the package: normalise the payload
 # (X keeps directories and already-executable files executable).
-chmod -R u=rwX,go=rX "$PKGROOT/usr" "$PKGROOT/lib"
+chmod -R u=rwX,go=rX "$PKGROOT"
 
 echo "==> installing the launchers, unit, config and documentation"
 install -m 0755 "$ROOT/packaging/deb/$PKG.launcher" "$PKGROOT/usr/bin/$PKG"
@@ -132,11 +136,15 @@ chmod 0644 "$COPYRIGHT"
 sed -e "s|^Documentation=.*|Documentation=file:/usr/share/doc/$PKG/README.md|" \
     -e "s|^WorkingDirectory=.*|WorkingDirectory=/usr/lib/$PKG|" \
     -e "s|^ExecStart=.*|ExecStart=/usr/bin/$PKG --config $CONF_DIR/config.ini|" \
-    "$ROOT/systemd/$PKG.service" > "$PKGROOT/lib/systemd/system/$PKG.service"
-grep -q "^ExecStart=/usr/bin/$PKG " "$PKGROOT/lib/systemd/system/$PKG.service" || {
+    "$ROOT/systemd/$PKG.service" > "$PKGROOT/usr/lib/systemd/system/$PKG.service"
+grep -q "^ExecStart=/usr/bin/$PKG " "$PKGROOT/usr/lib/systemd/system/$PKG.service" || {
     echo "cannot rewrite ExecStart in systemd/$PKG.service" >&2
     exit 1
 }
+
+install -d "$PKGROOT/usr/share/lintian/overrides"
+install -m 0644 "$ROOT/packaging/deb/lintian-overrides" \
+    "$PKGROOT/usr/share/lintian/overrides/$PKG"
 
 install -m 0644 /dev/null "$PKGROOT/DEBIAN/conffiles"
 echo "$CONF_DIR/config.ini" > "$PKGROOT/DEBIAN/conffiles"
@@ -151,6 +159,17 @@ render() {
 }
 
 render "$ROOT/packaging/deb/control.in" > "$PKGROOT/DEBIAN/control"
+
+# Policy expects a changelog, and nothing here is going to maintain one by
+# hand: the entry says what the package is and when it was built, which is
+# what `apt changelog` and `dpkg -l` have to show for a package built from a
+# tag.  The version is the one in the source, so the two cannot disagree.
+{
+    printf '%s (%s) unstable; urgency=medium\n\n' "$PKG" "$DEB_VERSION"
+    printf '  * Built from the %s source tree.\n' "$(git -C "$ROOT" describe --always --dirty 2>/dev/null || echo 'release')"
+    printf '\n -- %s  %s\n' "$MAINTAINER" "$(date -R)"
+} | gzip -9n > "$PKGROOT/usr/share/doc/$PKG/changelog.Debian.gz"
+chmod 0644 "$PKGROOT/usr/share/doc/$PKG/changelog.Debian.gz"
 render "$ROOT/packaging/deb/postinst.in" > "$PKGROOT/DEBIAN/postinst"
 install -m 0755 "$ROOT/packaging/deb/prerm" "$PKGROOT/DEBIAN/prerm"
 install -m 0755 "$ROOT/packaging/deb/postrm" "$PKGROOT/DEBIAN/postrm"

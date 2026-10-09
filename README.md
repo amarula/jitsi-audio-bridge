@@ -1,5 +1,8 @@
 # jitsi-audio-bridge
 
+[![CI](https://github.com/amarula/jitsi-audio-bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/amarula/jitsi-audio-bridge/actions/workflows/ci.yml)
+[![Licence: AGPL-3.0](https://img.shields.io/badge/licence-AGPL--3.0--only-blue.svg)](LICENSE)
+
 Captures per-participant audio from a Jitsi conference, then transcribes it with
 a local Whisper instance, summarises the transcript with a local Ollama model,
 and emails the result.
@@ -241,11 +244,54 @@ without Jitsi). The postinst creates the
 `jitsi-bridge` system user and `/srv/recordings`, and enables the unit but
 deliberately does not start it — review `config.ini`, put the SMTP password in
 `/etc/jitsi-audio-bridge/env` (mode 0600, created empty), then
-`systemctl start jitsi-audio-bridge`. `Depends: python3 (>= 3.11), libopus0`;
-`Recommends: ffmpeg` (only batch mode's master-track extraction uses it).
+`systemctl start jitsi-audio-bridge`. `Depends: python3 (>= 3.11), adduser,
+libc6, libopus0`; `Recommends: ffmpeg` (only batch mode's master-track
+extraction uses it). `libc6` is there because the virtualenv carries compiled
+extensions, and `adduser` because the postinst creates the service user.
 Removing the package stops and disables the unit; purging leaves
 `/srv/recordings` and the service user in place, because the recordings are the
 only copy of a meeting.
+
+### Continuous integration
+
+`.github/workflows/ci.yml` runs on every push and pull request:
+
+| Job | What it proves |
+|---|---|
+| `lint` | `ruff check src tests tools` |
+| `test` | the unit suite on python 3.11, 3.12, 3.13 and 3.14, with libopus installed so the Opus round-trip runs rather than skips |
+| `smoke` | the whole daemon, once: it records, transcribes, summarises, mails and archives a meeting end to end against the stubs |
+| `package` | `make deb` for real, in a container per distribution — Debian 12, Debian 13, Ubuntu 24.04 — with `lintian --fail-on error` and the packaged daemon run once from where it was unpacked |
+
+The package job is on every push on purpose: the bundled virtualenv, the
+copyright guard and the launcher rewrite only fail at build time, and finding
+that out while tagging a release is finding out too late.
+
+### Releasing
+
+The version lives in one place, `__version__` in
+`src/jitsi_audio_bridge/__init__.py`, and the tag has to agree with it — the
+release workflow refuses to publish if they disagree, because the package
+version, the changelog and the launcher's build stamp all come from it.
+
+```sh
+$EDITOR src/jitsi_audio_bridge/__init__.py          # bump __version__
+git commit -am "Release 0.2.0" && git push
+git tag -a v0.2.0 -m "jitsi-audio-bridge 0.2.0" && git push origin v0.2.0
+```
+
+The tag runs everything CI runs, then creates the release with one package per
+distribution attached:
+
+| Asset | Install on |
+|---|---|
+| `…_amd64.debian12.deb` | Debian 12 (python3 3.11) |
+| `…_amd64.debian13.deb` | Debian 13 (python3 3.13) |
+| `…_amd64.ubuntu2404.deb` | Ubuntu 24.04 (python3 3.12) |
+
+Pick the one matching the machine: the bundled virtualenv belongs to the
+python3 it was built against, and the launcher exits 78 with that reason rather
+than trying to run under another.
 
 ## Configuration
 

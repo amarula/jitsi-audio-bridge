@@ -1,6 +1,6 @@
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
 Upstream-Name: jitsi-audio-bridge
-Source: https://github.com/amarulasolutions/jitsi-audio-bridge
+Source: https://github.com/amarula/jitsi-audio-bridge
 Comment: This package carries its own Python dependencies in a virtualenv
  under /usr/lib/jitsi-audio-bridge.  Each of them is unmodified and keeps its
  own LICENSE and NOTICE files inside its .dist-info directory; they are listed

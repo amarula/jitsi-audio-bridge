@@ -1,0 +1,58 @@
+# A tag is a release: the same checks CI runs, then a GitHub release with the
+# Debian packages attached — one per distribution, each built where it is meant
+# to be installed.
+#
+#   git tag -a v0.2.0 -m "..."    &&    git push origin v0.2.0
+#
+# The tag has to match __version__ in the source, because that is what the
+# package version, the changelog and the launcher all come from: two places
+# saying different things is a broken release, not a typo to paper over.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    uses: ./.github/workflows/ci.yml
+
+  version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: The tag has to be the version the source says
+        run: |
+          version="$(sed -n 's/^__version__ = "\([^"]*\)"/\1/p' src/jitsi_audio_bridge/__init__.py)"
+          if [ -z "$version" ]; then
+            echo "::error::cannot read __version__ from src/jitsi_audio_bridge/__init__.py"
+            exit 1
+          fi
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match __version__ $version (expected v$version)"
+            echo "bump the version, commit, and tag again — or tag the commit that has it"
+            exit 1
+          fi
+          echo "releasing jitsi-audio-bridge $version"
+
+  release:
+    needs: [verify, version]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: deb-*
+          merge-multiple: true
+          path: dist
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ls -l dist
+          gh release create "$GITHUB_REF_NAME" dist/*.deb \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes

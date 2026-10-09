@@ -1,0 +1,133 @@
+# Everything that has to be true before a commit is worth anything: the code
+# lints, the unit tests pass on every python the project claims, the daemon
+# still records and mails a meeting end to end, and the Debian package still
+# builds — on each distribution it is offered for.
+#
+# The package build is in here rather than in the release workflow alone
+# because packaging is what breaks quietly: the bundled virtualenv, the
+# copyright guard and the launcher rewrite only fail at build time, and a
+# release is the worst moment to find out.
+#
+# Called by release.yml as well as by push and pull request, so a release
+# publishes exactly what CI verified.
+name: CI
+
+on:
+  push:
+    # Branch patterns only: without this a tag push would run CI twice, once
+    # here and once through the release workflow that calls it.
+    branches: ["**"]
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Debian wants a person in the package's Maintainer field, not a company.
+  DEB_MAINTAINER: "Michael Trimarchi <michael@amarulasolutions.com>"
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: python -m pip install --quiet ruff
+      - run: ruff check src tests tools
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+      # The Opus round-trip at the end of the unit suite loads the real
+      # library rather than a stub, so it has to be here.
+      - name: Install libopus
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libopus0
+      # The [s3] extra is installed so those tests run rather than skip.
+      - name: Install
+        run: python -m pip install --quiet -e '.[dev,s3]'
+      - name: Test on python ${{ matrix.python }}
+        run: python -m pytest tests/ -q
+
+  # Once, on the newest interpreter: this one spawns the daemon and drives it
+  # over a real socket, which is the same on every version and the slowest job
+  # in the file.
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          cache: pip
+      - name: Install libopus and ffmpeg
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libopus0 ffmpeg
+      - name: Install
+        run: python -m pip install --quiet '.[s3]'
+      - name: Smoke test
+        run: python tests/smoke_test.py
+
+  # One .deb per distribution, because the bundled virtualenv is tied to the
+  # python3 of the host it was built on: the launcher refuses to run one built
+  # for another with exit 78.  lintian is part of the job — a Debian package
+  # that a reviewer would reject is not a package that passed.
+  package:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: debian:12
+            slug: debian12
+          - image: debian:13
+            slug: debian13
+          - image: ubuntu:24.04
+            slug: ubuntu2404
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build in ${{ matrix.image }}
+        run: |
+          mkdir -p dist
+          docker run --rm \
+            -v "$PWD:/src" -w /src -v "$PWD/dist:/out" \
+            -e DEB_MAINTAINER \
+            "${{ matrix.image }}" bash -lc '
+              set -e
+              apt-get update -qq
+              apt-get install -y -qq python3 python3-venv libopus0 lintian
+              packaging/build-deb.sh /out
+              lintian --fail-on error /out/*.deb
+              unpack="$(mktemp -d)"
+              dpkg-deb -x /out/*.deb "$unpack"
+              "$unpack/usr/lib/jitsi-audio-bridge/venv/bin/python" \
+                  -m jitsi_audio_bridge --version
+            '
+      - name: Name it for the distribution it was built on
+        run: |
+          deb="$(ls dist/*.deb)"
+          mv "$deb" "${deb%.deb}.${{ matrix.slug }}.deb"
+          dpkg-deb --info "dist/"*".${{ matrix.slug }}.deb" | head -12
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deb-${{ matrix.slug }}
+          path: dist/*.deb
+          if-no-files-found: error

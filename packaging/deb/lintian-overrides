@@ -1,0 +1,23 @@
+# Lintian tags this package is allowed to have, and why.  Installed to
+# /usr/share/lintian/overrides/jitsi-audio-bridge, where lintian reads it.
+#
+# The daemon runs from a private virtualenv, which no other Debian package
+# does and which lintian therefore has no vocabulary for: its interpreter is
+# inside the package on purpose, and its extensions come from upstream wheels
+# exactly as published.
+
+# The venv's own python3 is the interpreter the launcher uses, at
+# /usr/lib/jitsi-audio-bridge/venv/bin/python3.  Nothing here is a script that
+# Debian expects to run under /usr/bin/python3: the entry points in venv/bin
+# are upstream's, unused by this package, and the launcher runs the venv.
+jitsi-audio-bridge: wrong-path-for-interpreter
+
+# The wheels ship compiled extensions with their symbols intact, and that is
+# what has to stay true: each wheel's RECORD holds the hash of every file, so
+# stripping them would leave a venv whose own integrity metadata disagrees with
+# its contents.  These are the publisher's bytes, unmodified.
+jitsi-audio-bridge: unstripped-binary-or-object
+
+# Same reason: these are the wheels as published, and a rebuilt one is no
+# longer the artifact anybody else would install.
+jitsi-audio-bridge: package-contains-no-arch-dependent-files
