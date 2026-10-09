@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Amarula Solutions
+# SPDX-License-Identifier: AGPL-3.0-only
 """Unit tests for tools/verify_jitsi.py.
 
 Everything here is offline: the parsers run over fixture strings and the check

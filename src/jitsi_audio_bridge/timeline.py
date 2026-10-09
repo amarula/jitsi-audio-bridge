@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Amarula Solutions
+# SPDX-License-Identifier: AGPL-3.0-only
 """Session timing: who spoke when, captured while the call is happening.
 
 A transcript built from per-participant files is a sequence of monologues,

@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 Amarula Solutions
+# SPDX-License-Identifier: AGPL-3.0-only
 """End-to-end smoke test for jitsi-audio-bridge.
 
 Brings up the same environment as ``python3 -m tools.testenv`` — stub Whisper,

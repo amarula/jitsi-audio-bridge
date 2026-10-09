@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Amarula Solutions
+# SPDX-License-Identifier: AGPL-3.0-only
 """Local test environment for jitsi-audio-bridge.
 
 Three runnable pieces:

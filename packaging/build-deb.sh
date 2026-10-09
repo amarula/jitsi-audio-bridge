@@ -72,6 +72,28 @@ rm -rf "$VENV"/lib/python*/site-packages/pip \
        "$VENV"/.gitignore
 "$VENV/bin/python" -c 'import jitsi_audio_bridge, websockets, requests, boto3'
 
+# Every distribution in the bundled virtualenv is distributed with this
+# package, so every one of them has to appear in its copyright file.  Nothing
+# else would notice a dependency arriving unaccounted for.  Names are compared
+# with their punctuation flattened: pip says charset-normalizer where a
+# directory says charset_normalizer, and both are the same package.
+accounted="$(tr -- '_-' '--' < "$ROOT/packaging/deb/copyright.in" | tr 'A-Z' 'a-z')"
+unlisted=""
+for meta in "$VENV"/lib/python*/site-packages/*.dist-info/METADATA; do
+    name="$(sed -n 's/^Name: //p' "$meta" | head -1)"
+    [ "$name" = "$PKG" ] && continue
+    flat="$(printf '%s' "$name" | tr -- '_-' '--' | tr 'A-Z' 'a-z')"
+    case "$accounted" in
+        *"$flat"*) ;;
+        *) unlisted="$unlisted $name" ;;
+    esac
+done
+if [ -n "$unlisted" ]; then
+    echo "packaging/deb/copyright.in does not account for:$unlisted" >&2
+    echo "add them, with their licence, before shipping the package" >&2
+    exit 1
+fi
+
 # The deployment tools travel with the package: the verifier is meant to run
 # on the Jitsi host, which may have nothing but this .deb, and the sender lets
 # a deployed bridge be exercised without Jitsi.
@@ -92,6 +114,18 @@ install -m 0755 "$ROOT/packaging/deb/$PKG.launcher" "$PKGROOT/usr/bin/$PKG-send"
 install -m 0644 "$ROOT/config.ini.example" "$PKGROOT$CONF_DIR/config.ini"
 install -m 0644 "$ROOT/README.md" "$PKGROOT/usr/share/doc/$PKG/README.md"
 install -m 0644 "$ROOT/docs/jitsi-integration.md" "$PKGROOT/usr/share/doc/$PKG/jitsi-integration.md"
+# Debian Policy requires the copyright file, and it is the only place that
+# accounts for the dependencies travelling in the bundled virtualenv.  The
+# licence itself is appended rather than substituted: it is full of "&" and
+# "\" as far as sed is concerned.  Indenting it a line at a time, blanks as
+# " .", is what makes it one DEP-5 field.
+install -m 0644 "$ROOT/LICENSE" "$PKGROOT/usr/share/doc/$PKG/LICENSE"
+COPYRIGHT="$PKGROOT/usr/share/doc/$PKG/copyright"
+{
+    sed -e "s/@PKG@/$PKG/g" -e "/@AGPL@/d" "$ROOT/packaging/deb/copyright.in"
+    awk '{ print ($0 == "") ? " ." : " " $0 }' "$ROOT/LICENSE"
+} > "$COPYRIGHT"
+chmod 0644 "$COPYRIGHT"
 
 # The shipped unit targets the README's /opt install; rewrite the three paths
 # it uses and fail loudly if the unit no longer has them.

@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Amarula Solutions
+# SPDX-License-Identifier: AGPL-3.0-only
 """Unit tests for the Opus encoder and the test-environment tooling.
 
 The encoder lives in the package because both the test suite and the tools

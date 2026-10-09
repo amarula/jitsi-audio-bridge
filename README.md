@@ -50,6 +50,7 @@ and emails the result.
 - [Troubleshooting](#troubleshooting)
 - [Limitations](#limitations)
 - [Development](#development)
+- [Licence](#licence)
 
 ## Requirements
 
@@ -1088,3 +1089,35 @@ a test enforces this.
 `tools/` sits outside the package and is not installed: it is the test
 environment described [above](#test-environment), and nothing in `src/` depends
 on it.
+
+## Licence
+
+Copyright 2026 Amarula Solutions, under the
+[GNU Affero General Public License, version 3](LICENSE) — `AGPL-3.0-only`, not
+"or later", and with no warranty of any kind.
+
+In practice, for whoever runs this:
+
+- **Using it, changing it and passing it on are all fine**, as long as what
+  comes out stays under the same licence and carries this notice.
+- **Offering it to users over a network — a modified copy, on your own host —
+  means those users have to be able to get the source**, modifications
+  included. That is the whole point of the AGPL, and it applies to a copy
+  reached over a WebSocket or a mail link, not to running it for yourself:
+  a meeting recorded and transcribed on your own machines, with no outside
+  users, triggers nothing.
+- **Selling it, or offering it as a hosted service without publishing your
+  changes, needs a different licence from Amarula Solutions** — the AGPL is
+  not the only terms available for it, it is the ones it comes with.
+
+The dependencies keep their own licences and are all permissive: Apache-2.0
+(boto3, botocore, requests, s3transfer), MIT (jmespath, six, urllib3,
+charset_normalizer), BSD-3-Clause (idna, websockets), MPL-2.0 (certifi),
+plus libopus and Python themselves. Nothing in the chain constrains the
+licence above. The `.deb` carries them in its virtualenv and accounts for each
+one in its `copyright` file, which the build refuses to produce without.
+
+The recordings this daemon makes are a different matter entirely: they are the
+meeting participants' personal data, and no licence here grants anybody the
+right to record them. That is between the people in the meeting, their
+employer, and whichever law applies to them.

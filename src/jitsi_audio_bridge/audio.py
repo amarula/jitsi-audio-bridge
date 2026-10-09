@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Amarula Solutions
+# SPDX-License-Identifier: AGPL-3.0-only
 """Opus decoding and meeting-metadata parsing.
 
 The JVB delivers bare Opus packets — one WebSocket binary message per packet,

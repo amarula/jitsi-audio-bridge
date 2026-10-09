@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Amarula Solutions
+# SPDX-License-Identifier: AGPL-3.0-only
 """HTTP clients for the local Whisper and Ollama services.
 
 These functions are synchronous on purpose.  The daemon calls them from a

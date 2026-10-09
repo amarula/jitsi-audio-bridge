@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Amarula Solutions
+# SPDX-License-Identifier: AGPL-3.0-only
 """Jitsi audio bridge.
 
 Receives per-participant Opus audio from a Jitsi Videobridge over a WebSocket,

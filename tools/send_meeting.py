@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Amarula Solutions
+# SPDX-License-Identifier: AGPL-3.0-only
 """Simulate a meeting by sending audio to a running bridge.
 
 Stands in for whatever forwards participant audio from the Jitsi side, speaking

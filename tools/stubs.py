@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Amarula Solutions
+# SPDX-License-Identifier: AGPL-3.0-only
 """Stub Whisper, Ollama, SMTP and S3 services.
 
 These stand in for the external dependencies so the whole pipeline can be

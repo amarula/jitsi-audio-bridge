@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Amarula Solutions
+# SPDX-License-Identifier: AGPL-3.0-only
 """Test configuration.
 
 Puts ``src/`` and the repository root on the import path so the suite runs from

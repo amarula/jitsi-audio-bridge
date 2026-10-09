@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Amarula Solutions
+# SPDX-License-Identifier: AGPL-3.0-only
 """SMTP delivery of the finished meeting summary and transcript.
 
 Synchronous, like :mod:`jitsi_audio_bridge.ai_client`, and called from the

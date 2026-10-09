@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Amarula Solutions
+# SPDX-License-Identifier: AGPL-3.0-only
 """Generate speech samples for replaying through the bridge.
 
 The tone generator in ``tools.send_meeting`` proves that audio survives the

@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Amarula Solutions
+# SPDX-License-Identifier: AGPL-3.0-only
 """Check a Jitsi deployment against docs/jitsi-integration.md.
 
 Read-only unless ``--fix`` is given.  Four sections, selected with ``--only``:

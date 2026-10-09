@@ -1,5 +1,6 @@
 [build-system]
-requires = ["setuptools>=64"]
+# 77 is where setuptools learned the PEP 639 licence fields below.
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -9,6 +10,11 @@ readme = "README.md"
 requires-python = ">=3.11"
 dynamic = ["version"]
 keywords = ["jitsi", "jvb", "whisper", "ollama", "transcription", "meeting"]
+# AGPL-3.0-only, and deliberately not "or later": whoever runs a modified copy
+# as a network service has to offer its users the source, and the copyright
+# holder keeps the option of licensing it otherwise.
+license = "AGPL-3.0-only"
+license-files = ["LICENSE"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Environment :: No Input/Output (Daemon)",

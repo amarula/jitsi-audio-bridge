@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Amarula Solutions
+# SPDX-License-Identifier: AGPL-3.0-only
 """Tests for the Debian packaging under packaging/.
 
 The package itself is built by packaging/build-deb.sh, which needs pip and
@@ -8,9 +10,11 @@ build script and the files it rewrites or renders.
 
 from __future__ import annotations
 
+import re
 import shutil
 import stat
 import subprocess
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -80,6 +84,56 @@ def test_unit_has_the_lines_the_builder_rewrites() -> None:
     lines = UNIT.read_text(encoding="utf-8").splitlines()
     for key in ("Documentation=", "WorkingDirectory=", "ExecStart="):
         assert any(line.startswith(key) for line in lines), f"systemd unit lost {key}"
+
+
+def test_the_licence_is_stated_once_and_the_same_way_everywhere() -> None:
+    """The package, the metadata and the source files have to agree."""
+    pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    assert pyproject["project"]["license"] == "AGPL-3.0-only"
+    assert "LICENSE" in pyproject["project"]["license-files"]
+
+    licence = (ROOT / "LICENSE").read_text(encoding="utf-8")
+    assert "GNU AFFERO GENERAL PUBLIC LICENSE" in licence
+    assert "Version 3, 19 November 2007" in licence
+    assert "END OF TERMS AND CONDITIONS" in licence
+
+    copyright_file = (ROOT / "packaging" / "deb" / "copyright.in").read_text(encoding="utf-8")
+    assert "License: AGPL-3.0-only" in copyright_file
+    assert "Copyright: 2026 Amarula Solutions" in copyright_file
+
+
+def test_every_source_file_says_what_it_is_under() -> None:
+    """A file copied out of the tree takes its licence with it."""
+    missing = [
+        str(path.relative_to(ROOT))
+        for directory in ("src", "tools", "tests")
+        for path in sorted((ROOT / directory).rglob("*.py"))
+        if "SPDX-License-Identifier: AGPL-3.0-only" not in path.read_text(encoding="utf-8")
+    ]
+    assert not missing, "no SPDX notice in: " + ", ".join(missing)
+
+
+def test_every_declared_dependency_is_accounted_for_in_the_copyright_file() -> None:
+    """The .deb ships its dependencies; its copyright file has to name them.
+
+    This is the half that can be checked offline — what the project declares.
+    The build script checks the other half, everything pip actually resolved.
+    """
+    pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    declared = list(pyproject["project"]["dependencies"])
+    declared += list(pyproject["project"]["optional-dependencies"].get("s3", []))
+    assert declared
+
+    copyright_file = (ROOT / "packaging" / "deb" / "copyright.in").read_text(encoding="utf-8")
+    for requirement in declared:
+        name = re.split(r"[<>=!\[; ]", requirement, maxsplit=1)[0]
+        assert name in copyright_file, f"{name} is shipped but not accounted for"
+
+
+def test_the_build_refuses_a_dependency_it_cannot_account_for() -> None:
+    builder = (ROOT / "packaging" / "build-deb.sh").read_text(encoding="utf-8")
+    assert "copyright.in does not account for" in builder
+    assert 'install -m 0644 "$ROOT/LICENSE"' in builder
 
 
 def test_templates_use_the_substitutions_the_builder_provides() -> None:

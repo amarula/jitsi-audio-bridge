@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Amarula Solutions
+# SPDX-License-Identifier: AGPL-3.0-only
 """Bring up a self-contained environment for testing the bridge.
 
 Starts stub Whisper, Ollama and SMTP services and the real daemon, wired

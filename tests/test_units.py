@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Amarula Solutions
+# SPDX-License-Identifier: AGPL-3.0-only
 """Unit tests for the parts of the bridge that need no Whisper, Ollama or JVB.
 
 The Opus round-trip at the bottom exercises the real libopus binding by

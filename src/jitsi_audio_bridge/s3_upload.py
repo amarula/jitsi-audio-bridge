@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Amarula Solutions
+# SPDX-License-Identifier: AGPL-3.0-only
 """Upload a finished meeting's Jibri recording to an S3-compatible endpoint.
 
 The video is not made here: Jibri makes it, and only when somebody pressed

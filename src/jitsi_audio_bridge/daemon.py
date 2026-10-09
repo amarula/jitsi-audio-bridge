@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Amarula Solutions
+# SPDX-License-Identifier: AGPL-3.0-only
 """WebSocket server that captures per-participant audio from a Jitsi bridge.
 
 One connection corresponds to one meeting.  Two wire framings are accepted on

@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Amarula Solutions
+# SPDX-License-Identifier: AGPL-3.0-only
 """Configuration loading for the Jitsi audio bridge.
 
 Values are resolved from three sources, in increasing order of precedence:
