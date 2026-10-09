@@ -99,6 +99,16 @@ DEFAULTS: dict[str, dict[str, str]] = {
         # How long a recording must have been untouched before it is uploaded.
         "settle_seconds": "30",
         "delete_after_upload": "false",
+        # Put the recording's link in the summary mail, and how long the mail
+        # waits for the recording before giving up and sending without one.
+        "link_in_mail": "false",
+        "link_wait_seconds": "120",
+        # How long a signed link works.  Seven days is the most SigV4 allows;
+        # 0 means "do not sign", for a bucket that is readable without it.
+        "link_expiry_seconds": "604800",
+        # The address recipients reach the bucket by, when that is not the
+        # one this daemon uploads to.  Empty means the same address.
+        "link_endpoint": "",
     },
 }
 
@@ -245,11 +255,33 @@ class S3Config:
     settle_seconds: float = 30.0
     #: Remove the local recording once the endpoint has confirmed it.
     delete_after_upload: bool = False
+    #: Put the recording's link in the summary mail.  Off by default because
+    #: it changes *when* the mail is sent: the daemon then looks for the
+    #: recording and uploads it before mailing, so the link works as soon as
+    #: somebody reads it.
+    link_in_mail: bool = False
+    #: How long the mail waits for a recording that has not appeared yet
+    #: before giving up and going out without a link.  A meeting nobody
+    #: recorded must not hold the transcript back.
+    link_wait_seconds: float = 120.0
+    #: How long a signed link works, in seconds; zero means the URL is not
+    #: signed at all, which is only right for a bucket anyone may read.
+    #: SigV4 refuses more than seven days, so a larger value is clamped.
+    link_expiry_seconds: float = 604800.0
+    #: Where recipients reach the bucket.  A daemon behind a tunnel usually
+    #: uploads to an address nobody outside can use, and the link in a mail is
+    #: read outside; empty keeps the two the same.
+    link_endpoint: str = ""
 
     @property
     def enabled(self) -> bool:
         """Whether an endpoint and a bucket were configured."""
         return bool(self.endpoint and self.bucket)
+
+    @property
+    def link_base(self) -> str:
+        """The address a link for a person should be built on."""
+        return self.link_endpoint or self.endpoint
 
 
 @dataclass(frozen=True)
@@ -459,6 +491,10 @@ def load_config(path: str | os.PathLike[str] | None = None) -> Config:
             wait_seconds=resolver.number("s3", "wait_seconds", minimum=0.0),
             settle_seconds=resolver.number("s3", "settle_seconds", minimum=0.0),
             delete_after_upload=resolver.boolean("s3", "delete_after_upload"),
+            link_in_mail=resolver.boolean("s3", "link_in_mail"),
+            link_wait_seconds=resolver.number("s3", "link_wait_seconds", minimum=0.0),
+            link_expiry_seconds=resolver.number("s3", "link_expiry_seconds", minimum=0.0),
+            link_endpoint=resolver.text("s3", "link_endpoint"),
         ),
         source=source,
     )

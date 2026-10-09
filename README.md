@@ -77,17 +77,22 @@ JVB connects to that.
 | Whisper endpoint | `443` (as written in its URL) | Every meeting, once per turn or recording | `[whisper] url` |
 | Ollama endpoint | `443` | Every meeting: language probe, summary, and the correction pass if enabled | `[ollama] url` |
 | SMTP relay | `25` by default, `587` for a relay that wants STARTTLS submission | When a meeting's summary is ready | `[smtp] host`, `[smtp] port` |
-| S3-compatible endpoint | `443` for TLS, `9000` for a MinIO reached directly | After the mail, when `[s3] endpoint` and `bucket` are set | `[s3] endpoint` |
+| S3-compatible endpoint | `443` for TLS, `9000` for a MinIO reached directly | Once the transcript is written, when `[s3] endpoint` and `bucket` are set — before the mail with `link_in_mail` | `[s3] endpoint` |
 | Jibri's recordings | *(no network)* | Reading the meeting's video | `[s3] jibri_dir`, on this host |
+| `[s3] link_endpoint` | as written | *(inbound, for the recipients)* — the mail's link has to reach them | `[s3] link_endpoint` |
 
 Port `465` is not on that list and will not work: it expects TLS from the first
 byte, while this daemon opens a plain connection and upgrades it with STARTTLS
 (`[smtp] use_starttls`), which is what `25` and `587` are for.
 
-Every URL in that table carries its own port, so what has to be reachable is
-whatever `[whisper] url`, `[ollama] url` and `[s3] endpoint` actually name —
-there is nothing else to read, and nothing is contacted that `config.ini` does
-not mention. The shipped defaults point at two external hostnames,
+Every row but the last is something the daemon itself connects to, and every
+URL carries its own port: what has to be reachable is whatever `[whisper] url`,
+`[ollama] url` and `[s3] endpoint` actually name — there is nothing else to
+read, and nothing is contacted that `config.ini` does not mention.
+`link_endpoint` is the other direction: it is where *recipients* fetch the
+recording from, so it has to be reachable by them, and a mail that links
+somewhere only the daemon can reach is a link that fails for everybody who
+reads it. The shipped defaults point at two external hostnames,
 `whisper.omnia.amarulasolutions.com` and `ollama.omnia.amarulasolutions.com`,
 so outbound `443` has to be open to those, and the same for whatever the S3
 endpoint turns out to be. Where the services sit behind a reverse proxy or a
@@ -100,7 +105,10 @@ Three things that catch people out:
 - **`path_style = false` moves the request to another hostname.** The bucket
   becomes a subdomain of the endpoint — `https://bucket.minio.example.com/...`
   — so a whitelist entry for the endpoint's own name is not enough, and the
-  certificate has to cover that name too. The default (`true`) keeps
+  certificate has to cover that name too. With `link_in_mail` that applies to
+  the *recipients* as well: the link points at
+  `<bucket>.<link_endpoint>`, which means a wildcard DNS entry and a wildcard
+  certificate on the name people can reach. The default (`true`) keeps
   everything on the one host.
 - **An empty `[s3] access_key`/`secret_key` makes botocore search for
   credentials**, and on an EC2 instance that search ends at the instance
@@ -403,10 +411,15 @@ a meeting is never mailed half-repaired.
 ### `[s3]`
 
 Uploads the meeting's recording — the video Jibri made, if somebody pressed
-Record — to an S3-compatible endpoint once the meeting has been transcribed and
-mailed. Off unless both `endpoint` and `bucket` are set. The section does
-nothing on its own: Jibri has to be running and recording for there to be a
-video, and its recordings directory has to be readable from this host.
+Record — to an S3-compatible endpoint once the meeting has been transcribed.
+Off unless both `endpoint` and `bucket` are set. The section does nothing on
+its own: Jibri has to be running and recording for there to be a video, and its
+recordings directory has to be readable from this host.
+
+By default the upload follows the mail, which never mentions it. With
+`link_in_mail` the order is reversed on purpose — the mail waits for the
+upload and links to the recording — see
+[The link in the mail](#the-link-in-the-mail).
 
 | Option | Type | Default | Environment |
 |---|---|---|---|
@@ -422,6 +435,10 @@ video, and its recordings directory has to be readable from this host.
 | `wait_seconds` | seconds | `900` | `JITSI_AUDIO_BRIDGE_S3_WAIT_SECONDS` |
 | `settle_seconds` | seconds | `30` | `JITSI_AUDIO_BRIDGE_S3_SETTLE_SECONDS` |
 | `delete_after_upload` | boolean | `false` | `JITSI_AUDIO_BRIDGE_S3_DELETE_AFTER_UPLOAD` |
+| `link_in_mail` | boolean | `false` | `JITSI_AUDIO_BRIDGE_S3_LINK_IN_MAIL` |
+| `link_wait_seconds` | seconds | `120` | `JITSI_AUDIO_BRIDGE_S3_LINK_WAIT_SECONDS` |
+| `link_expiry_seconds` | seconds | `604800` | `JITSI_AUDIO_BRIDGE_S3_LINK_EXPIRY_SECONDS` |
+| `link_endpoint` | URL | *(empty)* | `JITSI_AUDIO_BRIDGE_S3_LINK_ENDPOINT` |
 
 Objects are stored as `<prefix>/<room>/<Jibri's own filename>`, so a bucket
 reads as one directory per room. Empty `access_key` and `secret_key` fall back
@@ -446,6 +463,14 @@ leaves a `metadata.json` holding the call URL beside it. A recording that
 stopped too long before the meeting began, or that another meeting has already
 uploaded, is not a candidate. See [Output layout](#output-layout) for what the
 meeting directory records about the upload.
+
+`link_expiry_seconds` is how long the link in the mail works, and 604800 —
+seven days — is the most SigV4 will sign for; a longer value is clamped to it,
+with a warning, because the server refuses such a link only when somebody
+clicks it. `0` signs nothing and mails the plain `endpoint/bucket/key` URL,
+which is right only for a bucket anyone may read. `link_endpoint` is the
+address links are built on when recipients reach the bucket by another name
+than the daemon uploads to.
 
 Booleans accept `true/false`, `yes/no`, `on/off` and `1/0`. Values are validated
 at startup and a bad one names the exact setting and where it came from:
@@ -806,12 +831,18 @@ Note that blocks are ordered by participant, not by time — see
 
 ### Archiving the video
 
-If Jibri recorded the meeting and `[s3]` is configured, the recording is
-uploaded after the mail has gone out — never before it, because a long upload
-should not delay a transcript, and never *instead* of it, because a broken
-endpoint must not cost a meeting its summary. What was uploaded is recorded in
-the meeting directory, which is what makes the upload idempotent and what stops
-a second meeting in the same room from claiming the same file:
+If Jibri recorded the meeting and `[s3]` is configured, the recording is copied
+to the bucket — never *instead* of the mail, because a broken endpoint must not
+cost a meeting its summary, and by default not before it either, because a long
+upload should not delay a transcript.
+
+With `link_in_mail` on this is turned around on purpose: the mail *waits* for
+the recording, so that the link in it works the moment somebody reads it — see
+[The link in the mail](#the-link-in-the-mail).
+
+What was uploaded is recorded in the meeting directory, which is what makes the
+upload idempotent and what stops a second meeting in the same room from
+claiming the same file:
 
 ```json
 {
@@ -832,8 +863,8 @@ that was uploaded and the size on disk: an upload that half-finished must not
 take the only copy with it.
 
 The recording is looked for by room name and by time, and it is given up to
-`wait_seconds` to appear, because the file does not exist until somebody stops
-the recording — which is usually after the meeting, and can be well after the
+`wait_seconds` to appear, because the file is still being written when the
+meeting ends — somebody has to stop the recording, which can be well after the
 transcript is written. If nothing matches, the log says which rooms *were*
 found, which is usually enough to see why:
 
@@ -848,6 +879,43 @@ transcribing anything again:
 ```sh
 jitsi-audio-bridge --upload-video /srv/recordings/<sessionId>
 ```
+
+### The link in the mail
+
+With `[s3] link_in_mail = true` the summary mail also says where the recording
+is, and the daemon does the upload *before* sending it:
+
+```
+Recording (available until 2026-10-15):
+https://minio.omnia.amarulasolutions.com/meetings/videos/Team-Sync/Team-Sync_2026-10-08-10-11-12.mp4?X-Amz-Signature=…
+```
+
+Four things are worth knowing about that link:
+
+- **It is a bearer token.** Anyone the mail reaches can download the recording
+  until it expires, without logging in anywhere. Mail gets forwarded and
+  archived; set `link_expiry_seconds` to the shortest window that still lets
+  people fetch it, and `0` only when the bucket itself is meant to be readable
+  by anyone.
+- **The mail waits for the recording**, up to `link_wait_seconds`. It gives up
+  at once when there is nothing recorded for that room, and either way the mail
+  goes out — a meeting nobody recorded is mailed with no recording line, not
+  held back. While it waits, the meeting holds one of the
+  [processing slots](#ai) that `MAX_CONCURRENT_JOBS` bounds, so a very slow
+  upload on a busy daemon delays other meetings' transcripts.
+- **Recipients have to be able to reach the address in it.** The daemon often
+  uploads to one it cannot: `link_endpoint` is the name to set when the bucket
+  is reached from outside by another one, and it is the name the link's host
+  and the endpoint is validated against.
+- **Whatever sits in front of the bucket has to pass the request through
+  unchanged** — the query string included, and the `Host` header most of all,
+  since the signature covers both. A proxy that rewrites either, or that puts
+  its own login in front of the bucket, turns every link into a
+  `SignatureDoesNotMatch` or a login page.
+
+The link is signed with the same credentials as the upload and is not stored:
+`video.json` keeps the plain, permanent address of the object, so a meeting
+archived before this was switched on can be linked to later.
 
 ## Troubleshooting
 

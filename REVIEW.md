@@ -374,6 +374,27 @@ that lives in the meeting directory — delete that directory and a later run
 can upload the same recording again (to the same key, so nothing is
 duplicated in the bucket).
 
+### A link in the mail is a credential in a mailbox — **Low, by design**
+
+With `[s3] link_in_mail` the summary mail carries a presigned URL for the
+meeting's recording: anyone it reaches can download the video until the link
+expires, with no login anywhere. That is what makes it useful — the recipients
+are the people who were in the meeting — but mail is forwarded, archived and
+indexed, so the link outlives the meeting and can outlive the reader's right to
+it. `link_expiry_seconds` bounds that (seven days at most; SigV4 refuses
+longer), and the mail says the date it stops working.
+
+Two smaller consequences, both deliberate:
+
+- The mail now waits for the upload when this is on, so the meeting holds one
+  processing slot for as long as the transfer takes. A very slow upload on a
+  busy daemon delays other meetings' transcripts — the alternative is a link
+  that 404s when somebody clicks it.
+- The URL is signed for `link_endpoint`, so a proxy must forward the `Host`
+  header and the query string unchanged, and must not be behind an
+  authentication of its own. Nothing in this repository can check that; the
+  first reader with a 403 finds out.
+
 ### `wave` header only finalises on close — **Low**
 
 `Wave_write.close()` is what writes the true lengths into the RIFF header. A

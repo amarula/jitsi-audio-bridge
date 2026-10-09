@@ -11,7 +11,8 @@ from __future__ import annotations
 import logging
 import re
 import smtplib
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import datetime, timedelta
 from email.message import EmailMessage
 from pathlib import Path
 
@@ -82,56 +83,117 @@ def _format_when(started_at: str | None) -> str:
     return moment.strftime("%Y-%m-%d %H:%M")
 
 
-#: The mail's own words.  Only the phrases the daemon writes are here — the
-#: summary and its headings come from the model, already in the meeting's
-#: language — and a language that is not in the table is mailed in English
-#: rather than in nothing.
-_MAIL_STRINGS: dict[str, tuple[str, str, str, str]] = {
-    "english": (
+@dataclass(frozen=True)
+class MailStrings:
+    """The mail's own words, in one language.
+
+    Only the phrases this daemon writes are here: the summary and its headings
+    come from the model, already in the meeting's language.  ``introduction``
+    takes ``{room}`` and ``recording_expiry`` takes ``{when}``.
+    """
+
+    subject_prefix: str
+    heading: str
+    introduction: str
+    sign_off: str
+    #: What the recording is called, before the URL that follows it.
+    recording_label: str
+    #: The parenthetical after that label, when the link expires.
+    recording_expiry: str
+
+
+#: A language that is not in the table is mailed in English rather than in
+#: nothing.  Every field is required, so a row cannot be added half written.
+_MAIL_STRINGS: dict[str, MailStrings] = {
+    "english": MailStrings(
         "Meeting Summary & Transcript",
         "MEETING SUMMARY",
         "Please find the automated summary and raw transcript for room "
         "'{room}' attached below.",
         "Best regards,\nAutomated meeting transcription",
+        "Recording",
+        "(available until {when})",
     ),
-    "italian": (
+    "italian": MailStrings(
         "Riepilogo e trascrizione della riunione",
         "RIEPILOGO DELLA RIUNIONE",
         "In allegato il riepilogo automatico e la trascrizione della riunione "
         "'{room}'.",
         "Cordiali saluti,\nTrascrizione automatica della riunione",
+        "Registrazione",
+        "(disponibile fino al {when})",
     ),
-    "spanish": (
+    "spanish": MailStrings(
         "Resumen y transcripción de la reunión",
         "RESUMEN DE LA REUNIÓN",
         "Adjunto encontrará el resumen automático y la transcripción de la "
         "sala '{room}'.",
         "Un saludo,\nTranscripción automática de la reunión",
+        "Grabación",
+        "(disponible hasta el {when})",
     ),
-    "french": (
+    "french": MailStrings(
         "Résumé et transcription de la réunion",
         "RÉSUMÉ DE LA RÉUNION",
         "Veuillez trouver ci-joint le résumé automatique et la transcription "
         "de la salle '{room}'.",
         "Cordialement,\nTranscription automatique de la réunion",
+        "Enregistrement",
+        "(disponible jusqu'au {when})",
     ),
-    "german": (
+    "german": MailStrings(
         "Zusammenfassung und Transkript des Meetings",
         "ZUSAMMENFASSUNG DES MEETINGS",
         "Im Anhang finden Sie die automatische Zusammenfassung und das "
         "Transkript des Raums '{room}'.",
         "Mit freundlichen Grüßen,\nAutomatische Meeting-Transkription",
+        "Aufzeichnung",
+        "(verfügbar bis {when})",
     ),
 }
 
 
-def mail_strings(language: str | None) -> tuple[str, str, str, str]:
-    """Subject prefix, heading, introduction and sign-off for *language*.
+def mail_strings(language: str | None) -> MailStrings:
+    """The mail's words for *language*.
 
     The language is the one the summary was written in, so the whole mail
     reads in one voice.  Anything not in the table falls back to English.
     """
     return _MAIL_STRINGS.get(str(language or "").strip().lower(), _MAIL_STRINGS["english"])
+
+
+def _format_date(moment: str | None) -> str:
+    """When a link stops working: the day, or the hour when that is today.
+
+    A link a week long is "until the 15th" — a day is what its reader needs.
+    One that expires in an hour is not, so anything inside a day says the time
+    as well rather than claiming the whole of today.
+    """
+    if not moment:
+        return ""
+    try:
+        parsed = datetime.fromisoformat(str(moment))
+    except ValueError:
+        return ""
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone()
+    now = datetime.now(parsed.tzinfo) if parsed.tzinfo else datetime.now()
+    within_a_day = parsed - now < timedelta(days=1)
+    return parsed.strftime("%Y-%m-%d %H:%M" if within_a_day else "%Y-%m-%d")
+
+
+def _recording_paragraph(words: MailStrings, url: str | None, until: str | None) -> str:
+    """Where the meeting's recording is, or nothing when there is none.
+
+    Its own paragraph between the summary and the sign-off, with the URL alone
+    on its line: a bare URL is what mail clients turn into something clickable,
+    and anything appended to it would be part of the link.
+    """
+    if not url:
+        return ""
+    day = _format_date(until)
+    expiry = f" {words.recording_expiry.format(when=day)}" if day else ""
+    return f"{words.recording_label}{expiry}:\n{url}\n\n"
 
 
 def _subject_for(
@@ -142,7 +204,7 @@ def _subject_for(
 ) -> str:
     """Build a subject line with any embedded newlines flattened out."""
     flattened = " ".join(str(room_name).split()) or "Meeting"
-    subject = f"{mail_strings(language)[0]}: {flattened}"
+    subject = f"{mail_strings(language).subject_prefix}: {flattened}"
     when = _format_when(started_at)
     if when:
         subject = f"{subject} ({when})"
@@ -177,6 +239,8 @@ def send_meeting_email(
     smtp: SmtpConfig,
     started_at: str | None = None,
     language: str | None = None,
+    video_url: str | None = None,
+    video_until: str | None = None,
 ) -> bool:
     """Email the summary to *recipients*, attaching the transcript and summary.
 
@@ -184,6 +248,10 @@ def send_meeting_email(
     no addresses.  *started_at* is the meeting's own clock, used to tell one
     meeting in a room from the next, and *language* is the one the summary was
     written in, which the subject, the heading and the introduction follow.
+
+    *video_url* is where the meeting's recording can be downloaded, when there
+    is one, and *video_until* is when that link stops working — both left out
+    of the mail when the meeting was not recorded.
     Returns whether the message was handed to the relay.
     """
     targets = _usable_recipients(recipients)
@@ -205,18 +273,19 @@ def send_meeting_email(
         message["To"] = ", ".join(targets)
         # The model wrote the summary in the meeting's language; the mail
         # around it is written in the same one, so it reads in one voice.
-        _, heading, introduction, sign_off = mail_strings(language)
+        words = mail_strings(language)
         when = _format_when(started_at)
         message.set_content(
-            introduction.format(room=room_name)
+            words.introduction.format(room=room_name)
             + "\n\n"
             + f"{'-' * 50}\n"
-            + f"{heading} ({room_name.upper()})"
+            + f"{words.heading} ({room_name.upper()})"
             + (f" — {when}" if when else "")
             + "\n"
             + f"{'-' * 50}\n\n"
             + f"{summary_text}\n\n"
-            + sign_off
+            + _recording_paragraph(words, video_url, video_until)
+            + words.sign_off
             + "\n"
         )
 

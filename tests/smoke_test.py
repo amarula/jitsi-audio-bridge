@@ -17,11 +17,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import email
+import email.message
 import json
 import os
 import re
 import sys
 import time
+import urllib.request
 import wave
 from pathlib import Path
 
@@ -332,6 +335,30 @@ def build_master_recording(meeting_dir: Path) -> Path | None:
     )
     source.unlink(missing_ok=True)
     return master if muxed.returncode == 0 else None
+
+
+def mailed_body(raw: str) -> str:
+    """What a reader of the message sees, which is not what was transmitted.
+
+    The message is multipart once anything is attached, so the body is the
+    text/plain part — and a body carrying a long URL is quoted-printable: the
+    URL is soft-wrapped with "=\\r\\n" and its own "=" characters arrive as
+    "=3D", so a substring check on the raw payload fails on exactly the line it
+    is looking for.
+    """
+    message = email.message_from_string(raw)
+    for part in message.walk():
+        if part.get_content_type() == "text/plain" and not part.get_filename():
+            payload = part.get_payload(decode=True)
+            if isinstance(payload, bytes):
+                return payload.decode("utf-8", "replace")
+    return raw
+
+
+def recording_link(body: str) -> str | None:
+    """The first URL in *body*, which the recording paragraph puts on its own."""
+    found = re.search(r"https?://\S+", body)
+    return found.group(0) if found else None
 
 
 def plant_jibri_recording(
@@ -746,6 +773,24 @@ def main() -> int:
                   written.get("key") == key and written.get("source") == str(planted),
                   json.dumps(written))
         check("the local recording is kept unless asked otherwise", planted.is_file())
+
+        mail = mailed_body(smtp.messages[-1]) if smtp.messages else ""
+        check("the mail says where the recording is",
+              f"/stub-recordings/videos/Video-Test-Room/{planted.name}" in mail,
+              mail[-400:])
+        check("and the link it carries is a signed one",
+              "X-Amz-Signature=" in mail and "X-Amz-Algorithm=AWS4-HMAC-SHA256" in mail)
+        link = recording_link(mail)
+        check("the link can be followed", bool(link), mail[-300:])
+        if link:
+            with contextlib.closing(urllib.request.urlopen(link, timeout=10)) as answer:
+                fetched = answer.read()
+            check("and what comes back is the recording",
+                  fetched == planted.read_bytes(),
+                  f"{len(fetched)} bytes back, {planted.stat().st_size} planted")
+        # A meeting nobody recorded still gets its summary, without a link.
+        check("a meeting with no recording still mails, with no recording line",
+              bool(smtp.messages) and "Recording" not in mailed_body(smtp.messages[0]))
 
         print("\n11. directory mode (--process-dir)")
         check_directory_mode(config_path, workdir, smtp, ollama)

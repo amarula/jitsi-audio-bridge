@@ -40,6 +40,7 @@ import argparse
 import asyncio
 import configparser
 import contextlib
+import ipaddress
 import json
 import os
 import re
@@ -1356,11 +1357,11 @@ def bridge_recordings_dir() -> Path:
     return Path("/srv/recordings")
 
 
-def bridge_s3_config() -> tuple[str, str, str] | None:
+def bridge_s3_config() -> dict[str, str] | None:
     """The bridge's ``[s3]`` section, when it is set up to archive recordings.
 
-    Returns ``(endpoint, bucket, jibri_dir)``, or ``None`` when the bridge does
-    not upload anything — an empty endpoint or bucket is what turns it off.
+    Returns its settings as written, or ``None`` when the bridge uploads
+    nothing — an empty endpoint or bucket is what turns it off.
     """
     if not DEFAULT_BRIDGE_CONF.is_file():
         return None
@@ -1369,11 +1370,37 @@ def bridge_s3_config() -> tuple[str, str, str] | None:
         parser.read(DEFAULT_BRIDGE_CONF)
     except (OSError, configparser.Error):
         return None
+    if not parser.has_section("s3"):
+        return None
     endpoint = parser.get("s3", "endpoint", fallback="").strip()
     bucket = parser.get("s3", "bucket", fallback="").strip()
     if not endpoint or not bucket:
         return None
-    return endpoint, bucket, parser.get("s3", "jibri_dir", fallback="").strip()
+    return {key: parser.get("s3", key, fallback="").strip() for key in parser["s3"]}
+
+
+def unreachable_reason(url: str) -> str | None:
+    """Why an address is unlikely to be one a mail's reader can open.
+
+    Not a verdict on the address itself — only a person knows what the tunnel
+    publishes.  It is the shape of it that gives the game away: a private
+    address, a name with no domain in it, or a link that is not TLS.
+    """
+    parts = urlsplit(url)
+    host = parts.hostname or ""
+    if not host:
+        return "it names no host"
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        address = None
+    if address is not None and (address.is_private or address.is_loopback):
+        return f"{host} is a private address"
+    if address is None and "." not in host:
+        return f"{host} is not a fully qualified name"
+    if parts.scheme != "https":
+        return "it is not https"
+    return None
 
 
 def readable_by_another_user(path: Path) -> bool | None:
@@ -1450,7 +1477,8 @@ def check_recording_archive(jibri_dir: str | None) -> list[Check]:
             "recording.archive", Status.SKIP,
             "the bridge does not archive recordings ([s3] endpoint and bucket are unset)",
         )]
-    endpoint, bucket, configured_dir = s3
+    endpoint, bucket = s3["endpoint"], s3["bucket"]
+    configured_dir = s3.get("jibri_dir", "")
     if jibri_dir is None:
         return [Check(
             "recording.archive", Status.SKIP,
@@ -1488,6 +1516,51 @@ def check_recording_archive(jibri_dir: str | None) -> list[Check]:
     return [Check(
         "recording.archive", Status.PASS,
         f"{bucket} at {endpoint}, reading {directory}",
+    )]
+
+
+def check_recording_link() -> list[Check]:
+    """Whether a recording linked from a mail could actually be fetched.
+
+    Two ways this goes wrong quietly, both of them visible only to whoever
+    clicks the link days later: the address the daemon uploads to is not one a
+    reader can reach, and the link is unsigned against a bucket that needs a
+    signature.
+    """
+    s3 = bridge_s3_config()
+    if s3 is None or s3.get("link_in_mail", "").lower() not in ("true", "yes", "on", "1"):
+        return [Check(
+            "recording.link", Status.SKIP,
+            "the bridge does not link to recordings from the mail "
+            "([s3] link_in_mail is off)",
+        )]
+
+    expiry = s3.get("link_expiry_seconds", "")
+    if expiry.strip() in ("0", "0.0"):
+        return [Check(
+            "recording.link", Status.WARN,
+            f"links in the mail are unsigned, so they only work if {s3['bucket']} "
+            "is readable by anyone",
+            fix="set `[s3] link_expiry_seconds` to a window (604800 is the most SigV4 "
+                "signs for) to sign each link for that long",
+        )]
+
+    link_endpoint = s3.get("link_endpoint", "")
+    if not link_endpoint:
+        reason = unreachable_reason(s3["endpoint"])
+        if reason is not None:
+            return [Check(
+                "recording.link", Status.WARN,
+                f"the mail will link to {s3['endpoint']}, and {reason} — "
+                "the link would open for nobody reading that mail",
+                fix="set `[s3] link_endpoint` to the name recipients reach the bucket "
+                    "by; the proxy in front of it has to pass the query string and the "
+                    "Host header through unchanged, since the link is signed over both",
+            )]
+    return [Check(
+        "recording.link", Status.PASS,
+        f"links are signed for {link_endpoint or s3['endpoint']}, "
+        f"for {expiry or 'the default window'} seconds",
     )]
 
 
@@ -1558,6 +1631,7 @@ def check_recording(deployment: Deployment) -> list[Check]:
         checks.append(Check("recording.directory", Status.PASS, f"Jibri records into {jibri_dir}"))
 
     checks.extend(check_recording_archive(jibri_dir))
+    checks.extend(check_recording_link())
 
     if offered is not True:
         checks.append(Check(

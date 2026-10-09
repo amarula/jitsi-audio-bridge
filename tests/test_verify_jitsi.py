@@ -40,6 +40,7 @@ from tools.verify_jitsi import (
     check_prosody,
     check_recording,
     check_recording_archive,
+    check_recording_link,
     classify_jicofo,
     classify_jvb,
     exit_code,
@@ -1399,7 +1400,9 @@ def _bridge_s3_conf(
     *,
     endpoint: str = "https://minio.example.com",
     bucket: str = "meetings",
+    **extra: str,
 ) -> Path:
+    settings = "".join(f"{key} = {value}\n" for key, value in extra.items())
     path = tmp_path / "bridge-config.ini"
     path.write_text(
         "[storage]\n"
@@ -1408,10 +1411,90 @@ def _bridge_s3_conf(
         "[s3]\n"
         f"endpoint = {endpoint}\n"
         f"bucket = {bucket}\n"
-        f"jibri_dir = {jibri_dir}\n",
+        f"jibri_dir = {jibri_dir}\n"
+        f"{settings}",
         encoding="utf-8",
     )
     return path
+
+
+def test_the_link_check_says_nothing_when_the_mail_has_no_link(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        verify_jitsi, "DEFAULT_BRIDGE_CONF", _bridge_s3_conf(tmp_path, "/srv/jibri")
+    )
+    checks = check_recording_link()
+    assert _status(checks, "recording.link") is Status.SKIP
+
+    # Explicitly off is still off.
+    monkeypatch.setattr(
+        verify_jitsi,
+        "DEFAULT_BRIDGE_CONF",
+        _bridge_s3_conf(tmp_path, "/srv/jibri", link_in_mail="false"),
+    )
+    assert _status(check_recording_link(), "recording.link") is Status.SKIP
+
+
+def test_the_link_check_notices_an_address_a_reader_cannot_reach(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The daemon uploads over the tunnel; the mail is read outside it."""
+    monkeypatch.setattr(
+        verify_jitsi,
+        "DEFAULT_BRIDGE_CONF",
+        _bridge_s3_conf(
+            tmp_path,
+            "/srv/jibri",
+            endpoint="http://10.20.0.4:9000",
+            link_in_mail="true",
+        ),
+    )
+    check = next(c for c in check_recording_link() if c.id == "recording.link")
+    assert check.status is Status.WARN
+    assert "private address" in check.summary
+    assert "link_endpoint" in check.fix
+
+    # A name recipients can reach clears it.
+    monkeypatch.setattr(
+        verify_jitsi,
+        "DEFAULT_BRIDGE_CONF",
+        _bridge_s3_conf(
+            tmp_path,
+            "/srv/jibri",
+            endpoint="http://10.20.0.4:9000",
+            link_in_mail="true",
+            link_endpoint="https://minio.example.com",
+        ),
+    )
+    check = next(c for c in check_recording_link() if c.id == "recording.link")
+    assert check.status is Status.PASS
+    assert "https://minio.example.com" in check.summary
+
+
+def test_the_link_check_notices_unsigned_links(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        verify_jitsi,
+        "DEFAULT_BRIDGE_CONF",
+        _bridge_s3_conf(
+            tmp_path, "/srv/jibri", link_in_mail="true", link_expiry_seconds="0"
+        ),
+    )
+    check = next(c for c in check_recording_link() if c.id == "recording.link")
+    assert check.status is Status.WARN
+    assert "readable by anyone" in check.summary
+
+
+def test_unreachable_reason_reads_the_shape_of_an_address() -> None:
+    assert verify_jitsi.unreachable_reason("http://10.20.0.4:9000") is not None
+    assert "private address" in verify_jitsi.unreachable_reason("http://10.20.0.4:9000")
+    assert "private address" in verify_jitsi.unreachable_reason("http://127.0.0.1:9000")
+    assert "fully qualified" in verify_jitsi.unreachable_reason("http://minio:9000")
+    assert "not https" in verify_jitsi.unreachable_reason("http://minio.example.com")
+    assert verify_jitsi.unreachable_reason("https://minio.example.com") is None
+    assert verify_jitsi.unreachable_reason("") is not None
 
 
 def test_the_archive_check_is_skipped_unless_the_bridge_uploads(

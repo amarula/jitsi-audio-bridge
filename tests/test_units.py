@@ -18,7 +18,7 @@ import time
 import urllib.parse
 import wave
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -687,9 +687,9 @@ def test_the_language_rule_follows_the_transcript() -> None:
 def test_the_sign_off_follows_the_language_too() -> None:
     from jitsi_audio_bridge.mailer import mail_strings
 
-    assert mail_strings("Italian")[3].startswith("Cordiali saluti")
-    assert mail_strings("english")[3].startswith("Best regards")
-    assert mail_strings("Klingon")[3] == mail_strings("English")[3]
+    assert mail_strings("Italian").sign_off.startswith("Cordiali saluti")
+    assert mail_strings("english").sign_off.startswith("Best regards")
+    assert mail_strings("Klingon").sign_off == mail_strings("English").sign_off
 
 
 def test_correction_is_off_unless_it_is_asked_for(clean_env: None) -> None:
@@ -818,20 +818,150 @@ def test_the_mail_is_written_in_the_meetings_language() -> None:
     """An Italian meeting should not be headed in English."""
     from jitsi_audio_bridge.mailer import _subject_for, mail_strings
 
-    subject, heading, introduction, sign_off = mail_strings("Italian")
-    assert heading == "RIEPILOGO DELLA RIUNIONE"
-    assert "riunione" in introduction.format(room="Weekly")
-    assert sign_off.startswith("Cordiali saluti")
+    words = mail_strings("Italian")
+    assert words.heading == "RIEPILOGO DELLA RIUNIONE"
+    assert "riunione" in words.introduction.format(room="Weekly")
+    assert words.sign_off.startswith("Cordiali saluti")
     assert _subject_for("Weekly", "", None, "Italian") == (
         "Riepilogo e trascrizione della riunione: Weekly"
     )
     # However the model spelled it, and case-insensitively.
     assert mail_strings("italian") == mail_strings("Italian")
-    assert mail_strings(" French ")[1] == "RÉSUMÉ DE LA RÉUNION"
+    assert mail_strings(" French ").heading == "RÉSUMÉ DE LA RÉUNION"
 
     # A language we have no words for is mailed in English, not in nothing.
     assert mail_strings("Klingon") == mail_strings("English")
     assert mail_strings(None) == mail_strings("English")
+
+
+#: A link the length of a real one, so the body is encoded the way a real mail
+#: encodes it: past about 78 characters a line stops being 7bit.
+_LONG_LINK = (
+    "https://minio.omnia.amarulasolutions.com/meetings/videos/Weekly/"
+    "Weekly_2026-10-08-10-11-12.mp4?X-Amz-Algorithm=AWS4-HMAC-SHA256&"
+    "X-Amz-Credential=bridge%2F20261008%2Fus-east-1%2Fs3%2Faws4_request&"
+    "X-Amz-Signature=6f1c0a2b3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8"
+)
+
+
+def _capturing_smtp(sent: list) -> type:
+    """A stand-in for ``smtplib.SMTP`` that keeps what it was handed."""
+
+    class Smtp:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def __enter__(self) -> Smtp:
+            return self
+
+        def __exit__(self, *exc: object) -> bool:
+            return False
+
+        def starttls(self) -> None:
+            pass
+
+        def login(self, *args: object) -> None:
+            pass
+
+        def send_message(self, message: object) -> None:
+            sent.append(message)
+
+    return Smtp
+
+
+def _mailed_body(monkeypatch, **kwargs: object) -> tuple[str, object]:
+    """Send one mail and return the body a reader would see, and the message."""
+    from jitsi_audio_bridge import mailer
+
+    sent: list = []
+    monkeypatch.setattr(mailer.smtplib, "SMTP", _capturing_smtp(sent))
+    assert mailer.send_meeting_email(
+        ["someone@example.com"],
+        "Weekly",
+        "the summary",
+        None,
+        None,
+        load_config().smtp,
+        started_at="2026-10-08T10:11:00+00:00",
+        **kwargs,
+    )
+    return str(sent[0].get_payload(decode=True).decode("utf-8")), sent[0]
+
+
+def test_the_mail_carries_the_recording_link_and_until_when(
+    monkeypatch,
+) -> None:
+    body, message = _mailed_body(
+        monkeypatch,
+        language="english",
+        video_url=_LONG_LINK,
+        video_until="2026-10-15T10:11:00+00:00",
+    )
+    assert "Recording (available until 2026-10-15):" in body
+    assert _LONG_LINK in body
+    # The URL is whole once decoded — but not in the raw message, which is
+    # quoted-printable from here on: the line is soft-wrapped with "=\r\n" and
+    # every "=" in it arrives as "=3D".  Anything asserting on a link has to
+    # decode first, as this does.
+    assert _LONG_LINK not in message.as_string()
+    assert "=3D" in message.as_string()
+
+
+def test_the_link_is_written_in_the_meetings_language(monkeypatch) -> None:
+    body, _ = _mailed_body(
+        monkeypatch,
+        language="italian",
+        video_url="https://minio.example.com/b/k.mp4",
+        video_until="2026-10-15T10:11:00+00:00",
+    )
+    assert "Registrazione (disponibile fino al 2026-10-15):" in body
+
+
+def test_a_meeting_with_no_recording_says_nothing_about_one(monkeypatch) -> None:
+    body, _ = _mailed_body(monkeypatch, language="english")
+    assert "Recording" not in body
+    # And the mail around the summary is otherwise what it was.
+    assert "the summary" in body
+    assert "MEETING SUMMARY (WEEKLY)" in body
+
+
+def test_a_link_that_dies_today_says_the_hour(monkeypatch) -> None:
+    """"Until today" is not an answer for a link that lasts an hour."""
+    from jitsi_audio_bridge.mailer import _format_date
+
+    soon = (datetime.now(UTC) + timedelta(minutes=45)).isoformat(timespec="seconds")
+    assert _format_date(soon) == (
+        (datetime.now(UTC) + timedelta(minutes=45)).astimezone().strftime("%Y-%m-%d %H:%M")
+    )
+    # A week out is a day, which is what somebody reading it needs.
+    later = (datetime.now(UTC) + timedelta(days=7)).isoformat(timespec="seconds")
+    assert _format_date(later) == (
+        (datetime.now(UTC) + timedelta(days=7)).astimezone().strftime("%Y-%m-%d")
+    )
+    assert _format_date(None) == ""
+    assert _format_date("not a moment") == ""
+
+
+def test_a_link_without_an_expiry_gets_no_parenthetical(monkeypatch) -> None:
+    """A bucket anyone may read gives a URL that never stops working."""
+    body, _ = _mailed_body(
+        monkeypatch,
+        language="english",
+        video_url="https://minio.example.com/b/k.mp4",
+    )
+    assert "Recording:\nhttps://minio.example.com/b/k.mp4" in body
+    assert "available until" not in body
+
+
+def test_every_language_says_what_is_in_every_other_one() -> None:
+    """A row added half translated would mail a blank line, not a fallback."""
+    from jitsi_audio_bridge.mailer import _MAIL_STRINGS
+
+    for language, words in _MAIL_STRINGS.items():
+        assert words.recording_label.strip(), language
+        assert "{when}" in words.recording_expiry, language
+        for field, value in words.__dict__.items():
+            assert str(value).strip(), f"{language}.{field}"
 
 
 def test_the_subject_says_when_the_meeting_was() -> None:
@@ -2023,6 +2153,157 @@ def test_a_recording_larger_than_the_multipart_threshold_is_uploaded_in_parts(
         assert sum(1 for method, _, _ in stub.requests if method == "PUT") >= 2
     finally:
         stub.close()
+
+
+def test_a_link_is_signed_with_sigv4_on_the_address_recipients_use(
+    tmp_path: Path,
+) -> None:
+    """The daemon may upload to a name nobody outside can reach."""
+    pytest.importorskip("boto3")
+    config = _s3_config(
+        tmp_path,
+        endpoint="http://minio.internal:9000",
+        link_endpoint="https://minio.omnia.amarulasolutions.com",
+        bucket="meetings",
+    )
+    url = s3_upload.presigned_url(config.s3, "meetings", "videos/Room/rec.mp4")
+    assert url is not None
+    parsed = urllib.parse.urlparse(url)
+    query = urllib.parse.parse_qs(parsed.query)
+
+    assert parsed.netloc == "minio.omnia.amarulasolutions.com"
+    assert parsed.path == "/meetings/videos/Room/rec.mp4"
+    # v4, not the v2 query signature botocore picks by default against a
+    # custom endpoint — MinIO refuses that one, and it looks signed either way.
+    assert query["X-Amz-Algorithm"] == ["AWS4-HMAC-SHA256"]
+    assert "X-Amz-Signature" in query
+    assert "AWSAccessKeyId" not in query
+    assert query["X-Amz-Expires"] == ["604800"]
+
+
+def test_a_link_can_be_asked_for_unsigned(tmp_path: Path) -> None:
+    """For a bucket that is readable without a signature."""
+    config = _s3_config(tmp_path, link_expiry_seconds=0.0, bucket="meetings")
+    url = s3_upload.presigned_url(config.s3, "meetings", "videos/Room/rec.mp4")
+    assert url == f"{config.s3.endpoint}/meetings/videos/Room/rec.mp4"
+    assert "?" not in url
+
+
+def test_a_link_longer_than_sigv4_allows_is_clamped(tmp_path: Path) -> None:
+    """S3 refuses more than seven days when somebody clicks, not when signing."""
+    pytest.importorskip("boto3")
+    config = _s3_config(tmp_path, link_expiry_seconds=700000.0)
+    url = s3_upload.presigned_url(config.s3, "b", "k")
+    assert url is not None
+    assert urllib.parse.parse_qs(urllib.parse.urlparse(url).query)["X-Amz-Expires"] == [
+        "604800"
+    ]
+
+
+def test_the_claim_keeps_the_plain_address_even_when_the_mail_is_signed(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """``video.json`` records where the object is, not a link that expires."""
+    config = _s3_config(
+        tmp_path,
+        endpoint="http://minio.internal:9000",
+        link_endpoint="https://minio.example.com",
+    )
+    meeting = _meeting_dir(tmp_path)
+    _jibri_recording(config.s3.jibri_dir, "Standup", _MEETING_EPOCH + 10)
+    monkeypatch.setattr(s3_upload, "_client", lambda s3, endpoint=None: _NoopS3())
+
+    assert s3_upload.upload_meeting_video(meeting, config, wait=False)
+    claim = s3_upload.read_claim(meeting / s3_upload.CLAIM_FILENAME)
+    assert claim["url"] == f"https://minio.example.com/meetings-recordings/{claim['key']}"
+    assert "Signature" not in claim["url"]
+
+
+class _NoopS3:
+    """A client that accepts an upload, confirms its size, and signs a link."""
+
+    def upload_file(self, path: str, bucket: str, key: str) -> None:
+        pass
+
+    def head_object(self, **kwargs: object) -> dict:
+        return {"ContentLength": 32}
+
+    def generate_presigned_url(
+        self, operation: str, Params: dict, ExpiresIn: int  # noqa: N803 - botocore's names
+    ) -> str:
+        return (
+            f"https://minio.example.com/{Params['Bucket']}/{Params['Key']}"
+            f"?X-Amz-Expires={ExpiresIn}&X-Amz-Signature=stub"
+        )
+
+
+def test_the_mail_gets_a_link_when_the_recording_was_uploaded(tmp_path: Path) -> None:
+    pytest.importorskip("boto3")
+    stub = _StubS3()
+    try:
+        config = _s3_config(tmp_path, endpoint=stub.url, link_endpoint=stub.url)
+        meeting = _meeting_dir(tmp_path)
+        recording = _jibri_recording(config.s3.jibri_dir, "Standup", _MEETING_EPOCH + 10)
+
+        link = s3_upload.prepare_video(meeting, config, wait_seconds=5.0)
+
+        assert link is not None
+        assert urllib.parse.urlparse(link.url).path == (
+            f"/meetings-recordings/Standup/{recording.name}"
+        )
+        assert "X-Amz-Signature" in link.url
+        assert link.expires_at is not None
+        # The upload it did is the one the later call would have done.
+        assert s3_upload.upload_meeting_video(meeting, config, wait=False)
+        assert [method for method, _, _ in stub.requests].count("PUT") == 1
+    finally:
+        stub.close()
+
+
+def test_a_second_prepare_does_not_upload_again(tmp_path: Path, monkeypatch) -> None:
+    config = _s3_config(tmp_path)
+    meeting = _meeting_dir(tmp_path)
+    _jibri_recording(config.s3.jibri_dir, "Standup", _MEETING_EPOCH + 10)
+    uploads: list[str] = []
+
+    class Counting(_NoopS3):
+        def upload_file(self, path: str, bucket: str, key: str) -> None:
+            uploads.append(key)
+
+    monkeypatch.setattr(s3_upload, "_client", lambda s3, endpoint=None: Counting())
+    assert s3_upload.prepare_video(meeting, config, wait_seconds=5.0) is not None
+    assert s3_upload.prepare_video(meeting, config, wait_seconds=5.0) is not None
+    assert len(uploads) == 1
+
+
+def test_a_link_is_not_waited_for_when_no_recording_is_coming(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Most meetings are not recorded, and their mail must not sit and wait."""
+    config = _s3_config(tmp_path, link_wait_seconds=30.0)
+    meeting = _meeting_dir(tmp_path)
+    monkeypatch.setattr(s3_upload, "POLL_SECONDS", 0.05)
+
+    started = time.monotonic()
+    assert s3_upload.prepare_video(meeting, config, wait_seconds=30.0) is None
+    assert time.monotonic() - started < 5.0, "it waited for a recording that never comes"
+
+
+def test_the_post_mail_upload_still_waits_for_a_recording_that_is_late(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The patient path is untouched: a late recording is still archived."""
+    config = _s3_config(tmp_path, jibri_dir=tmp_path / "jibri-empty", wait_seconds=1.0)
+    config = replace(
+        config, s3=replace(config.s3, jibri_dir=tmp_path / "jibri-empty", wait_seconds=1.0)
+    )
+    (tmp_path / "jibri-empty").mkdir()
+    meeting = _meeting_dir(tmp_path)
+    monkeypatch.setattr(s3_upload, "POLL_SECONDS", 0.05)
+
+    started = time.monotonic()
+    assert not s3_upload.upload_meeting_video(meeting, config)
+    assert time.monotonic() - started >= 0.9, "the patient path stopped waiting"
 
 
 def test_an_uploaded_recording_is_not_uploaded_twice(tmp_path: Path) -> None:

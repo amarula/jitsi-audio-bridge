@@ -389,6 +389,18 @@ class S3Stub:
                     headers=(("Content-Length", str(len(stored or b""))),),
                 )
 
+            def do_GET(self) -> None:  # noqa: N802 - required name
+                # What a link in a mail does when somebody clicks it.  The
+                # signature is not checked, which a real server would do — so
+                # this proves the link points at the object, not that the
+                # endpoint would accept it.
+                self._note("GET")
+                stored = outer.objects.get(self._key())
+                if stored is None:
+                    self._reply(404, b"<Error><Code>NoSuchKey</Code></Error>")
+                    return
+                self._reply(200, stored, headers=(("Content-Type", "video/mp4"),))
+
         self._server = ThreadingHTTPServer(("127.0.0.1", self.port), Handler)
         self._server.daemon_threads = True
         self._thread: threading.Thread | None = None
@@ -445,6 +457,13 @@ jibri_dir = {jibri_dir}
 ; test plants its recording already older than this.
 settle_seconds = 30
 wait_seconds = 10
+; The mail waits for the recording and links to it, signed for an hour.  The
+; link endpoint is named here although it is the same address, so the smoke
+; test exercises the branch a real deployment uses.
+link_in_mail = true
+link_wait_seconds = 10
+link_expiry_seconds = 3600
+link_endpoint = {s3.url}
 """
         if s3 is not None and jibri_dir is not None
         else ""

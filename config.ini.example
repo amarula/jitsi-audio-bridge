@@ -143,6 +143,29 @@ settle_seconds = 30
 ; byte.  Off by default: the recording is the only copy until then.
 delete_after_upload = false
 
+; Put the recording's link in the summary mail.  This is the one setting here
+; that changes *when* the mail is sent: the daemon then looks for the recording
+; and uploads it before mailing, so that the link works as soon as somebody
+; reads it.  A meeting nobody recorded is mailed without a link rather than
+; held back.  See "The link in the mail" in the README -- the link is a bearer
+; token for as long as it lasts, and whoever the mail reaches can download the
+; recording with it.
+link_in_mail = false
+; How long the mail waits for a recording that has not been written yet.
+; Nothing is waited for when the room has no recording at all, which is most
+; meetings.
+link_wait_seconds = 120
+; How long the signed link works, in seconds.  604800 (seven days) is the most
+; SigV4 will sign for and a longer value is clamped to it; 0 signs nothing and
+; mails the plain URL, which is right only for a bucket anyone may read.
+link_expiry_seconds = 604800
+; The address recipients reach the recording by, when it is not the one above
+; -- a daemon behind a tunnel usually uploads to a name nobody outside can use.
+; Links are built on this, and the proxy in front of the bucket has to pass the
+; query string and the Host header through unchanged: the signature covers
+; both.  Empty means the two addresses are the same.
+link_endpoint =
+
 [smtp]
 host = 127.0.0.1
 port = 25

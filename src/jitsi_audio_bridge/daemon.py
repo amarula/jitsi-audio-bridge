@@ -16,7 +16,9 @@ emailed.
 
 This is the only module that knows about asyncio.  The blocking half of the
 pipeline lives in :func:`process_completed_session` and is pushed onto a worker
-thread via :func:`asyncio.to_thread`.
+thread via :func:`asyncio.to_thread` — which, when the mail is to carry a link
+to the meeting's recording, starts one thread of its own for the upload
+(:class:`VideoJob`) so that it runs while the transcription does.
 """
 
 from __future__ import annotations
@@ -33,6 +35,7 @@ import re
 import shutil
 import signal
 import tempfile
+import threading
 import time
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
@@ -68,7 +71,7 @@ from .audio import (
 )
 from .config import Config, ConfigError, load_config
 from .mailer import send_meeting_email
-from .s3_upload import upload_meeting_video
+from .s3_upload import VideoLink, prepare_video, upload_meeting_video
 from .timeline import SessionTimeline, TurnTracker, format_offset, merge_turns, utc_now
 
 logger = logging.getLogger(__name__)
@@ -583,6 +586,50 @@ def transcribe_recordings(
     return lines
 
 
+class VideoJob:
+    """The recording, uploaded while the meeting is being transcribed.
+
+    The two waits are on different things — Whisper on one side, the bucket on
+    the other — so running them at once is the difference between the mail
+    leaving at their sum and at the slower of the two.  The thread is started
+    when the audio is discovered and joined before the mail, by
+    :meth:`result` or by the ``finally`` that owns it; nothing survives the
+    call that started it.
+    """
+
+    def __init__(self, meeting_dir: Path, config: Config, wait_seconds: float) -> None:
+        self._link: VideoLink | None = None
+        self._done = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run,
+            args=(meeting_dir, config, wait_seconds),
+            name="video-upload",
+            daemon=True,
+        )
+        self._thread.start()
+
+    @classmethod
+    def start(cls, meeting_dir: Path, config: Config) -> VideoJob | None:
+        """Start one, or return ``None`` when the mail will carry no link."""
+        if not (config.s3.enabled and config.s3.link_in_mail):
+            return None
+        return cls(meeting_dir, config, config.s3.link_wait_seconds)
+
+    def _run(self, meeting_dir: Path, config: Config, wait_seconds: float) -> None:
+        try:
+            self._link = prepare_video(meeting_dir, config, wait_seconds=wait_seconds)
+        finally:
+            # Setting this on every path is what makes ``result`` a join that
+            # cannot hang: prepare_video does not raise, but a future edit that
+            # lets it must not deadlock the mail behind it.
+            self._done.set()
+
+    def result(self) -> VideoLink | None:
+        """Wait for the upload and return what to put in the mail."""
+        self._done.wait()
+        return self._link
+
+
 def process_completed_session(meeting_dir: Path, config: Config) -> bool:
     """Transcribe, summarise and email one finished meeting.
 
@@ -612,86 +659,119 @@ def process_completed_session(meeting_dir: Path, config: Config) -> bool:
         logger.info("no audio in %s; nothing to do", meeting_dir)
         return False
 
-    logger.info("transcribing %d audio file(s)", len(participant_files))
-    timeline = SessionTimeline.load(meeting_dir / TIMELINE_FILENAME)
-    if timeline is None:
-        logger.info(
-            "no %s in %s; the transcript keeps the per-participant shape",
-            TIMELINE_FILENAME,
-            meeting_dir,
+    # From here on the directory is worth a recording, and this is the moment
+    # to go looking for it: everything below is minutes of waiting on Whisper,
+    # which the upload can spend on the bucket instead.
+    video = VideoJob.start(meeting_dir, config)
+    try:
+        logger.info("transcribing %d audio file(s)", len(participant_files))
+        timeline = SessionTimeline.load(meeting_dir / TIMELINE_FILENAME)
+        if timeline is None:
+            logger.info(
+                "no %s in %s; the transcript keeps the per-participant shape",
+                TIMELINE_FILENAME,
+                meeting_dir,
+            )
+        transcript_lines = transcribe_recordings(
+            participant_files, metadata, timeline, config
         )
-    transcript_lines = transcribe_recordings(participant_files, metadata, timeline, config)
 
-    if not transcript_lines:
-        logger.warning("nothing was transcribed for %s; skipping the email", meeting_dir)
-        return False
-
-    transcript = render_transcript(transcript_lines)
-    transcript_path = meeting_dir / "transcript.txt"
-    transcript_path.write_text(transcript, encoding="utf-8")
-    logger.info(
-        "wrote %s (%d speaker(s), %d line(s))",
-        transcript_path.name,
-        len({speaker for _, speaker, _ in transcript_lines}),
-        len(transcript_lines),
-    )
-
-    # Detected once, then given to both: the summary is written in it and the
-    # mail around the summary follows it, so the two read in one language.
-    language = detect_language(transcript, config.ollama)
-
-    # An optional pass over the transcript before it is summarised: speech
-    # recognition mishears words, and the model that reads the whole meeting
-    # can often repair them from context.  The raw transcript is what was
-    # said, so it is never replaced — the corrected one is written beside it,
-    # is what gets summarised and mailed, and is dropped if the pass fails.
-    summarised = transcript
-    attached = transcript_path
-    if config.ollama.correct_transcript:
-        corrected = correct_transcript(transcript, config.ollama, language=language)
-        if corrected:
-            corrected_path = meeting_dir / CORRECTED_TRANSCRIPT_NAME
-            corrected_path.write_text(corrected, encoding="utf-8")
-            summarised, attached = corrected, corrected_path
-            logger.info("wrote %s", corrected_path.name)
-        else:
+        if not transcript_lines:
             logger.warning(
-                "the correction pass produced nothing; summarising the transcript as it is"
+                "nothing was transcribed for %s; skipping the email", meeting_dir
+            )
+            return False
+
+        transcript = render_transcript(transcript_lines)
+        transcript_path = meeting_dir / "transcript.txt"
+        transcript_path.write_text(transcript, encoding="utf-8")
+        logger.info(
+            "wrote %s (%d speaker(s), %d line(s))",
+            transcript_path.name,
+            len({speaker for _, speaker, _ in transcript_lines}),
+            len(transcript_lines),
+        )
+
+        # Detected once, then given to both: the summary is written in it and
+        # the mail around the summary follows it, so the two read in one
+        # language.
+        language = detect_language(transcript, config.ollama)
+
+        # An optional pass over the transcript before it is summarised: speech
+        # recognition mishears words, and the model that reads the whole
+        # meeting can often repair them from context.  The raw transcript is
+        # what was said, so it is never replaced — the corrected one is written
+        # beside it, is what gets summarised and mailed, and is dropped if the
+        # pass fails.
+        summarised = transcript
+        attached = transcript_path
+        if config.ollama.correct_transcript:
+            corrected = correct_transcript(transcript, config.ollama, language=language)
+            if corrected:
+                corrected_path = meeting_dir / CORRECTED_TRANSCRIPT_NAME
+                corrected_path.write_text(corrected, encoding="utf-8")
+                summarised, attached = corrected, corrected_path
+                logger.info("wrote %s", corrected_path.name)
+            else:
+                logger.warning(
+                    "the correction pass produced nothing; summarising the transcript "
+                    "as it is"
+                )
+
+        summary = generate_summary(
+            summarised,
+            metadata["room_name"],
+            metadata["participants"],
+            config.ollama,
+            language=language,
+        )
+        if not summary:
+            logger.warning(
+                "no summary was produced for %s; the transcript is kept", meeting_dir
+            )
+            return False
+
+        summary_path = meeting_dir / "summary.md"
+        summary_path.write_text(summary, encoding="utf-8")
+        logger.info("wrote %s", summary_path.name)
+
+        # The last thing before the mail: whatever the upload has become by
+        # now, and no longer than it was given.  A link is only worth mailing
+        # if it works when the mail is read.
+        link = video.result() if video is not None else None
+        if link is not None:
+            logger.info(
+                "the recording is at the endpoint; the mail links to it%s",
+                f" until {link.expires_at}" if link.expires_at else " with no expiry",
             )
 
-    summary = generate_summary(
-        summarised,
-        metadata["room_name"],
-        metadata["participants"],
-        config.ollama,
-        language=language,
-    )
-    if not summary:
-        logger.warning("no summary was produced for %s; the transcript is kept", meeting_dir)
-        return False
+        sent = send_meeting_email(
+            metadata["recipients"],
+            metadata["room_name"],
+            summary,
+            attached,
+            summary_path,
+            config.smtp,
+            started_at=session_started_at(meeting_dir, timeline),
+            language=language,
+            video_url=link.url if link else None,
+            video_until=link.expires_at if link else None,
+        )
 
-    summary_path = meeting_dir / "summary.md"
-    summary_path.write_text(summary, encoding="utf-8")
-    logger.info("wrote %s", summary_path.name)
+        if sent and config.storage.cleanup_after_send:
+            # Only after a confirmed send, and only when asked for: these files
+            # are the only copy of the meeting.
+            logger.info("cleanup_after_send is enabled; removing the processed files")
+            _cleanup([*participant_files, extracted, transcript_path, summary_path])
 
-    sent = send_meeting_email(
-        metadata["recipients"],
-        metadata["room_name"],
-        summary,
-        attached,
-        summary_path,
-        config.smtp,
-        started_at=session_started_at(meeting_dir, timeline),
-        language=language,
-    )
-
-    if sent and config.storage.cleanup_after_send:
-        # Only after a confirmed send, and only when asked for: these files are
-        # the only copy of the meeting.
-        logger.info("cleanup_after_send is enabled; removing the processed files")
-        _cleanup([*participant_files, extracted, transcript_path, summary_path])
-
-    return sent
+        return sent
+    finally:
+        # Every way out of the block above, the early returns included: the
+        # upload is this call's to finish before it hands the directory back.
+        # It has already written its claim by then, which is what keeps the
+        # caller's own upload from repeating the work.
+        if video is not None:
+            video.result()
 
 
 def process_directory(meeting_dir: Path, config: Config) -> int:

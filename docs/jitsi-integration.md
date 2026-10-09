@@ -551,10 +551,11 @@ control frame are untouched: their own `metadata.json` always wins.
 ### 6. Optional — archive the recordings
 
 The video is the one product of a meeting the bridge cannot make itself: Jibri
-makes it, when a user presses Record, and the bridge only copies it out
-afterwards — to an S3-compatible bucket, if `[s3]` says where. That leaves the
-bridge to work out *which* recording belongs to the meeting it has just
-transcribed, and Jitsi tells it only two things:
+makes it, when a user presses Record, and the bridge only copies it out — to an
+S3-compatible bucket, if `[s3]` says where, either after the mail or before it,
+when the mail is to link to the recording. That leaves the bridge to work out
+*which* recording belongs to the meeting it has just transcribed, and Jitsi
+tells it only two things:
 
 * **the room**, which Jibri puts in the filename it builds
   (`<callName>_<yyyy-MM-dd-HH-mm-ss>.<ext>`) and again in the `metadata.json`
@@ -590,6 +591,14 @@ pointed at a directory this host's Jibri does not write to — which is otherwis
 a silent failure, with one line in the log at the end of every meeting. If
 `delete_after_upload` is on, the bridge also writes there: add the directory to
 `ReadWritePaths` in the unit.
+
+With `link_in_mail` the deployment needs one more thing of the network, and it
+is the opposite direction: the address in `[s3] link_endpoint` has to be
+reachable by the people who read the mail, and the proxy in front of the bucket
+has to pass the request through with its query string and `Host` header intact,
+because the link is signed over both. A resource that requires a login turns
+every link into a login page, and one that rewrites the path or the host turns
+it into `SignatureDoesNotMatch`.
 
 The endpoint itself is one more outbound connection to whitelist, like the
 Whisper and Ollama ones — same host, same tunnel — and it is the failure that
