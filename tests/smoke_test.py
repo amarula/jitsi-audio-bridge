@@ -55,6 +55,31 @@ def check(name: str, ok: bool, detail: str = "") -> None:
     print(f"  [{'PASS' if ok else 'FAIL'}] {name}" + (f" — {detail}" if detail else ""))
 
 
+def settle(smtp: SmtpStub, quiet: float = 3.0, timeout: float = 60.0) -> None:
+    """Wait until no new mail has arrived for *quiet* seconds.
+
+    Several checks count messages — "exactly one email", "no email at all" —
+    and a count is only meaningful when nothing else is in flight.  Sections
+    here run back to back while earlier sessions are still being transcribed
+    and mailed: their mail arrives a grace period after their last connection,
+    which on a fast machine lands in the middle of the next section's window
+    and turns a correct count into a failure.  Waiting for the mailbox to go
+    quiet first is what makes those counts assertions about the daemon rather
+    than about the machine's speed.
+    """
+    deadline = time.monotonic() + timeout
+    seen = len(smtp.messages)
+    changed = time.monotonic()
+    while time.monotonic() < deadline:
+        time.sleep(0.2)
+        if len(smtp.messages) != seen:
+            seen = len(smtp.messages)
+            changed = time.monotonic()
+        elif time.monotonic() - changed >= quiet:
+            return
+    print(f"    (the mailbox never went quiet for {quiet}s; counting anyway)")
+
+
 def wait_for(predicate, timeout: float, interval: float = 0.2) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -267,7 +292,6 @@ def check_directory_mode(
         )
     )
 
-    before = len(smtp.messages)
     code, output = run_process_dir(config_path, jitsi_dir)
     check("--process-dir exits successfully on a Jitsi-shaped directory", code == 0,
           f"exit {code}")
@@ -278,7 +302,10 @@ def check_directory_mode(
         body = (jitsi_dir / "transcript.txt").read_text()
         check("speakers were attributed from the address mapping",
               "Ada" in body and "Grace" in body, body.strip()[:80])
-    check("directory mode sent an email", len(smtp.messages) == before + 1)
+    # Its own mail, found by the room it is about rather than by being the
+    # newest: a session from earlier can still be finishing and deliver after
+    # this one.
+    check("directory mode sent an email", bool(mailed_for(smtp, "Batch-Review")))
     check("the room came from meeting_url",
           ollama.summary_prompts and "Batch-Review" in ollama.summary_prompts[-1])
 
@@ -293,14 +320,14 @@ def check_directory_mode(
         print("    (ffmpeg or flite unavailable; skipping the master-track check)")
         return
 
-    before = len(smtp.messages)
     code, output = run_process_dir(config_path, master_dir)
     check("--process-dir handles a single master recording", code == 0, f"exit {code}")
     check("the master track was extracted to 16 kHz",
           (master_dir / "extracted_audio.wav").is_file())
     check("a transcript was written from the extracted audio",
           (master_dir / "transcript.txt").is_file())
-    check("the master-recording session sent an email", len(smtp.messages) == before + 1)
+    check("the master-recording session sent an email",
+          bool(mailed_for(smtp, "Master-Recording")))
 
 
 def build_master_recording(meeting_dir: Path) -> Path | None:
@@ -372,6 +399,27 @@ def recording_link(body: str) -> str | None:
     """The first URL in *body*, which the recording paragraph puts on its own."""
     found = re.search(r"https?://\S+", body)
     return found.group(0) if found else None
+
+
+def mailed_for(smtp: SmtpStub, needle: str, timeout: float = 30.0) -> str:
+    """The body of the mail that mentions *needle*, waiting for it to arrive.
+
+    Sessions are post-processed independently, so a mail for one can land
+    between another's upload and the check that follows it: "the newest
+    message" and "one more message than before" are both assertions about
+    timing rather than about the mail.  Asking for the one that names what the
+    check is about is the only one of the three that stays true on a machine
+    that runs the smoke test faster than this one.
+    """
+    deadline = time.time() + timeout
+    while True:
+        for raw in smtp.messages:
+            body = mailed_body(raw)
+            if needle in body:
+                return body
+        if time.time() >= deadline:
+            return ""
+        time.sleep(0.2)
 
 
 def plant_jibri_recording(
@@ -555,8 +603,9 @@ def main() -> int:
 
         print("\n5. empty session handling")
         # The previous session's mail arrives a grace period after its last
-        # connection, so let it land before counting what this one sends.
-        time.sleep(2)
+        # connection, so let it — and every other session still finishing —
+        # land before counting what this one sends.
+        settle(smtp)
         before = len(smtp.messages)
         send_meeting(url, session_id="noaudio", participants=1, audio="none", fast=True)
         time.sleep(2)
@@ -572,6 +621,7 @@ def main() -> int:
         print("\n6. malformed control frames")
         # A junk control frame must not abort the session: the audio that
         # follows it still has to be captured and processed.
+        settle(smtp)
         before_junk = len(smtp.messages)
         check("a malformed control frame does not kill the session",
               send_junk_then_audio(url, "junkframes"))
@@ -585,6 +635,7 @@ def main() -> int:
         wait_for(lambda: len(smtp.messages) > before_junk, timeout=30)
 
         print("\n7. media-json capture (stock Jitsi's framing)")
+        settle(smtp)
         before_mediajson = len(smtp.messages)
         send_meeting(
             url,
@@ -670,6 +721,7 @@ def main() -> int:
                   "fallback@example.com" in smtp.messages[-1])
 
         print("\n8. media-json edge cases")
+        settle(smtp)
         before_edge = len(smtp.messages)
         check("junk media-json events do not kill the session, and the pong is answered",
               send_media_json_events(url, "mediajson-edge"))
@@ -684,6 +736,7 @@ def main() -> int:
         # A 5xx is the service saying "not now": the request is retried, and a
         # participant whose every turn failed is handed over as one recording
         # rather than lost.
+        settle(smtp)
         before_flaky = len(smtp.messages)
         whisper.fail_next = 2
         send_meeting(
@@ -705,6 +758,7 @@ def main() -> int:
         # a connection ending must not finalise the meeting: no mail from the
         # first connection, no file truncated by the second, and one transcript
         # covering both once the session finally goes quiet.
+        settle(smtp)
         before_reconnect = len(smtp.messages)
         send_meeting(
             url, session_id="reconnect", participants=1, duration=2, fast=True,
@@ -803,7 +857,7 @@ def main() -> int:
                   json.dumps(written))
         check("the local recording is kept unless asked otherwise", planted.is_file())
 
-        mail = mailed_body(smtp.messages[-1]) if smtp.messages else ""
+        mail = mailed_for(smtp, "Video-Test-Room")
         check("the mail says where the recording is",
               f"/stub-recordings/videos/Video-Test-Room/{planted.name}" in mail,
               mail[-400:])
