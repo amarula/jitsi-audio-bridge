@@ -186,7 +186,7 @@ def test_the_workflows_check_the_things_that_break() -> None:
     assert "python -m pytest tests/ -q" in ci
     assert "python tests/smoke_test.py" in ci
     assert "lintian --fail-on error" in ci
-    for image in ("debian:12", "debian:13", "ubuntu:24.04"):
+    for image in ("debian:12", "debian:13", "ubuntu:24.04", "ubuntu:26.04"):
         assert image in ci, f"the package matrix no longer builds for {image}"
     assert 'python: ["3.11", "3.12", "3.13", "3.14"]' in ci
 
@@ -217,7 +217,7 @@ def test_the_jenkins_pipeline_checks_what_the_workflows_check() -> None:
     everything = _jenkins_text()
 
     assert "values '3.11', '3.12', '3.13', '3.14'" in jenkinsfile, "the python axis lost a cell"
-    assert "values 'debian:12', 'debian:13', 'ubuntu:24.04'" in jenkinsfile, (
+    assert "values 'debian:12', 'debian:13', 'ubuntu:24.04', 'ubuntu:26.04'" in jenkinsfile, (
         "the distribution axis lost a cell"
     )
 

@@ -102,6 +102,10 @@ jobs:
             slug: debian13
           - image: ubuntu:24.04
             slug: ubuntu2404
+          # The newest LTS, and the only one of these whose python3 is the
+          # 3.14 this project is developed against.
+          - image: ubuntu:26.04
+            slug: ubuntu2604
     steps:
       - uses: actions/checkout@v4
       - name: Build in ${{ matrix.image }}

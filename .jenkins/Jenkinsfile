@@ -22,7 +22,7 @@
 // means nothing, and the mistake would look like an empty image name.
 
 def pythonVersions = ['3.11', '3.12', '3.13', '3.14']
-def distributions = ['debian:12', 'debian:13', 'ubuntu:24.04']
+def distributions = ['debian:12', 'debian:13', 'ubuntu:24.04', 'ubuntu:26.04']
 // Not a job parameter's default resolution order to rely on: on the very first
 // build of a multibranch job the parameters do not exist yet.
 def registry = (params.REGISTRY ?: '')
@@ -177,7 +177,7 @@ pipeline {
                 axes {
                     axis {
                         name 'DISTRO'
-                        values 'debian:12', 'debian:13', 'ubuntu:24.04'
+                        values 'debian:12', 'debian:13', 'ubuntu:24.04', 'ubuntu:26.04'
                     }
                 }
                 stages {

@@ -261,7 +261,7 @@ only copy of a meeting.
 | `lint` | `ruff check src tests tools` |
 | `test` | the unit suite on python 3.11, 3.12, 3.13 and 3.14, with libopus installed so the Opus round-trip runs rather than skips |
 | `smoke` | the whole daemon, once: it records, transcribes, summarises, mails and archives a meeting end to end against the stubs |
-| `package` | `make deb` for real, in a container per distribution — Debian 12, Debian 13, Ubuntu 24.04 — with `lintian --fail-on error` and the packaged daemon run once from where it was unpacked |
+| `package` | `make deb` for real, in a container per distribution — Debian 12, Debian 13, Ubuntu 24.04, Ubuntu 26.04 — with `lintian --fail-on error` and the packaged daemon run once from where it was unpacked |
 
 The package job is on every push on purpose: the bundled virtualenv, the
 copyright guard and the launcher rewrite only fail at build time, and finding
@@ -337,10 +337,42 @@ distribution attached:
 | `…_amd64.debian12.deb` | Debian 12 (python3 3.11) |
 | `…_amd64.debian13.deb` | Debian 13 (python3 3.13) |
 | `…_amd64.ubuntu2404.deb` | Ubuntu 24.04 (python3 3.12) |
+| `…_amd64.ubuntu2604.deb` | Ubuntu 26.04 (python3 3.14) |
 
 Pick the one matching the machine: the bundled virtualenv belongs to the
 python3 it was built against, and the launcher exits 78 with that reason rather
 than trying to run under another.
+
+What happens between pushing the tag and holding a package:
+
+1. The tag starts **Release**, not CI — `ci.yml` triggers on branches only, so
+   the same commit is not built twice.
+2. **verify** calls the CI workflow and waits for it: the same lint, the same
+   four interpreters, the same smoke test, the same four packages. A release
+   publishes what was verified, never a separate build of its own.
+3. **version** fails the run if the tag and `__version__` disagree, before
+   anything is published. The message names both: `tag v0.2.0 does not match
+   __version__ 0.1.0 (expected v0.1.0)`. Nothing is released, and deleting the
+   tag (`git push --delete origin v0.2.0`) leaves no trace to clean up.
+4. **release** collects the four `.deb`s that the package jobs produced in that
+   same run and creates the release with `gh release create`, using the
+   workflow's own `GITHUB_TOKEN` — there is no secret to configure, because
+   `permissions: contents: write` is declared in the workflow.
+
+The result is at `github.com/amarula/jitsi-audio-bridge/releases`: the four
+packages as assets, the release notes generated from the commits since the
+previous tag, and the source tarballs GitHub adds by itself.
+
+The tags are not the only way to get the packages: **every** run — a push to a
+branch, a pull request — keeps its four `.deb`s in the run's *Artifacts*
+section, one per distribution, for as long as the repository's artifact
+retention allows. A release is what makes them permanent and named; the
+artifacts are what to download while a version is still being tested.
+
+```sh
+gh run list --repo amarula/jitsi-audio-bridge --limit 5
+gh run download <run-id> --repo amarula/jitsi-audio-bridge --pattern 'deb-ubuntu2604'
+```
 
 ## Configuration
 
