@@ -112,6 +112,24 @@ DEFAULTS: dict[str, dict[str, str]] = {
         # one this daemon uploads to.  Empty means the same address.
         "link_endpoint": "",
     },
+    "mail": {
+        # Send an HTML part alongside the plain-text body.  The text part is
+        # sent either way: it is what a client that refuses HTML falls back to.
+        "html": "true",
+        # A stylesheet to use instead of the packaged one, which is how a
+        # deployment re-brands the mail.  Empty uses the stock theme in
+        # jitsi_audio_bridge/templates/summary_email.css.
+        "stylesheet": "",
+        # The closing line.  It is the one place the mail names whoever runs
+        # the deployment, so it is configuration rather than a constant.
+        "footer": (
+            "Generated entirely on-premise on our private Debian infrastructure. "
+            "No cloud dependency."
+        ),
+        # How many speaking turns the mail shows before deferring to the
+        # attached transcript.
+        "preview_turns": "10",
+    },
 }
 
 
@@ -224,6 +242,21 @@ class SmtpConfig:
 
 
 @dataclass(frozen=True)
+class MailConfig:
+    """How the summary mail is presented, as opposed to how it is delivered."""
+
+    #: Send an HTML part alongside the plain-text body.
+    html: bool
+    #: A stylesheet to use in place of the packaged one, or ``None`` for the
+    #: stock theme.  This is the whole of re-branding: see html_mail.
+    stylesheet: Path | None
+    #: The closing line of the mail.
+    footer: str
+    #: Speaking turns shown before the mail defers to the attached transcript.
+    preview_turns: int
+
+
+@dataclass(frozen=True)
 class S3Config:
     """Where a finished meeting's video is uploaded, and how.
 
@@ -298,6 +331,7 @@ class Config:
     ollama: OllamaConfig
     smtp: SmtpConfig
     s3: S3Config
+    mail: MailConfig
     #: The file the values came from, or ``None`` if only defaults applied.
     source: Path | None = None
 
@@ -497,6 +531,14 @@ def load_config(path: str | os.PathLike[str] | None = None) -> Config:
             link_wait_seconds=resolver.number("s3", "link_wait_seconds", minimum=0.0),
             link_expiry_seconds=resolver.number("s3", "link_expiry_seconds", minimum=0.0),
             link_endpoint=resolver.text("s3", "link_endpoint"),
+        ),
+        mail=MailConfig(
+            html=resolver.boolean("mail", "html"),
+            # Empty means "use the packaged stylesheet", so an absent path is
+            # not an error the way a missing recordings directory would be.
+            stylesheet=resolver.optional_path("mail", "stylesheet"),
+            footer=resolver.text("mail", "footer"),
+            preview_turns=resolver.integer("mail", "preview_turns", minimum=0, maximum=100),
         ),
         source=source,
     )

@@ -357,6 +357,17 @@ def mailed_body(raw: str) -> str:
     return raw
 
 
+def mailed_html(raw: str) -> str:
+    """The text/html part, or "" when the message has none."""
+    message = email.message_from_string(raw)
+    for part in message.walk():
+        if part.get_content_type() == "text/html":
+            payload = part.get_payload(decode=True)
+            if isinstance(payload, bytes):
+                return payload.decode("utf-8", "replace")
+    return ""
+
+
 def recording_link(body: str) -> str | None:
     """The first URL in *body*, which the recording paragraph puts on its own."""
     found = re.search(r"https?://\S+", body)
@@ -511,6 +522,22 @@ def main() -> int:
             check("the summary is in the body", "STUB SUMMARY" in mail)
             check("the transcript is attached", "transcript.txt" in mail)
             check("the message was written to disk", any(mail_dir.glob("*.eml")))
+
+            # The HTML part is built and inlined at send time, so this is the
+            # only place the whole path — template, stylesheet, inliner and
+            # MIME assembly — is exercised together.
+            html = mailed_html(mail)
+            check("the mail carries an HTML part", html.startswith("<!DOCTYPE html>"),
+                  html[:60])
+            check(
+                "its styles are inlined, not left in a linked stylesheet",
+                'style="' in html and "<link" not in html,
+            )
+            check("the HTML part shows the summary", "STUB SUMMARY" in html)
+            check(
+                "the plain-text body is still there as the fallback",
+                "STUB SUMMARY" in mailed_body(mail),
+            )
 
         print("\n4. security guards")
         send_meeting(url, session_id="../../tmp/pwned", participants=1, duration=0.5, fast=True)

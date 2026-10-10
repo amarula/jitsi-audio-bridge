@@ -181,3 +181,25 @@ use_starttls = true
 ; Appended to the subject line. Either spelling works: "Amarula Solutions" or
 ; "- Amarula Solutions".
 subject_suffix = Amarula Solutions
+
+[mail]
+; Send a styled HTML part beside the plain-text body. The plain-text body is
+; sent either way: it is what a client that refuses HTML falls back to, and
+; what search and archival tools read.
+html = true
+; Re-brand the mail by pointing this at your own stylesheet. Start from the
+; shipped one, edit its THEME block, and leave everything below it alone:
+;
+;   cp /usr/lib/jitsi-audio-bridge/venv/lib/python*/site-packages/\
+;      jitsi_audio_bridge/templates/summary_email.css /etc/jitsi-audio-bridge/brand.css
+;
+; Only :root variables, .class/tag selectors and @media can be used — the
+; rest cannot be inlined into a mail and is reported in the log. Empty uses
+; the stock theme.
+stylesheet =
+; The closing line of the mail, so it can name whoever runs the deployment.
+; Newlines are kept.
+footer = Generated entirely on-premise on our private Debian infrastructure. No cloud dependency.
+; How many speaking turns the mail shows before it defers to the attached
+; transcript. 0 sends no preview at all.
+preview_turns = 10

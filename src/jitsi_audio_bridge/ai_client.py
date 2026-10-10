@@ -252,6 +252,15 @@ def build_summary_prompt(transcript_text: str, room_name: str, participants: lis
         f"- [Header for Action Items & Decisions in {language}]: Bullet points "
         "explicitly listing assigned tasks and who agreed to do them.\n"
         "\n"
+        # Structure only, and phrased so it cannot be read as a language rule:
+        # the mail lays these sections out, and a heading it cannot recognise
+        # is a section it cannot number.  The heading's wording is still the
+        # model's, in the meeting's language — only the marker is fixed.
+        "FORMATTING (this is about structure, not language — keep answering in "
+        f"{language}):\n"
+        '- Begin each section with a markdown heading: "## ", then that heading.\n'
+        '- Write every point as a markdown bullet: "- ", then the point.\n'
+        "\n"
         "Meeting Transcript:\n"
         f"{transcript_text}\n"
         "\n"

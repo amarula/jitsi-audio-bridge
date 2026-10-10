@@ -37,12 +37,20 @@ import re
 from html.parser import HTMLParser
 from pathlib import Path
 
+from jinja2 import Environment, StrictUndefined
+from markupsafe import Markup, escape
+
 logger = logging.getLogger(__name__)
 
 #: Where the mail's structure and stylesheet live.
 TEMPLATE_DIR = Path(__file__).parent / "templates"
+TEMPLATE_NAME = "summary_email.html.j2"
+STYLESHEET_NAME = "summary_email.css"
 
 #: Stands in for the media queries inside the template's ``<style>`` block.
+#: ``render()`` does not need it — the Jinja template interpolates the queries
+#: it is handed — but ``inline()`` is a general utility and keeps the marker,
+#: so a caller working on a plain HTML file has somewhere to put them.
 MEDIA_QUERY_PLACEHOLDER = "/*{{MEDIA_QUERIES}}*/"
 
 _COMMENT = re.compile(r"/\*.*?\*/", re.DOTALL)
@@ -255,21 +263,73 @@ def inline(css: str, html: str) -> str:
 
 
 def load_default() -> tuple[str, str]:
-    """The stock template and its stylesheet, as text."""
+    """The stock template source and stylesheet, as text."""
     return (
-        (TEMPLATE_DIR / "summary_email.html").read_text(encoding="utf-8"),
-        (TEMPLATE_DIR / "summary_email.css").read_text(encoding="utf-8"),
+        (TEMPLATE_DIR / TEMPLATE_NAME).read_text(encoding="utf-8"),
+        (TEMPLATE_DIR / STYLESHEET_NAME).read_text(encoding="utf-8"),
     )
 
 
-def render(html: str | None = None, css: str | None = None) -> str:
-    """The mail's HTML, styled and ready to attach as the text/html part.
+def load_stylesheet(path: str | Path | None = None) -> str:
+    """The stylesheet to send with, which a deployment may have replaced.
 
-    Both arguments default to the packaged template, so a deployment that
-    wants its own branding passes a stylesheet (and only a stylesheet) read
-    from wherever it keeps one.
+    A company re-brands the mail by pointing ``[mail] stylesheet`` at its own
+    copy of the theme block; a stylesheet that cannot be read is an error the
+    caller has to deal with, not something to paper over with the default,
+    which would silently mail the wrong branding.
     """
-    default_html, default_css = load_default()
-    markup = default_html if html is None else html
-    stylesheet = default_css if css is None else css
-    return inline(stylesheet, markup)
+    if path is None:
+        return (TEMPLATE_DIR / STYLESHEET_NAME).read_text(encoding="utf-8")
+    return Path(path).read_text(encoding="utf-8")
+
+
+def _environment() -> Environment:
+    """Jinja, configured for mail.
+
+    ``autoescape`` is the security boundary rather than a preference: the
+    transcript is Whisper's reading of whatever was said, and speaker names
+    come from the sender's ``metadata.json``.  Both are untrusted, and both
+    are interpolated into this document.
+
+    ``StrictUndefined`` turns a template that asks for something the renderer
+    does not supply into a loud failure rather than a silently blank section —
+    which matters most for whoever edits the template next.
+    """
+    environment = Environment(
+        autoescape=True,
+        undefined=StrictUndefined,
+        trim_blocks=True,
+        lstrip_blocks=True,
+    )
+    environment.filters["nl2br"] = _nl2br
+    return environment
+
+
+def _nl2br(value: object) -> Markup:
+    """Escape *value*, then turn its newlines into ``<br>``.
+
+    Escaping happens first and on purpose: ``{{ text | nl2br }}`` has to be as
+    safe as ``{{ text }}``, or a multi-line field would quietly become the one
+    place markup gets through. The sign-off and the footer are the two places
+    a deployment writes its own text, and both are multi-line.
+    """
+    return Markup(str(escape(str(value))).replace("\n", "<br>"))
+
+
+def render(context: dict[str, object], stylesheet: str | Path | None = None) -> str:
+    """The mail's HTML: template rendered, then styled, ready to attach.
+
+    Order is load-bearing.  Rendering first escapes the meeting's text; the
+    inliner then walks the resulting document and only ever adds style
+    attributes, leaving entities as it found them.
+    """
+    css = load_stylesheet(stylesheet)
+    variables, rules, media = _parse_stylesheet(css)
+    source = (TEMPLATE_DIR / TEMPLATE_NAME).read_text(encoding="utf-8")
+    markup = _environment().from_string(source).render(
+        media_queries=_resolve(media, variables), **context
+    )
+    inliner = _Inliner(variables, rules)
+    inliner.feed(markup)
+    inliner.close()
+    return inliner.result()

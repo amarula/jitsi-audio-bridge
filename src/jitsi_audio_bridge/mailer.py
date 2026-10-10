@@ -18,7 +18,8 @@ from datetime import datetime, timedelta
 from email.message import EmailMessage
 from pathlib import Path
 
-from .config import SmtpConfig
+from . import html_mail, mail_render
+from .config import MailConfig, SmtpConfig
 
 logger = logging.getLogger(__name__)
 
@@ -218,18 +219,81 @@ def _subject_for(
     return subject
 
 
-def _attach(message: EmailMessage, path: str | Path | None, filename: str, subtype: str) -> bool:
-    """Attach a file if it exists.  Returns whether it was attached."""
+def _read_attachment(path: str | Path | None) -> bytes | None:
+    """The file's bytes, or ``None`` when there is nothing to attach.
+
+    Read before the message is composed rather than during, because the HTML
+    part lists what is attached and has to be added to the message *before*
+    the attachments are: a message is only multipart/alternative while it is
+    still a single part, so adding the HTML after an attachment would nest it
+    under the wrong boundary.
+    """
     if not path:
-        return False
+        return None
     source = Path(path)
     try:
-        data = source.read_bytes()
+        return source.read_bytes()
     except OSError as exc:
         logger.error("cannot attach %s: %s", source, exc)
-        return False
-    message.add_attachment(data, maintype="text", subtype=subtype, filename=filename)
-    return True
+        return None
+
+
+def _html_alternative(
+    room_name: str,
+    summary_text: str,
+    transcript_path: str | Path | None,
+    attachments: list[str],
+    words: MailStrings,
+    mail: MailConfig,
+    started_at: str | None,
+    participant_count: int,
+    video_url: str | None,
+    video_until: str | None,
+) -> str | None:
+    """The HTML part, or ``None`` if it could not be built.
+
+    Every failure here is swallowed on purpose.  The plain-text body has
+    already been composed and the files are already attached; a stylesheet
+    someone edited badly, or a Jinja template that asks for something the
+    renderer does not supply, must cost the mail its styling and not its
+    delivery — the same rule the S3 upload follows.
+    """
+    try:
+        transcript_text = ""
+        if transcript_path:
+            try:
+                transcript_text = Path(transcript_path).read_text(encoding="utf-8")
+            except OSError as exc:
+                # The preview is optional; the attachment is read separately
+                # and will report its own failure.
+                logger.warning("cannot read the transcript for the preview: %s", exc)
+
+        recording = None
+        if video_url:
+            recording = mail_render.Recording(
+                url=video_url,
+                label=words.recording_label,
+                expires=_format_when(video_until),
+            )
+
+        context = mail_render.build_context(
+            heading=words.heading,
+            room_name=room_name,
+            when=_format_when(started_at),
+            participant_count=participant_count,
+            introduction=words.introduction.format(room=room_name),
+            summary_text=summary_text,
+            transcript_text=transcript_text,
+            attachments=attachments,
+            sign_off=words.sign_off,
+            footer=mail.footer,
+            preview_turns=mail.preview_turns,
+            recording=recording,
+        )
+        return html_mail.render(context, stylesheet=mail.stylesheet)
+    except Exception as exc:  # noqa: BLE001 - see the docstring
+        logger.error("could not build the HTML summary; sending text only: %s", exc)
+        return None
 
 
 def send_meeting_email(
@@ -243,6 +307,8 @@ def send_meeting_email(
     language: str | None = None,
     video_url: str | None = None,
     video_until: str | None = None,
+    mail: MailConfig | None = None,
+    participant_count: int = 0,
 ) -> bool:
     """Email the summary to *recipients*, attaching the transcript and summary.
 
@@ -254,6 +320,13 @@ def send_meeting_email(
     *video_url* is where the meeting's recording can be downloaded, when there
     is one, and *video_until* is when that link stops working — both left out
     of the mail when the meeting was not recorded.
+
+    *mail* selects the presentation: when it is given and has ``html`` set, the
+    message carries a styled ``text/html`` alternative beside the plain-text
+    body, built from the transcript's opening turns and the summary.  Without
+    it the mail is text only, which is what every caller got before there was
+    an HTML part.
+
     Returns whether the message was handed to the relay.
     """
     targets = _usable_recipients(recipients)
@@ -294,9 +367,31 @@ def send_meeting_email(
         # Both are attached: the transcript is the record, the summary is what
         # people actually read, and the summary is also in the body so it is
         # legible without opening anything.
-        attached = _attach(message, transcript_path, f"{stem}_transcript.txt", "plain")
-        attached |= _attach(message, summary_path, f"{stem}_summary.md", "markdown")
-        if not attached:
+        wanted = (
+            (f"{stem}_transcript.txt", "plain", _read_attachment(transcript_path)),
+            (f"{stem}_summary.md", "markdown", _read_attachment(summary_path)),
+        )
+        files = [entry for entry in wanted if entry[2] is not None]
+
+        if mail is not None and mail.html:
+            html = _html_alternative(
+                room_name,
+                summary_text,
+                transcript_path,
+                [name for name, _, _ in files],
+                words,
+                mail,
+                started_at,
+                participant_count,
+                video_url,
+                video_until,
+            )
+            if html:
+                message.add_alternative(html, subtype="html")
+
+        for name, subtype, data in files:
+            message.add_attachment(data, maintype="text", subtype=subtype, filename=name)
+        if not files:
             logger.warning("no files were attached to the summary email")
 
         with smtplib.SMTP(smtp.host, smtp.port, timeout=60) as server:

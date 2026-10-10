@@ -1049,6 +1049,51 @@ def test_load_config_uses_defaults_when_no_file_is_found(
     assert config.storage.recordings_dir == Path("/srv/recordings")
     assert config.whisper.verify_tls is True
     assert config.smtp.use_starttls is True
+    assert config.mail.html is True
+    assert config.mail.stylesheet is None
+    assert config.mail.preview_turns == 10
+
+
+def test_the_mail_section_can_rebrand_and_can_be_switched_off(
+    tmp_path: Path, clean_env: None
+) -> None:
+    brand = tmp_path / "brand.css"
+    brand.write_text(":root { --accent: #b4531f; }", encoding="utf-8")
+    path = tmp_path / "config.ini"
+    path.write_text(
+        "[mail]\n"
+        "html = false\n"
+        f"stylesheet = {brand}\n"
+        "footer = Run by Example Ltd.\n"
+        "preview_turns = 3\n",
+        encoding="utf-8",
+    )
+    config = load_config(path)
+    assert config.mail.html is False
+    assert config.mail.stylesheet == brand
+    assert config.mail.footer == "Run by Example Ltd."
+    assert config.mail.preview_turns == 3
+
+
+def test_the_mail_section_is_overridable_from_the_environment(
+    monkeypatch: pytest.MonkeyPatch, clean_env: None
+) -> None:
+    """So a container can be re-branded without shipping a config file."""
+    monkeypatch.setattr(config_module, "SEARCH_PATHS", (Path("/nonexistent.ini"),))
+    monkeypatch.setenv("JITSI_AUDIO_BRIDGE_MAIL_FOOTER", "Run by Example Ltd.")
+    monkeypatch.setenv("JITSI_AUDIO_BRIDGE_MAIL_HTML", "no")
+    config = load_config()
+    assert config.mail.footer == "Run by Example Ltd."
+    assert config.mail.html is False
+
+
+def test_a_malformed_preview_turn_count_names_the_setting(
+    tmp_path: Path, clean_env: None
+) -> None:
+    path = tmp_path / "config.ini"
+    path.write_text("[mail]\npreview_turns = lots\n", encoding="utf-8")
+    with pytest.raises(config_module.ConfigError, match="preview_turns"):
+        load_config(path)
 
 
 def test_load_config_reads_a_file(tmp_path: Path, clean_env: None) -> None:

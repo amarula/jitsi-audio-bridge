@@ -25,6 +25,10 @@ classifiers = [
 dependencies = [
     "websockets>=13",
     "requests>=2.31",
+    # The HTML part of the summary mail. Brings in MarkupSafe, which is what
+    # does the escaping that keeps a participant's chosen name out of the
+    # markup.
+    "jinja2>=3.1",
 ]
 
 [project.optional-dependencies]
@@ -51,7 +55,7 @@ where = ["src"]
 [tool.setuptools.package-data]
 # The mail's structure and its stylesheet are read at send time rather than
 # compiled in, so they have to travel inside the wheel and the .deb with it.
-jitsi_audio_bridge = ["templates/*.html", "templates/*.css"]
+jitsi_audio_bridge = ["templates/*.j2", "templates/*.css"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

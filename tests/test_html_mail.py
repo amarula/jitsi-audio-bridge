@@ -153,14 +153,33 @@ def test_an_unsupported_at_rule_is_reported_and_skipped(caplog):
 # -- the shipped template ----------------------------------------------------
 
 
-def test_the_shipped_template_renders_fully():
-    out = html_mail.render()
+def test_the_shipped_template_renders_fully(mail_context):
+    out = html_mail.render(mail_context)
     assert "var(--" not in out
     assert MS not in out
     assert "@media" in out
     assert "Meeting Summary &amp; Transcript" in out
     # The MSO scaffolding Outlook needs is still conditional.
     assert out.count("<!--[if mso]>") == 3
+
+
+def test_the_template_escapes_what_the_meeting_contains(mail_context):
+    """Speaker names come from the sender's metadata; turn text from Whisper.
+
+    Both are untrusted and both are interpolated straight into the mail, so
+    autoescape is the boundary that stops a participant putting markup into
+    everyone else's inbox.  Asserted on the *inlined* output, because that is
+    what is sent — the inliner walks the document afterwards and must not
+    unescape anything on the way through.
+    """
+    out = html_mail.render(mail_context)
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in out
+    assert "<script>alert(1)</script>" not in out
+
+
+def test_the_sign_off_keeps_its_line_breaks_without_gaining_markup(mail_context):
+    out = html_mail.render(mail_context)
+    assert "Best regards,<br>Automated meeting transcription" in out
 
 
 class _ClassCollector(HTMLParser):
@@ -174,19 +193,21 @@ class _ClassCollector(HTMLParser):
                 self.classes.update(value.split())
 
 
-def test_every_class_in_the_template_has_a_rule():
+def test_every_class_in_the_template_has_a_rule(mail_context):
     """A class in the HTML that no rule matches is a typo.
 
     It would not fail the build or the send — it would just ship an element
     with no styles, which is exactly the kind of thing nobody notices until a
-    customer says the mail looks broken.
+    customer says the mail looks broken.  Collected from the *rendered* mail,
+    so a class built from a variable (``chip-{{ n }}``) is checked in the form
+    it actually takes.
     """
-    template, css = html_mail.load_default()
+    _, css = html_mail.load_default()
     _, rules, _ = html_mail._parse_stylesheet(css)
     styled = {name for kind, name, _ in rules if kind == "class"}
 
     collector = _ClassCollector()
-    collector.feed(template)
+    collector.feed(html_mail.render(mail_context))
     assert collector.classes - styled == set()
 
 

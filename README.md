@@ -526,6 +526,57 @@ at startup and a bad one names the exact setting and where it came from:
 ERROR  invalid value for [server] port: 'bogus' is not an integer (from /etc/jitsi-audio-bridge/config.ini [server] port)
 ```
 
+### `[mail]`
+
+How the summary mail is presented, as opposed to how it is delivered.
+
+| Option | Type | Default | Environment |
+|---|---|---|---|
+| `html` | boolean | `true` | `JITSI_AUDIO_BRIDGE_MAIL_HTML` |
+| `stylesheet` | path | *(empty)* | `JITSI_AUDIO_BRIDGE_MAIL_STYLESHEET` |
+| `footer` | string | *(the on-premise line)* | `JITSI_AUDIO_BRIDGE_MAIL_FOOTER` |
+| `preview_turns` | 0–100 | `10` | `JITSI_AUDIO_BRIDGE_MAIL_PREVIEW_TURNS` |
+
+The mail is sent as `multipart/alternative`: a plain-text body, which is what
+every client has always received, and a styled HTML part beside it showing the
+summary as numbered sections, the opening turns of the transcript with a
+colour-coded chip per speaker, and the attachments. `html = false` sends the
+text body alone. The plain-text part is composed either way, because it is what
+an HTML-refusing client, a search index and an archive all fall back to.
+
+**Re-branding is `stylesheet`.** Copy the shipped one, edit the `THEME` block
+at the top of it, and point this setting at your copy:
+
+```sh
+sudo cp /usr/lib/jitsi-audio-bridge/venv/lib/python*/site-packages/\
+jitsi_audio_bridge/templates/summary_email.css /etc/jitsi-audio-bridge/brand.css
+sudo editor /etc/jitsi-audio-bridge/brand.css
+```
+
+Everything below the theme block refers to it and to nothing else, so colours,
+fonts, corner radii and the speaker palette all follow from editing it.
+`footer` is the closing line, which is the one place the mail names whoever
+runs the deployment.
+
+The stylesheet is *inlined* into the mail at send time rather than linked,
+because Gmail discards linked stylesheets and Outlook ignores `<style>`
+blocks. Only three things can be inlined: `:root` variables, `.class` and tag
+selectors, and `@media` — which cannot go on an element and is passed through
+to the mail's own `<style>` block instead. Anything else in a stylesheet is
+reported in the log and skipped rather than silently dropped:
+
+```
+WARNING  stylesheet: selector '.a > .b' is not supported and was ignored
+```
+
+Use longhand properties (`padding-top`, not `padding`). Declarations from
+several classes are merged onto one element, so a shorthand in one class would
+erase a longhand set by another.
+
+A stylesheet that cannot be read or a template that cannot be rendered costs
+the mail its styling, never its delivery: the failure is logged and the
+plain-text mail is sent.
+
 ### Secrets
 
 Keep `config.ini` world-readable and pass the SMTP password through the
@@ -1158,8 +1209,8 @@ In practice, for whoever runs this:
 
 The dependencies keep their own licences and are all permissive: Apache-2.0
 (boto3, botocore, requests, s3transfer), MIT (jmespath, six, urllib3,
-charset_normalizer), BSD-3-Clause (idna, websockets), MPL-2.0 (certifi),
-plus libopus and Python themselves. Nothing in the chain constrains the
+charset_normalizer), BSD-3-Clause (idna, websockets, jinja2, markupsafe),
+MPL-2.0 (certifi), plus libopus and Python themselves. Nothing in the chain constrains the
 licence above. The `.deb` carries them in its virtualenv and accounts for each
 one in its `copyright` file, which the build refuses to produce without.
 

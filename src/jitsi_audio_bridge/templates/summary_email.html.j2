@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<!--
+  Meeting summary mail — HTML part (multipart/alternative alongside the
+  plain-text body in mailer.py).
+
+  Structure only.  Every colour, font, radius and spacing value lives in
+  summary_email.css, which html_mail.inline() resolves and moves onto these
+  elements before the mail is sent — see that module for why nothing may be
+  left in a linked stylesheet.
+
+  Values are interpolated by Jinja with autoescape ON.  That is the security
+  boundary, not a nicety: speaker names come from the sender's metadata.json
+  and turn text comes from Whisper, so a participant called "<script>" must
+  arrive as text.  Anything added here that needs raw markup must say so with
+  |safe, deliberately.
+
+  Style is applied after rendering, so the escaping above survives it — the
+  inliner re-emits entities untouched.
+
+  Rendering rules, all of them load-bearing:
+    * layout is tables, not flex/grid; Outlook has no flexbox
+    * no external images and no web fonts, so nothing is blocked by default
+-->
+<html lang="en" xmlns:v="urn:schemas-microsoft-com:vml" xmlns:o="urn:schemas-microsoft-com:office:office">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="x-apple-disable-message-reformatting">
+  <meta name="color-scheme" content="dark light">
+  <meta name="supported-color-schemes" content="dark light">
+  <title>{{ heading }}</title>
+  <!--[if mso]>
+  <xml><o:OfficeDocumentSettings><o:PixelsPerInch>96</o:PixelsPerInch></o:OfficeDocumentSettings></xml>
+  <![endif]-->
+  <style>{{ media_queries | safe }}</style>
+</head>
+
+<body>
+
+<!-- Preview text: shown in the inbox list, hidden in the body. -->
+<div class="preheader">{{ preheader }}</div>
+
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" class="page">
+<tr>
+<td align="center" class="wrap">
+
+  <!--
+    Fluid hybrid. Outlook's Word engine has no max-width, so the conditional
+    comment hands it a fixed 640px table; every other client gets one that
+    shrinks to the viewport. Without this the card stays 640px wide on a phone
+    and its right-hand side is cut off.
+  -->
+  <!--[if mso]>
+  <table role="presentation" width="640" cellpadding="0" cellspacing="0" border="0"><tr><td>
+  <![endif]-->
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" class="card">
+
+    <tr>
+      <td class="px band-header">
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+          <tr>
+            <td class="header-title">{{ heading }}</td>
+          </tr>
+          <tr>
+            <td class="header-meta">
+              <span class="room">{{ room_name }}</span>
+              {%- if when %}
+              <span class="sep">&nbsp;&middot;&nbsp;</span>{{ when }}
+              {%- endif %}
+              {%- if participant_count %}
+              <span class="sep">&nbsp;&middot;&nbsp;</span>{{ participant_count }} participant{{ '' if participant_count == 1 else 's' }}
+              {%- endif %}
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+
+    <tr>
+      <td class="px band-intro intro">{{ introduction }}</td>
+    </tr>
+
+    {#- One block per section the model produced. The count is not fixed:
+        the prompt asks for three, a model may return fewer or more, and the
+        numbering has to follow whatever arrived. -#}
+    {% for section in sections %}
+    <tr>
+      <td class="px band-section">
+        {%- if section.title %}
+        <div class="section-title">{{ section.number }}. {{ section.title }}</div>
+        {%- endif %}
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+          {%- for item in section.entries %}
+          <tr>
+            {%- if item.bullet %}
+            <td width="16" valign="top" class="marker marker-bullet">&bull;</td>
+            {%- else %}
+            <td width="16" valign="top" class="marker">&nbsp;</td>
+            {%- endif %}
+            <td valign="top" class="row-text">{{ item.text }}</td>
+          </tr>
+          {%- endfor %}
+        </table>
+      </td>
+    </tr>
+    {% endfor %}
+
+    {% if turns %}
+    <tr>
+      <td class="px band-section">
+        <div class="section-title">{{ transcript_number }}. Interleaved Transcript Preview</div>
+        {%- for turn in turns %}
+        <p class="turn">
+          {%- if turn.timestamp %}
+          <span class="timestamp">[{{ turn.timestamp }}]</span>
+          {%- endif %}
+          <span class="chip chip-{{ turn.chip }}">{{ turn.speaker }}</span>
+          {{ turn.text }}
+        </p>
+        {%- endfor %}
+        <p class="turn turn-last note">
+          {%- if hidden_turns %}
+          {{ hidden_turns }} further turns are in the attached transcript.
+          {%- else %}
+          The complete transcript is attached.
+          {%- endif %}
+        </p>
+      </td>
+    </tr>
+    {% endif %}
+
+    {% if attachments %}
+    <tr>
+      <td class="px band-section">
+        <div class="section-title">{{ attachments_number }}. Attachments</div>
+        <table role="presentation" cellpadding="0" cellspacing="0" border="0">
+          <tr>
+            {%- for name in attachments %}
+            <td class="file-cell">
+              <span class="file">&#128196;&nbsp; {{ name }}</span>
+            </td>
+            {%- endfor %}
+          </tr>
+        </table>
+      </td>
+    </tr>
+    {% endif %}
+
+    {% if recording %}
+    <tr>
+      <td class="px band-section">
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" class="recording">
+          <tr>
+            <td class="recording-cell">
+              <span class="recording-label">{{ recording.label }}</span>
+              {%- if recording.expires %}
+              <span class="recording-when">(available until {{ recording.expires }})</span>
+              {%- endif %}<br>
+              <a href="{{ recording.url }}" class="recording-link">{{ recording.url }}</a>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+    {% endif %}
+
+    <tr>
+      <td class="px band-signoff signoff">{{ sign_off | nl2br }}</td>
+    </tr>
+
+    <tr>
+      <td class="px band-footer">
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" class="footer-rule">
+          <tr>
+            <td class="footer-text">{{ footer | nl2br }}</td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+
+  </table>
+  <!--[if mso]>
+  </td></tr></table>
+  <![endif]-->
+
+</td>
+</tr>
+</table>
+
+</body>
+</html>

@@ -758,6 +758,8 @@ def process_completed_session(meeting_dir: Path, config: Config) -> bool:
             language=language,
             video_url=link.url if link else None,
             video_until=link.expires_at if link else None,
+            mail=config.mail,
+            participant_count=len(metadata["participants"]),
         )
 
         if sent and config.storage.cleanup_after_send:
