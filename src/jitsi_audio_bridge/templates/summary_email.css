@@ -1,0 +1,324 @@
+/* ==========================================================================
+   Meeting summary mail — default (Amarula) theme.
+
+   This file is the single source of style for the mail.  It is never sent as
+   it is: html_mail.inline() resolves the variables below and moves every
+   declaration onto the matching element's style="" attribute before the mail
+   goes out, because Gmail and Outlook discard linked stylesheets and most
+   <style> blocks.
+
+   Re-branding for another company means editing the THEME block and nothing
+   else.  Nothing below it refers to a colour, a font or a radius directly.
+
+   The inliner understands a deliberately small subset, and says so out loud
+   when it meets anything else — see html_mail.py:
+     * `:root { --name: value; }`   theme variables, referenced as var(--name)
+     * `.class { ... }`             one or more comma-separated class or tag
+                                    selectors, no combinators, no pseudo-classes
+     * `@media ... { ... }`         passed through to the mail's <style> block
+                                    untouched, since it cannot be inlined
+   Use longhand properties only (`padding-top`, not `padding`): declarations
+   from several classes are merged onto one element, and a shorthand in one
+   class would silently wipe out a longhand set by another.
+   ========================================================================== */
+
+/* --------------------------------------------------------------------------
+   THEME — the block to edit when re-branding.
+   -------------------------------------------------------------------------- */
+:root {
+  /* Surfaces */
+  --page-bg:       #0b1420;
+  --card-bg:       #121d2b;
+  --card-border:   #1f3045;
+  --chip-bg:       #182739;
+  --chip-border:   #2a3f57;
+  --rule:          #1f3045;
+
+  /* Type */
+  --heading:       #ffffff;
+  --text:          #dbe6f2;
+  --text-strong:   #e8eef6;
+  --text-muted:    #9fb0c4;
+  --text-faint:    #7b8fa6;
+
+  /* Accents */
+  --accent:        #5aa9ff;
+  --action:        #ffc46b;
+
+  /* Fonts — a system stack, so nothing has to be downloaded or unblocked */
+  --font:          -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+  --font-mono:     'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+
+  /* Geometry */
+  --radius-card:   12px;
+  --radius-chip:   10px;
+  --radius-file:   8px;
+  --pad-x:         32px;
+  --pad-x-narrow:  18px;
+
+  /* Speaker palette.  A speaker keeps their colour across meetings because
+     the palette is indexed by a hash of the name, not by join order. */
+  --sp1-bg: #a7e8b5;  --sp1-fg: #0d3320;
+  --sp2-bg: #8ec5ff;  --sp2-fg: #0b2a4a;
+  --sp3-bg: #d3b4ff;  --sp3-fg: #2a1148;
+  --sp4-bg: #ffcf9e;  --sp4-fg: #4a2a08;
+  --sp5-bg: #ffb3d1;  --sp5-fg: #4a0f2a;
+  --sp6-bg: #9fe8e0;  --sp6-fg: #06322e;
+}
+
+/* --------------------------------------------------------------------------
+   Page frame
+   -------------------------------------------------------------------------- */
+body {
+  margin-top: 0;
+  margin-right: 0;
+  margin-bottom: 0;
+  margin-left: 0;
+  padding-top: 0;
+  padding-right: 0;
+  padding-bottom: 0;
+  padding-left: 0;
+  width: 100%;
+  background-color: var(--page-bg);
+  -webkit-text-size-adjust: 100%;
+  -ms-text-size-adjust: 100%;
+}
+
+.page { background-color: var(--page-bg); }
+.wrap { padding-top: 24px; padding-bottom: 24px; padding-left: 12px; padding-right: 12px; }
+
+.card {
+  width: 100%;
+  max-width: 640px;
+  background-color: var(--card-bg);
+  border: 1px solid var(--card-border);
+  border-radius: var(--radius-card);
+}
+
+/* Inbox preview line: rendered by the client next to the subject, hidden in
+   the body itself. */
+.preheader {
+  display: none;
+  font-size: 1px;
+  color: var(--page-bg);
+  line-height: 1px;
+  max-height: 0;
+  max-width: 0;
+  opacity: 0;
+  overflow: hidden;
+}
+
+/* Side padding, shared by every band of the card. */
+.px { padding-left: var(--pad-x); padding-right: var(--pad-x); }
+
+/* Vertical rhythm, one class per band. */
+.band-header  { padding-top: 28px; padding-bottom: 20px; border-bottom: 1px solid var(--rule); }
+.band-intro   { padding-top: 20px; padding-bottom: 4px; }
+.band-section { padding-top: 24px; }
+.band-signoff { padding-top: 24px; }
+.band-footer  { padding-top: 24px; padding-bottom: 28px; }
+
+/* --------------------------------------------------------------------------
+   Header
+   -------------------------------------------------------------------------- */
+.header-title {
+  font-family: var(--font);
+  font-size: 22px;
+  font-weight: 700;
+  line-height: 1.3;
+  color: var(--heading);
+}
+
+.header-meta {
+  padding-top: 8px;
+  font-family: var(--font);
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--text-muted);
+}
+
+.room { color: var(--accent); font-weight: 600; }
+.sep  { color: var(--text-faint); }
+
+/* --------------------------------------------------------------------------
+   Introduction and sign-off
+   -------------------------------------------------------------------------- */
+.intro {
+  font-family: var(--font);
+  font-size: 15px;
+  line-height: 1.65;
+  color: var(--text-muted);
+}
+
+.signoff {
+  font-family: var(--font);
+  font-size: 15px;
+  line-height: 1.65;
+  color: var(--text-muted);
+}
+
+/* --------------------------------------------------------------------------
+   Section headings
+   -------------------------------------------------------------------------- */
+.section-title {
+  font-family: var(--font);
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--heading);
+  padding-bottom: 12px;
+}
+
+/* --------------------------------------------------------------------------
+   Bullet and action-item rows
+   -------------------------------------------------------------------------- */
+.row-text {
+  font-family: var(--font);
+  font-size: 15px;
+  line-height: 1.65;
+  color: var(--text);
+  padding-bottom: 8px;
+}
+
+.marker {
+  font-family: var(--font);
+  font-size: 15px;
+  line-height: 1.65;
+  padding-right: 8px;
+}
+
+.marker-bullet { color: var(--accent); }
+.marker-action { color: var(--action); }
+
+.icon { font-family: var(--font-mono); font-size: 13px; color: var(--text-muted); }
+
+/* --------------------------------------------------------------------------
+   Transcript turns
+   -------------------------------------------------------------------------- */
+.turn {
+  margin-top: 0;
+  margin-right: 0;
+  margin-bottom: 14px;
+  margin-left: 0;
+  font-family: var(--font);
+  font-size: 15px;
+  line-height: 1.65;
+  color: var(--text);
+}
+
+.turn-last { margin-bottom: 0; }
+
+.timestamp {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  color: var(--text-faint);
+}
+
+/* The speaker chip.  Outlook has no border-radius and will square it off,
+   which is the one deliberate degradation in this design. */
+.chip {
+  display: inline-block;
+  font-family: var(--font);
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1.5;
+  padding-top: 2px;
+  padding-bottom: 2px;
+  padding-left: 10px;
+  padding-right: 10px;
+  border-radius: var(--radius-chip);
+  margin-left: 4px;
+  margin-right: 4px;
+}
+
+.chip-0 { background-color: var(--sp1-bg); color: var(--sp1-fg); }
+.chip-1 { background-color: var(--sp2-bg); color: var(--sp2-fg); }
+.chip-2 { background-color: var(--sp3-bg); color: var(--sp3-fg); }
+.chip-3 { background-color: var(--sp4-bg); color: var(--sp4-fg); }
+.chip-4 { background-color: var(--sp5-bg); color: var(--sp5-fg); }
+.chip-5 { background-color: var(--sp6-bg); color: var(--sp6-fg); }
+
+.note {
+  margin-top: 0;
+  margin-right: 0;
+  margin-bottom: 0;
+  margin-left: 0;
+  font-family: var(--font);
+  font-size: 14px;
+  line-height: 1.6;
+  color: var(--text-faint);
+}
+
+/* --------------------------------------------------------------------------
+   Attachment chips
+   -------------------------------------------------------------------------- */
+.file-cell { padding-right: 8px; padding-bottom: 8px; }
+
+.file {
+  display: inline-block;
+  background-color: var(--chip-bg);
+  border: 1px solid var(--chip-border);
+  border-radius: var(--radius-file);
+  padding-top: 8px;
+  padding-bottom: 8px;
+  padding-left: 14px;
+  padding-right: 14px;
+  font-family: var(--font);
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-muted);
+}
+
+/* --------------------------------------------------------------------------
+   Recording link
+   -------------------------------------------------------------------------- */
+.recording {
+  background-color: var(--chip-bg);
+  border: 1px solid var(--chip-border);
+  border-radius: var(--radius-file);
+}
+
+.recording-cell {
+  padding-top: 14px;
+  padding-bottom: 14px;
+  padding-left: 16px;
+  padding-right: 16px;
+  font-family: var(--font);
+  font-size: 14px;
+  line-height: 1.6;
+  color: var(--text-muted);
+}
+
+.recording-label { font-weight: 700; color: var(--text-strong); }
+.recording-when  { color: var(--text-faint); }
+
+.recording-link {
+  color: var(--accent);
+  text-decoration: underline;
+  word-break: break-all;
+}
+
+/* --------------------------------------------------------------------------
+   Footer
+   -------------------------------------------------------------------------- */
+.footer-rule { border-top: 1px solid var(--rule); }
+
+.footer-text {
+  padding-top: 16px;
+  font-family: var(--font);
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text-faint);
+}
+
+.footer-note { color: var(--text-faint); }
+
+/* --------------------------------------------------------------------------
+   Narrow screens.  This cannot be inlined, so the inliner lifts it into the
+   mail's <style> block verbatim.  A client that drops <style> keeps the
+   --pad-x above, which still fits a phone.
+   -------------------------------------------------------------------------- */
+@media only screen and (max-width: 600px) {
+  .px { padding-left: var(--pad-x-narrow) !important; padding-right: var(--pad-x-narrow) !important; }
+}

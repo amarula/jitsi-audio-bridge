@@ -48,6 +48,11 @@ version = { attr = "jitsi_audio_bridge.__version__" }
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+# The mail's structure and its stylesheet are read at send time rather than
+# compiled in, so they have to travel inside the wheel and the .deb with it.
+jitsi_audio_bridge = ["templates/*.html", "templates/*.css"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"

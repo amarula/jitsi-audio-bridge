@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<!--
+  Meeting summary mail — HTML part (multipart/alternative alongside the
+  plain-text body in mailer.py).
+
+  Structure only.  Every colour, font, radius and spacing value lives in
+  summary_email.css, which html_mail.inline() resolves and moves onto these
+  elements before the mail is sent — see that module for why nothing may be
+  left in a linked stylesheet.
+
+  The one thing that stays here is the <style> block below: a media query
+  cannot be inlined, so the inliner copies it out of the CSS file and into
+  that placeholder.
+
+  Rendering rules this file follows, all of them load-bearing:
+    * layout is tables, not flex/grid; Outlook has no flexbox
+    * no external images and no web fonts, so nothing is blocked by default
+    * every value interpolated below is HTML-escaped by the renderer first:
+      transcripts are untrusted text and a bare "<" or "&" must not reach the
+      client as markup
+
+  Repeatable / dynamic regions are marked with  TEMPLATE:  comments.
+  Sample content is the meeting from the design mock-up, so this file can be
+  opened directly in a browser to review the design.
+-->
+<html lang="en" xmlns:v="urn:schemas-microsoft-com:vml" xmlns:o="urn:schemas-microsoft-com:office:office">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="x-apple-disable-message-reformatting">
+  <meta name="color-scheme" content="dark light">
+  <meta name="supported-color-schemes" content="dark light">
+  <title>Meeting Summary &amp; Transcript</title>
+  <!--[if mso]>
+  <xml><o:OfficeDocumentSettings><o:PixelsPerInch>96</o:PixelsPerInch></o:OfficeDocumentSettings></xml>
+  <![endif]-->
+  <style>/*{{MEDIA_QUERIES}}*/</style>
+</head>
+
+<body>
+
+<!-- Preview text: shown in the inbox list, hidden in the body. -->
+<div class="preheader">
+  Summary and transcript for jitsi-ai-review &mdash; 2 action items, 4 speakers.
+</div>
+
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" class="page">
+<tr>
+<td align="center" class="wrap">
+
+  <!--
+    Fluid hybrid. Outlook's Word engine has no max-width, so the conditional
+    comment hands it a fixed 640px table; every other client gets one that
+    shrinks to the viewport. Without this the card stays 640px wide on a phone
+    and its right-hand side is cut off.
+  -->
+  <!--[if mso]>
+  <table role="presentation" width="640" cellpadding="0" cellspacing="0" border="0"><tr><td>
+  <![endif]-->
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" class="card">
+
+    <!--
+      ============================================================
+      Header — TEMPLATE: {{heading}}, {{room_name}}, {{when}},
+      {{participant_count}}
+      ============================================================
+    -->
+    <tr>
+      <td class="px band-header">
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+          <tr>
+            <td class="header-title">Meeting Summary &amp; Transcript</td>
+          </tr>
+          <tr>
+            <td class="header-meta">
+              <span class="room">jitsi-ai-review</span>
+              <span class="sep">&nbsp;&middot;&nbsp;</span>Friday, Oct 9, 2026, 11:30 AM
+              <span class="sep">&nbsp;&middot;&nbsp;</span>4 participants
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+
+    <!--
+      ============================================================
+      Introduction — TEMPLATE: {{introduction}}, already localised by
+      mail_strings(language) with {room} substituted
+      ============================================================
+    -->
+    <tr>
+      <td class="px band-intro intro">
+        Please find the automated summary and raw transcript for room
+        <strong>jitsi-ai-review</strong> below. The full transcript is attached.
+      </td>
+    </tr>
+
+    <!--
+      ============================================================
+      1. MEETING SUMMARY
+      TEMPLATE: repeat one <tr> per bullet, from the model's summary.
+      ============================================================
+    -->
+    <tr>
+      <td class="px band-section">
+        <div class="section-title">1. Meeting Summary</div>
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+          <tr>
+            <td width="16" valign="top" class="marker marker-bullet">&bull;</td>
+            <td valign="top" class="row-text">
+              Reviewed the jitsi-audio-bridge (<span class="icon">daemon.py</span> &amp; <span class="icon">audio.py</span>) implementation in Python.
+            </td>
+          </tr>
+          <tr>
+            <td width="16" valign="top" class="marker marker-bullet">&bull;</td>
+            <td valign="top" class="row-text">
+              Resolved the JVB media export challenge by retrieving room and participant data from the Prosody side.
+            </td>
+          </tr>
+          <tr>
+            <td width="16" valign="top" class="marker marker-bullet">&bull;</td>
+            <td valign="top" class="row-text">
+              Addressed WebSocket disconnects to ensure seamless reconnect mapping without data loss.
+            </td>
+          </tr>
+          <tr>
+            <td width="16" valign="top" class="marker marker-bullet">&bull;</td>
+            <td valign="top" class="row-text">
+              Optimized local GPU resources, adjusting exponential backoff to handle 14B LLM and Whisper starvation (503 answers).
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+
+    <!--
+      ============================================================
+      2. ACTION ITEMS
+      TEMPLATE: omit the whole <tr> when the model returned none, rather than
+      emitting an empty heading.
+      ============================================================
+    -->
+    <tr>
+      <td class="px band-section">
+        <div class="section-title">2. Action Items</div>
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+          <tr>
+            <td width="16" valign="top" class="marker marker-action">&rarr;</td>
+            <td valign="top" class="row-text">
+              Check Prosody config against the new verification live deployment.
+            </td>
+          </tr>
+          <tr>
+            <td width="16" valign="top" class="marker marker-action">&rarr;</td>
+            <td valign="top" class="row-text">
+              Optimize model loading times to minimize retry intervals.
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+
+    <!--
+      ============================================================
+      3. INTERLEAVED TRANSCRIPT PREVIEW
+      TEMPLATE: repeat one <p class="turn"> per speaking turn.  The chip class
+      is chip-<n>, n being a hash of the speaker name modulo the palette size,
+      so the same person keeps the same colour from meeting to meeting.
+      ============================================================
+    -->
+    <tr>
+      <td class="px band-section">
+        <div class="section-title">3. Interleaved Transcript Preview</div>
+
+        <p class="turn">
+          <span class="timestamp">[00:00:04]</span>
+          <span class="chip chip-0">Elena</span>
+          Welcome everyone. Let's kick off the Jitsi architecture review.
+        </p>
+
+        <p class="turn">
+          <span class="timestamp">[00:00:12]</span>
+          <span class="chip chip-1">Michael</span>
+          Thanks Elena. I've updated daemon.py to handle WebSocket reconnection seamlessly.
+        </p>
+
+        <p class="turn">
+          <span class="timestamp">[00:00:25]</span>
+          <span class="chip chip-2">David</span>
+          Quick question&mdash;how are we handling audio tags from Prosody when the JVB reconnects?
+        </p>
+
+        <p class="turn turn-last note">Preview only &mdash; the complete transcript is attached.</p>
+      </td>
+    </tr>
+
+    <!--
+      ============================================================
+      4. ATTACHMENTS
+      TEMPLATE: one chip per file actually attached.  mailer.py attaches
+      <stem>_transcript.txt and <stem>_summary.md and either may be missing,
+      so build this from what _attach() reported.
+      ============================================================
+    -->
+    <tr>
+      <td class="px band-section">
+        <div class="section-title">4. Attachments</div>
+        <table role="presentation" cellpadding="0" cellspacing="0" border="0">
+          <tr>
+            <td class="file-cell">
+              <span class="file">&#128196;&nbsp; jitsi-ai-review_transcript.txt</span>
+            </td>
+            <td class="file-cell">
+              <span class="file">&#128196;&nbsp; jitsi-ai-review_summary.md</span>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+
+    <!--
+      ============================================================
+      Recording link — TEMPLATE: present only when [s3] link_in_mail is on and
+      the upload completed.  Omit the whole <tr> otherwise; never render the
+      heading with no link under it.
+      ============================================================
+    -->
+    <tr>
+      <td class="px band-section">
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" class="recording">
+          <tr>
+            <td class="recording-cell">
+              <span class="recording-label">Recording</span>
+              <span class="recording-when">(available until Oct 16, 2026)</span><br>
+              <a href="https://minio.example.com/meetings/videos/jitsi-ai-review/jitsi-ai-review_2026-10-09-11-30-00.mp4?X-Amz-Signature=EXAMPLE" class="recording-link">jitsi-ai-review_2026-10-09-11-30-00.mp4</a>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+
+    <!--
+      ============================================================
+      Sign-off — TEMPLATE: {{sign_off}}, newlines rendered as <br>
+      ============================================================
+    -->
+    <tr>
+      <td class="px band-signoff signoff">
+        Best regards,<br>
+        Automated meeting transcription
+      </td>
+    </tr>
+
+    <!--
+      ============================================================
+      Footer
+      ============================================================
+    -->
+    <tr>
+      <td class="px band-footer">
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" class="footer-rule">
+          <tr>
+            <td class="footer-text">
+              Generated entirely on-premise on our private Debian infrastructure. No cloud dependency.<br>
+              <span class="footer-note">Transcription by local Whisper &middot; summary by local Ollama</span>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+
+  </table>
+  <!--[if mso]>
+  </td></tr></table>
+  <![endif]-->
+
+</td>
+</tr>
+</table>
+
+</body>
+</html>
