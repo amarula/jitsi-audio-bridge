@@ -464,3 +464,126 @@ def test_the_recent_meetings_list_is_newest_first(tmp_path: Path) -> None:
     hidden = config.storage.recordings_dir / ".session-metadata"
     hidden.mkdir()
     assert hidden not in recover_meeting.recent_meetings(config, 10)
+
+
+#: Two lines from a real Jicofo log, which is where the endpoint ids the audio
+#: is tagged with meet the identities the deployment gave those participants.
+JICOFO_LOG = (
+    "Jicofo 2026-10-13 09:46:56.403 INFO: [223] "
+    "[room=1ff2f1ff@conference.example.com meeting_id=53f025af] "
+    "JitsiMeetConferenceImpl.onMemberJoined#873: Member joined:76e96806 "
+    "stats-id=sezen@example.com region=null audioMuted=true role=PARTICIPANT\n"
+    "Jicofo 2026-10-13 09:46:58.930 INFO: [225] "
+    "[room=1ff2f1ff@conference.example.com meeting_id=53f025af] "
+    "JitsiMeetConferenceImpl.onMemberJoined#873: Member joined:e53be326 "
+    "stats-id=patrick@example.com region=null audioMuted=true role=PARTICIPANT\n"
+    "Jicofo 2026-10-13 09:47:01.100 INFO: [227] "
+    "[room=other@conference.example.com meeting_id=another-meeting] "
+    "JitsiMeetConferenceImpl.onMemberJoined#873: Member joined:deadbeef "
+    "stats-id=somebody@example.com region=null\n"
+)
+
+
+def _meeting_with_labels(tmp_path: Path):
+    from dataclasses import replace
+
+    from jitsi_audio_bridge.config import load_config
+
+    recordings = tmp_path / "recordings"
+    meeting = recordings / "53f025af"
+    meeting.mkdir(parents=True)
+    (meeting / "metadata.json").write_text(
+        json.dumps(
+            {
+                "room_name": "1ff2f1ff",
+                "participants": [
+                    {"user": {"name": "Sezen Tosunoğlu", "email": "sezen@example.com"}},
+                    {"user": {"name": "Patrick Barsanti", "email": "patrick@example.com"}},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (meeting / "transcript.txt").write_text(
+        "[participant-76e96806-a0]: buongiorno\n[participant-e53be326-a0]: ciao\n",
+        encoding="utf-8",
+    )
+    (meeting / "summary.md").write_text(
+        "## Punti chiave\n- participant-76e96806-a0 ha aperto la riunione\n", encoding="utf-8"
+    )
+    log = tmp_path / "jicofo.log"
+    log.write_text(JICOFO_LOG, encoding="utf-8")
+
+    base = load_config()
+    config = replace(
+        base, storage=replace(base.storage, recordings_dir=recordings)
+    )
+    return meeting, config, log
+
+
+def test_the_endpoint_ids_come_from_jicofo_for_this_meeting_only(tmp_path: Path) -> None:
+    lines = tmp_path / "jicofo.log"
+    lines.write_text(JICOFO_LOG, encoding="utf-8")
+
+    found = recover_meeting.endpoints_from_jicofo([lines], "53f025af")
+
+    assert found == {"76e96806": "sezen@example.com", "e53be326": "patrick@example.com"}
+    assert "deadbeef" not in found, "another meeting's participants leaked in"
+
+
+def test_attribution_names_the_labels_and_leaves_the_words(tmp_path: Path) -> None:
+    meeting_dir, config, log = _meeting_with_labels(tmp_path)
+    meeting = recover_meeting.inspect(meeting_dir, config)
+
+    assert recover_meeting.recover(
+        meeting, config, attribute=True, jicofo_logs=[log]
+    ) == 0
+
+    transcript = (meeting_dir / "transcript.txt").read_text(encoding="utf-8")
+    assert transcript == "[Sezen Tosunoğlu]: buongiorno\n[Patrick Barsanti]: ciao\n"
+    summary = (meeting_dir / "summary.md").read_text(encoding="utf-8")
+    assert "Sezen Tosunoğlu ha aperto la riunione" in summary
+    # What was said is untouched, and the previous text is kept.
+    assert (meeting_dir / "transcript.txt.before-attribution").read_text(
+        encoding="utf-8"
+    ).startswith("[participant-76e96806-a0]:")
+
+
+def test_attribution_does_nothing_without_the_flag(tmp_path: Path) -> None:
+    meeting_dir, config, log = _meeting_with_labels(tmp_path)
+    original = (meeting_dir / "transcript.txt").read_text(encoding="utf-8")
+    meeting = recover_meeting.inspect(meeting_dir, config)
+
+    assert recover_meeting.recover(meeting, config, jicofo_logs=[log]) == 0
+
+    assert (meeting_dir / "transcript.txt").read_text(encoding="utf-8") == original
+    assert not (meeting_dir / "transcript.txt.before-attribution").exists()
+
+
+def test_attribution_says_so_when_the_log_has_no_such_meeting(tmp_path: Path) -> None:
+    """Rotated away, or the meeting ran on another host: no mapping, no edit."""
+    meeting_dir, config, _ = _meeting_with_labels(tmp_path)
+    empty = tmp_path / "empty.log"
+    empty.write_text("nothing about any meeting here\n", encoding="utf-8")
+    meeting = recover_meeting.inspect(meeting_dir, config)
+
+    assert recover_meeting.recover(
+        meeting, config, attribute=True, jicofo_logs=[empty]
+    ) == 0
+    assert (meeting_dir / "transcript.txt").read_text(encoding="utf-8").startswith(
+        "[participant-76e96806-a0]:"
+    )
+
+
+def test_a_compressed_log_reads_too(tmp_path: Path) -> None:
+    import gzip as gzip_module
+
+    meeting_dir, config, log = _meeting_with_labels(tmp_path)
+    rotated = tmp_path / "jicofo.log.2.gz"
+    with gzip_module.open(rotated, "wt", encoding="utf-8") as handle:
+        handle.write(JICOFO_LOG)
+
+    assert recover_meeting.endpoints_from_jicofo([rotated], "53f025af") == {
+        "76e96806": "sezen@example.com",
+        "e53be326": "patrick@example.com",
+    }

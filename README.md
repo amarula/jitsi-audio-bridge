@@ -915,12 +915,28 @@ summary and transcript to the recovered recipients, in the language the
 summary is written in; `--video` uploads the recording when `[s3]` is
 configured. Nothing is written or sent unless it is asked for.
 
-Two things it cannot do. Per-speaker attribution still needs the Prosody
-module: Jibri's participant ids are Mattermost's, not the MUC resources the
-audio files are named after, so a recovered transcript keeps
-`participant-<id>` where a name would be. And a meeting with no transcript at
-all is a different problem — that one needs
-`jitsi-audio-bridge --process-dir`, which costs what it costs.
+Names for the labels come from a second place, when the first one is gone.
+The transcript is rendered from the recordings' names, so its speakers are
+`[participant-76e96806-a0]`; Jicofo logs every participant arriving with the
+endpoint id the audio is tagged with *and* the identity the deployment gave
+them, on a line that also carries the meeting id:
+
+```
+JitsiMeetConferenceImpl.onMemberJoined#873: Member joined:76e96806 stats-id=sezen@example.com ...
+```
+
+`--attribute` reads those lines for this meeting — plain or gzipped, and
+scoped by meeting id so another meeting's participants cannot leak in — turns
+each address into the name recovered from Jibri, and renames the labels in the
+transcript, the corrected transcript and the summary. The spoken text is not
+touched, and the files it changes are left beside themselves as
+`*.before-attribution`. Without the flag it prints the mapping and changes
+nothing.
+
+One thing it cannot do is a meeting whose transcript is missing: that needs
+`jitsi-audio-bridge --process-dir`, which costs what it costs. And when the
+Jicofo log has rotated past a meeting, there is nothing left to attribute it
+with — which is why the Prosody module, fixed, is the answer that lasts.
 
 ## Running as a service
 

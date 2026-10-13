@@ -41,7 +41,9 @@ transcript is missing as well cannot be recovered by this tool: that is what
 from __future__ import annotations
 
 import argparse
+import gzip
 import logging
+import re
 import shutil
 import sys
 from dataclasses import dataclass, field
@@ -69,6 +71,110 @@ BACKUP_NAME = METADATA_FILENAME + ".before-recovery"
 
 SUMMARY_NAME = "summary.md"
 TRANSCRIPT_NAME = "transcript.txt"
+
+#: Jicofo logs every participant arriving, with the id the bridge's audio is
+#: tagged with and the identity the deployment gave them:
+#:
+#:     [room=... meeting_id=53f025af-...] JitsiMeetConferenceImpl.onMemberJoined:
+#:         Member joined:76e96806 stats-id=sezen@amarulasolutions.com ...
+#:
+#: The first is the endpoint id, which is what ``participant-76e96806-a0.wav``
+#: is named after; the second is an address where the deployment has one, and
+#: whatever the token called them otherwise.  This is the only place the two
+#: are written down together -- the Prosody module is the other, and it lives
+#: in memory -- so it is what a meeting whose participants were lost has left.
+_JICOFO_JOIN = re.compile(
+    r"Member joined\s*:(?P<endpoint>[0-9a-zA-Z_-]+)\s+stats-id=(?P<who>\S+)"
+)
+
+#: Where Jicofo writes, and the rotations that may still hold the meeting.
+JICOFO_LOGS = (
+    Path("/var/log/jitsi/jicofo.log"),
+    Path("/var/log/jitsi/jicofo.log.1"),
+)
+
+
+def _log_lines(path: Path) -> list[str]:
+    """A log file's lines, rotated-and-compressed ones included."""
+    try:
+        if path.suffix == ".gz":
+            with gzip.open(path, "rt", encoding="utf-8", errors="replace") as handle:
+                return handle.readlines()
+        return path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError as exc:
+        logger.warning("cannot read %s: %s", path, exc)
+        return []
+
+
+def endpoints_from_jicofo(log_paths: list[Path], meeting_id: str) -> dict[str, str]:
+    """Endpoint id -> the identity Jicofo logged for it, for one meeting.
+
+    Scoped by the meeting id, which is on the same line as the join, so a log
+    holding a week of meetings yields this one's participants and nobody
+    else's.  Later lines win, which is what a participant who reconnected
+    wants: the last identity under which they were in the call.
+    """
+    names: dict[str, str] = {}
+    marker = f"meeting_id={meeting_id}"
+    for path in log_paths:
+        for line in _log_lines(path):
+            if marker not in line:
+                continue
+            found = _JICOFO_JOIN.search(line)
+            if found:
+                names[found.group("endpoint")] = found.group("who")
+    return names
+
+
+def attribute_files(
+    meeting_dir: Path, names: dict[str, str], *, write: bool
+) -> list[tuple[str, str, int]]:
+    """Replace the labels the daemon wrote with the names of the people.
+
+    The transcript is rendered from the recordings' names, so its labels are
+    ``[participant-76e96806-a0]`` and the summary, written by the model from
+    that transcript, carries the same words.  Only those labels change: the
+    spoken text is untouched, which is the difference between attributing a
+    meeting and rewriting one.
+
+    Returns ``(file, label, replacements)`` for everything it changed, or would
+    have.
+    """
+    report: list[tuple[str, str, int]] = []
+    for name in (TRANSCRIPT_NAME, CORRECTED_TRANSCRIPT_NAME, SUMMARY_NAME):
+        path = meeting_dir / name
+        if not path.is_file():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            logger.warning("cannot read %s: %s", path, exc)
+            continue
+
+        changed = text
+        counts: list[tuple[str, str, int]] = []
+        for endpoint, who in sorted(names.items()):
+            # The label is the recording's name, which is the tag the audio
+            # arrived under: the endpoint id and then the source, as in
+            # ``participant-76e96806-a0``.  Matching the whole of it, and not
+            # the id alone, is what keeps "-a0" from surviving the rename --
+            # and refusing to match a bare id keeps one id from matching
+            # another that begins with it.
+            label = f"participant-{endpoint}"
+            pattern = re.compile(rf"{re.escape(label)}(?:-[0-9a-zA-Z_]+)?")
+            changed, count = pattern.subn(who, changed)
+            counts.append((name, label, count))
+        if changed == text:
+            continue
+        if write:
+            backup = path.with_suffix(path.suffix + ".before-attribution")
+            if not backup.exists():
+                shutil.copy2(path, backup)
+                print(f"  kept        {backup.name}")
+            path.write_text(changed, encoding="utf-8")
+            print(f"  named       {name}")
+        report.extend(counts)
+    return report
 
 
 @dataclass
@@ -189,6 +295,8 @@ def recover(
     write: bool = False,
     mail: bool = False,
     video: bool = False,
+    attribute: bool = False,
+    jicofo_logs: list[Path] | None = None,
     language: str | None = None,
 ) -> int:
     """Do the recovery.  Returns a process exit status."""
@@ -242,6 +350,34 @@ def recover(
     if not recipients:
         logger.warning("no recipients: the mail would go to the fallback address")
 
+    # Who each recording belongs to, from the only place the two id spaces are
+    # written down together.  Jicofo logs an address where the deployment has
+    # one, and the name is then read out of the metadata that was just
+    # recovered -- which is why this runs after it.
+    mapping = endpoints_from_jicofo(jicofo_logs or list(JICOFO_LOGS), meeting.path.name)
+    if mapping:
+        known = parse_metadata(meeting.path)["id_to_name"]
+        names = {endpoint: known.get(who, who) for endpoint, who in mapping.items()}
+        print("\nendpoint id   who Jicofo saw       (this is what the labels are named after)")
+        for endpoint, who in sorted(names.items()):
+            print(f"  {endpoint:12}  {who}")
+        if attribute:
+            print("\nattributing:")
+            changed = attribute_files(meeting.path, names, write=True)
+            for name, label, count in changed:
+                if count:
+                    print(f"  {name:24}  {label} -> {names[label.split('participant-', 1)[1]]}"
+                          f"  ({count})")
+            if not any(count for _, _, count in changed):
+                print("  nothing to rename: no label matches those ids")
+        else:
+            print("\n  pass --attribute to name the labels in the transcript and summary")
+    elif attribute:
+        logger.warning(
+            "no join lines for meeting %s in the Jicofo logs; nothing to attribute",
+            meeting.path.name,
+        )
+
     if video and config.s3.enabled:
         print("\nrecording:")
         upload_meeting_video(meeting.path, config, wait=False)
@@ -267,7 +403,7 @@ def recover(
         print("  sent" if sent else "  not sent; see the log")
         return 0 if sent else 1
 
-    if not write and (participants or recipients):
+    if not write and not attribute and (participants or recipients):
         print("\nnothing was changed: pass --write to keep the names, --mail to send")
     return 0
 
@@ -318,6 +454,20 @@ def build_parser() -> argparse.ArgumentParser:
         "--mail",
         action="store_true",
         help="send the summary and transcript to the recovered recipients",
+    )
+    parser.add_argument(
+        "--attribute",
+        action="store_true",
+        help=(
+            "name the speaker labels in the transcript and summary, using the endpoint "
+            "ids Jicofo logged for this meeting"
+        ),
+    )
+    parser.add_argument(
+        "--jicofo-log",
+        action="append",
+        metavar="PATH",
+        help="a Jicofo log to read the endpoint ids from; repeatable, and gzip is fine",
     )
     parser.add_argument(
         "--video",
@@ -384,6 +534,8 @@ def main(argv: list[str] | None = None) -> int:
         write=args.write,
         mail=args.mail,
         video=args.video,
+        attribute=args.attribute,
+        jicofo_logs=[Path(path) for path in args.jicofo_log] if args.jicofo_log else None,
         language=args.language,
     )
 
