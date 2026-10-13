@@ -1,7 +1,7 @@
 #!/bin/sh
 # Run the bridge, or one of the bundled tools, from the package's private
 # virtualenv. The name this script is invoked under selects the module, so one
-# file serves all three commands.
+# file serves all four commands.
 #
 # The virtualenv path is derived from this script's location rather than
 # hard-coded, so the tree also runs straight out of an extracted package; the
@@ -30,6 +30,7 @@ case "$(basename "$self")" in
     jitsi-audio-bridge)         module=jitsi_audio_bridge ;;
     jitsi-audio-bridge-verify)  module=tools.verify_jitsi ;;
     jitsi-audio-bridge-send)    module=tools.send_meeting ;;
+    jitsi-audio-bridge-recover) module=tools.recover_meeting ;;
     *)
         echo "$(basename "$self"): unknown command" >&2
         exit 2

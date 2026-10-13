@@ -55,6 +55,7 @@ def _installed_launcher(tmp_path: Path, name: str, *, built_for: str = "3.14",
         ("jitsi-audio-bridge", "jitsi_audio_bridge"),
         ("jitsi-audio-bridge-verify", "tools.verify_jitsi"),
         ("jitsi-audio-bridge-send", "tools.send_meeting"),
+        ("jitsi-audio-bridge-recover", "tools.recover_meeting"),
     ],
 )
 def test_launcher_maps_its_name_to_a_module(tmp_path: Path, name: str, module: str) -> None:

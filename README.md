@@ -47,6 +47,7 @@ and emails the result.
 - [Wire protocol](#wire-protocol)
 - [Jitsi integration](docs/jitsi-integration.md)
 - [Batch mode](#batch-mode)
+- [Recovering a meeting](#recovering-a-meeting)
 - [Running as a service](#running-as-a-service)
 - [Test environment](#test-environment)
 - [Output layout](#output-layout)
@@ -881,6 +882,46 @@ capture path handles live meetings, and this handles recordings that were
 already written to disk. Both share the same transcribe, summarise and email
 code, so a fix to one applies to the other.
 
+## Recovering a meeting
+
+A meeting is mailed from three things: its audio, the transcript made of it,
+and the metadata that says who was there. When the metadata arrives with nobody
+in it — a companion module that wrote an empty record, a control frame that
+carried no participants — the meeting is mailed anyway: speakers named
+`participant-<id>`, the summary titled with the placeholder room, and the mail
+sent to the fallback address instead of to the people who were in the call. The
+audio and the transcript are fine. Only the names are missing.
+
+`jitsi-audio-bridge-recover` finds them, without transcribing anything again —
+which is the part that costs minutes and a GPU:
+
+```sh
+# What is in this meeting, and who should have received it?
+jitsi-audio-bridge-recover /srv/recordings/<sessionId>
+
+# The ten most recent, to find the one that was mailed to the wrong place.
+jitsi-audio-bridge-recover --list 10
+
+# Keep the names, and send the mail that should have gone out.
+jitsi-audio-bridge-recover /srv/recordings/<sessionId> --write --mail
+```
+
+It reads Jibri's `metadata.json` — the file beside every recording, with the
+call URL and the participants it could see — matching it to the meeting
+directory by room and by time, the same way the upload does. `--write` keeps
+those participants in the meeting's metadata, leaving the file it replaced
+beside it as `metadata.json.before-recovery`; `--mail` sends the existing
+summary and transcript to the recovered recipients, in the language the
+summary is written in; `--video` uploads the recording when `[s3]` is
+configured. Nothing is written or sent unless it is asked for.
+
+Two things it cannot do. Per-speaker attribution still needs the Prosody
+module: Jibri's participant ids are Mattermost's, not the MUC resources the
+audio files are named after, so a recovered transcript keeps
+`participant-<id>` where a name would be. And a meeting with no transcript at
+all is a different problem — that one needs
+`jitsi-audio-bridge --process-dir`, which costs what it costs.
+
 ## Running as a service
 
 ```sh
@@ -933,6 +974,7 @@ the environment stays up and prints the URL to point the sender at.
 |---|---|
 | `tools.testenv` | Starts the stubs and the real daemon together, wired with a generated `config.ini` |
 | `tools.send_meeting` | The sender simulator: speaks the wire protocol from the [Wire protocol](#wire-protocol) section |
+| `tools.recover_meeting` | Recovers a meeting whose metadata names nobody, and re-sends its mail — see [Recovering a meeting](#recovering-a-meeting) |
 | `tools.stubs` | Stub Whisper, Ollama, SMTP and S3, each runnable on its own |
 | `tools.sample_audio` | Synthesises speech WAVs with ffmpeg, for the replay path |
 

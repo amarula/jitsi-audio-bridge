@@ -10,13 +10,17 @@ guarantee in one place. Nothing in this file touches the network.
 from __future__ import annotations
 
 import base64
+import json
+import os
 import struct
 import wave
+from datetime import datetime
 from pathlib import Path
 
 import pytest
 
 from jitsi_audio_bridge.audio import OpusDecoder, OpusEncoder, OpusError
+from tools import recover_meeting
 from tools.send_meeting import (
     DEFAULT_RATE,
     ENCODABLE_RATES,
@@ -304,3 +308,159 @@ def test_media_json_info_names_the_bridge() -> None:
     info = media_json_info()
     assert info["event"] == "info"
     assert info["application"] == "jitsi-videobridge"
+
+
+# --------------------------------------------------------------------------
+# Recovering a meeting whose people went missing
+# --------------------------------------------------------------------------
+
+
+def _broken_meeting(root: Path, *, room: str = "1ff2f1ff-4bab", with_parts: bool = True):
+    """A meeting directory as this daemon leaves one that lost its people."""
+    from dataclasses import replace
+
+    from jitsi_audio_bridge.config import load_config
+    from jitsi_audio_bridge.timeline import SessionTimeline
+
+    recordings = root / "recordings"
+    meeting = recordings / "53f025af"
+    meeting.mkdir(parents=True)
+    (meeting / "metadata.json").write_text(
+        json.dumps({"room_name": room, "participants": {}, "meeting_id": "53f025af"}),
+        encoding="utf-8",
+    )
+    (meeting / "transcript.txt").write_text(
+        "[participant-27edee51-a0]: buongiorno a tutti\n", encoding="utf-8"
+    )
+    (meeting / "summary.md").write_text("## Punti chiave\n- uno\n", encoding="utf-8")
+    SessionTimeline(started_at="2026-10-13T09:47:00+00:00", duration=800.0).write(
+        meeting / "timeline.json"
+    )
+
+    jibri = root / "jibri-recordings" / "908c74d7"
+    jibri.mkdir(parents=True)
+    if with_parts:
+        (jibri / "metadata.json").write_text(
+            json.dumps(
+                {
+                    "meeting_url": f"https://jitsi.example.com/{room}",
+                    "participants": [
+                        {"user": {"name": "annachiara.gallo"}},
+                        {"user": {"name": "Sezen Tosunoğlu", "email": "sezen@example.com"}},
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+    recording = jibri / f"{room}_2026-10-13-09-47-21.mp4"
+    recording.write_bytes(b"\x00" * 4096)
+    # Recorded when the meeting was, not when this test ran: a file written
+    # seconds ago is one the daemon leaves alone until it settles.
+    stopped = datetime.fromisoformat("2026-10-13T10:00:00+00:00").timestamp()
+    for path in jibri.iterdir():
+        os.utime(path, (stopped, stopped))
+
+    base = load_config()
+    config = replace(
+        base,
+        storage=replace(base.storage, recordings_dir=recordings),
+        s3=replace(base.s3, jibri_dir=root / "jibri-recordings"),
+    )
+    return meeting, config
+
+
+def test_recovery_finds_the_people_jibri_saw(tmp_path: Path) -> None:
+    meeting_dir, config = _broken_meeting(tmp_path)
+
+    meeting = recover_meeting.inspect(meeting_dir, config)
+
+    assert meeting.room_name == "1ff2f1ff-4bab"
+    assert meeting.participants == [] and meeting.recipients == []
+    assert meeting.transcript == meeting_dir / "transcript.txt"
+    assert meeting.summary == meeting_dir / "summary.md"
+    assert meeting.jibri_metadata is not None
+    assert meeting.recording is not None and meeting.recording.suffix == ".mp4"
+
+    found = recover_meeting.people_from_jibri(meeting.jibri_metadata, meeting_dir)
+    assert found["recipients"] == ["sezen@example.com"]
+    assert "Sezen Tosunoğlu (sezen@example.com)" in found["participants"]
+    # Nothing was written by looking.
+    assert json.loads((meeting_dir / "metadata.json").read_text())["participants"] == {}
+    assert not (meeting_dir / ".recovery-scratch").exists()
+
+
+def test_recovery_keeps_the_names_and_the_file_it_replaced(tmp_path: Path) -> None:
+    meeting_dir, config = _broken_meeting(tmp_path)
+    meeting = recover_meeting.inspect(meeting_dir, config)
+
+    assert recover_meeting.recover(meeting, config, write=True) == 0
+
+    written = json.loads((meeting_dir / "metadata.json").read_text(encoding="utf-8"))
+    # Jibri's file, kept as it was: the participant with an address, and the
+    # one with only a name, both.
+    assert [entry["user"].get("email") for entry in written["participants"]] == [
+        None, "sezen@example.com",
+    ]
+    backup = meeting_dir / recover_meeting.BACKUP_NAME
+    assert backup.is_file()
+    assert json.loads(backup.read_text(encoding="utf-8"))["participants"] == {}
+
+
+def test_recovery_sends_the_mail_to_the_recovered_people(tmp_path: Path) -> None:
+    sent: list = []
+    meeting_dir, config = _broken_meeting(tmp_path)
+
+    def fake_mail(recipients, room, summary, transcript, summary_path, smtp, **kwargs):
+        sent.append((recipients, room, kwargs.get("started_at"), kwargs.get("language")))
+        return True
+
+    meeting = recover_meeting.inspect(meeting_dir, config)
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        monkeypatch.setattr(recover_meeting, "send_meeting_email", fake_mail)
+        monkeypatch.setattr(recover_meeting, "detect_language", lambda text, endpoint: "Italian")
+        assert recover_meeting.recover(meeting, config, mail=True) == 0
+    finally:
+        monkeypatch.undo()
+
+    recipients, room, started_at, language = sent[0]
+    assert recipients == ["sezen@example.com"]
+    assert room == "1ff2f1ff-4bab"
+    assert started_at == "2026-10-13T09:47:00+00:00"
+    assert language == "Italian"
+
+
+def test_recovery_says_so_when_there_is_nothing_to_recover(tmp_path: Path) -> None:
+    """No transcript means this tool is the wrong tool, and it says which is right."""
+    meeting_dir, config = _broken_meeting(tmp_path)
+    (meeting_dir / "transcript.txt").unlink()
+    meeting = recover_meeting.inspect(meeting_dir, config)
+
+    assert recover_meeting.recover(meeting, config, mail=True) == 1
+
+
+def test_recovery_without_a_recording_leaves_the_meeting_alone(tmp_path: Path) -> None:
+    meeting_dir, config = _broken_meeting(tmp_path)
+    for path in (config.s3.jibri_dir).rglob("*"):
+        if path.is_file():
+            path.unlink()
+    meeting = recover_meeting.inspect(meeting_dir, config)
+
+    assert meeting.jibri_metadata is None and meeting.recording is None
+    assert recover_meeting.recover(meeting, config, write=True) == 0
+    assert json.loads((meeting_dir / "metadata.json").read_text())["participants"] == {}
+
+
+def test_the_recent_meetings_list_is_newest_first(tmp_path: Path) -> None:
+    meeting_dir, config = _broken_meeting(tmp_path)
+    older = config.storage.recordings_dir / "older-meeting"
+    older.mkdir()
+    os.utime(older, (1_600_000_000, 1_600_000_000))
+
+    listed = recover_meeting.recent_meetings(config, 10)
+
+    assert listed[0] == meeting_dir and older in listed
+    # The bridge's own hidden directories are not meetings.
+    hidden = config.storage.recordings_dir / ".session-metadata"
+    hidden.mkdir()
+    assert hidden not in recover_meeting.recent_meetings(config, 10)
