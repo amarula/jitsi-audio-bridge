@@ -58,6 +58,7 @@ from .ai_client import (
 )
 from .audio import (
     CORRECTED_TRANSCRIPT_NAME,
+    DEFAULT_ROOM_NAME,
     EXTRACTED_AUDIO_NAME,
     METADATA_FILENAME,
     TIMELINE_FILENAME,
@@ -73,7 +74,12 @@ from .audio import (
 )
 from .config import Config, ConfigError, load_config
 from .mailer import send_meeting_email
-from .s3_upload import VideoLink, prepare_video, upload_meeting_video
+from .s3_upload import (
+    VideoLink,
+    find_meeting_metadata,
+    prepare_video,
+    upload_meeting_video,
+)
 from .timeline import SessionTimeline, TurnTracker, format_offset, merge_turns, utc_now
 
 logger = logging.getLogger(__name__)
@@ -377,6 +383,50 @@ def adopt_session_metadata(meeting_dir: Path, source_dir: Path | None) -> Path |
     return target
 
 
+def adopt_jibri_metadata(meeting_dir: Path, config: Config, room_name: str) -> Path | None:
+    """Take the meeting's people from Jibri when our own metadata has none.
+
+    The Prosody module is the better source -- its participant ids are the
+    MUC resources, which is what the audio files are named after -- but it is
+    not always there, not always right, and a file with nobody in it is
+    indistinguishable from no file at all once the mail has gone out with the
+    fallback address on it.  Jibri writes a metadata file beside every
+    recording, with the call URL, the names and the addresses it could see,
+    and it is already on this host.
+
+    Copied, not translated: the shape Jibri writes -- ``meeting_url`` and
+    participants nested under ``user`` -- is one this daemon already reads.
+    Jibri's file is left where it is, because the upload reads it too.
+
+    Returns the path written, or ``None`` when there was nothing to take — and
+    there is nothing to take when the session already has people, or when the
+    room is the placeholder, which no recording can be matched against.
+    """
+    if not room_name or room_name == DEFAULT_ROOM_NAME:
+        return None
+    if parse_metadata(meeting_dir)["participants"]:
+        return None
+
+    source = find_meeting_metadata(meeting_dir, config, room_name)
+    if source is None:
+        return None
+
+    try:
+        raw = source.read_text(encoding="utf-8")
+    except OSError as exc:
+        logger.warning("cannot read %s: %s", source, exc)
+        return None
+
+    if not write_metadata(meeting_dir, raw):
+        return None
+    logger.info(
+        "our metadata for %s had no participants; took Jibri's from %s",
+        meeting_dir.name,
+        source.parent.name,
+    )
+    return meeting_dir / METADATA_FILENAME
+
+
 def _semaphore() -> asyncio.Semaphore:
     """Return the processing semaphore, binding it to the running loop."""
     global _PROCESSING_SEMAPHORE
@@ -647,6 +697,13 @@ def process_completed_session(meeting_dir: Path, config: Config) -> bool:
     meeting_dir = Path(meeting_dir)
     adopt_session_metadata(meeting_dir, config.storage.session_metadata_dir)
     metadata = parse_metadata(meeting_dir)
+    # Nobody to attribute and nobody to write to, which is what a record
+    # emptied after the meeting looks like.  Skipped when there is nobody
+    # missing, so that the search only happens for the meetings that need it.
+    if not metadata["participants"] and adopt_jibri_metadata(
+        meeting_dir, config, metadata["room_name"]
+    ):
+        metadata = parse_metadata(meeting_dir)
 
     participant_files, master_file = discover_audio(meeting_dir)
     extracted: Path | None = None

@@ -540,6 +540,33 @@ def _expiry_moment(seconds: float) -> str:
     ).isoformat(timespec="seconds")
 
 
+def find_meeting_metadata(meeting_dir: Path, config: Config, room_name: str) -> Path | None:
+    """Jibri's own metadata for this meeting, if its recording can be found.
+
+    The file Jibri writes beside a recording holds the call URL and the
+    participants it could see, names and addresses included -- the same facts
+    the bridge gets from its control frame or from the Prosody module, and the
+    only source of them when neither of those arrives.  Photographed rather
+    than copied: the caller decides whether to use it.
+
+    This is the same search the upload does, so the file found here is the one
+    beside the recording that would be uploaded.  Nothing is waited for: this
+    runs before the mail, and a meeting that has just ended has a recording
+    that has already stopped or has none at all.
+    """
+    recording = _locate(meeting_dir, config, room_name, 0.0)
+    if recording is None:
+        return None
+
+    beside = recording.parent / JIBRI_METADATA_NAME
+    try:
+        if not beside.is_file():
+            return None
+    except OSError:
+        return None
+    return beside
+
+
 def _locate(
     meeting_dir: Path,
     config: Config,

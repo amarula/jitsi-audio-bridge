@@ -41,6 +41,10 @@ logger = logging.getLogger(__name__)
 #: The control frame's payload, inside a meeting directory.
 METADATA_FILENAME = "metadata.json"
 
+#: Used when nothing in the metadata names the room -- and checked against, so
+#: that a placeholder is never taken for a room a recording could match.
+DEFAULT_ROOM_NAME = "General Meeting"
+
 #: Audio produced by live capture, one file per participant.
 PARTICIPANT_GLOB = "participant-*.wav"
 
@@ -571,7 +575,7 @@ def parse_metadata(meeting_dir: str | Path) -> dict[str, Any]:
     """
     metadata_path = Path(meeting_dir) / METADATA_FILENAME
     info: dict[str, Any] = {
-        "room_name": "General Meeting",
+        "room_name": DEFAULT_ROOM_NAME,
         "recipients": [],
         "participants": [],
         "id_to_name": {},
@@ -598,7 +602,21 @@ def parse_metadata(meeting_dir: str | Path) -> dict[str, Any]:
     id_to_name: dict[str, str] = {}
     seen_participants: set[str] = set()
 
-    for participant in meta.get("participants", []) or []:
+    # An empty table in Lua encodes as {} rather than [] -- the companion
+    # module writes that when its record is empty -- and iterating a dict
+    # yields its keys, so this used to read as "no participants" without
+    # saying anything.  It is the whole reason a mail can arrive with no
+    # recipients and no names, so it says so.
+    listed = meta.get("participants")
+    if listed is not None and not isinstance(listed, list):
+        logger.warning(
+            "%s lists participants as %s, not a list; reading none of them",
+            METADATA_FILENAME,
+            type(listed).__name__,
+        )
+        listed = []
+
+    for participant in listed or []:
         if not isinstance(participant, dict):
             continue
 

@@ -14,7 +14,9 @@ The two fixtures that matter most are the traps the tool exists to catch: a
 from __future__ import annotations
 
 import argparse
+import json
 import os
+import shutil
 import subprocess
 import sys
 from dataclasses import replace
@@ -687,6 +689,176 @@ def test_module_source_matches_the_documented_module() -> None:
     ):
         fence = docs.split(marker, 1)[1].split("```lua", 1)[1].split("```", 1)[0]
         assert fence.strip() == module.strip()
+
+
+# --------------------------------------------------------------------------
+# The metadata module, run
+# --------------------------------------------------------------------------
+
+#: Prosody's surroundings, stubbed, so that the module can be loaded and
+#: driven exactly as it ships.  The JSON codec here is a matched pair that
+#: understands only what this module writes, which is all the merge needs.
+MODULE_HARNESS_LUA = """\
+-- SPDX-FileCopyrightText: 2026 Amarula Solutions
+-- SPDX-License-Identifier: AGPL-3.0-only
+--
+-- Drive mod_audio_bridge_metadata.lua without Prosody.
+--
+--     lua module_harness.lua <output-dir> <module.lua>
+--
+-- The module is loaded as it ships, with `module`, `util.jid`, `cjson.safe`
+-- and `lfs` stubbed; the file it writes is a real file in <output-dir>, read
+-- back by the module itself.  The stubbed JSON codec is a matched pair --
+-- encode and decode understand each other's output and nothing else -- which
+-- is all the merge needs, and all this is here to check.
+--
+-- The scenario is the one that lost a meeting's participants: three people
+-- join, the room is recreated (which is what empties the in-memory record),
+-- and then somebody joins again.  The file must still name all three.
+
+local out_dir, module_path = arg[1], arg[2]
+
+local handlers = {}
+
+-- A codec just rich enough for the participants and the four fields written.
+local function encode(value)
+    local parts = {}
+    for _, entry in ipairs(value.participants or {}) do
+        parts[#parts + 1] = string.format(
+            '{"id":"%s","name":"%s","email":"%s"}',
+            entry.id or '', entry.name or '', entry.email or ''
+        )
+    end
+    return string.format(
+        '{"room_name":"%s","meeting_id":"%s","participants":[%s]}',
+        value.room_name or '', value.meeting_id or '', table.concat(parts, ',')
+    )
+end
+
+local function decode(raw)
+    if type(raw) ~= 'string' then
+        return nil
+    end
+    local participants = {}
+    for id, name, email in raw:gmatch('{"id":"(.-)","name":"(.-)","email":"(.-)"}') do
+        participants[#participants + 1] = { id = id, name = name, email = email }
+    end
+    if not raw:match('"participants"%s*:%s*%[') then
+        return nil
+    end
+    return {
+        room_name = raw:match('"room_name"%s*:%s*"(.-)"'),
+        meeting_id = raw:match('"meeting_id"%s*:%s*"(.-)"'),
+        participants = participants,
+    }
+end
+
+package.preload['util.jid'] = function()
+    return {
+        node = function(jid) return jid:match('^([^@]*)') end,
+        resource = function(jid) return jid:match('/(.*)$') end,
+    }
+end
+package.preload['cjson.safe'] = function()
+    return { encode = encode, decode = decode }
+end
+package.preload['lfs'] = function()
+    return { attributes = function() return 'file' end, mkdir = function() end }
+end
+
+local util = {
+    is_admin = function() return false end,
+    is_jibri = function() return false end,
+    is_transcriber = function() return false end,
+    is_healthcheck_room = function() return false end,
+}
+
+module = {
+    require = function() return util end,
+    get_option_string = function() return out_dir end,
+    log = function() end,
+    hook = function(_, name, handler) handlers[name] = handler end,
+}
+
+dofile(module_path)
+
+local Presence = {}
+Presence.__index = Presence
+function Presence:get_child_text() return self.nick end
+
+local function occupant(resource, name)
+    local nick = resource .. '@conference.example.com/' .. resource
+    return {
+        nick = nick,
+        bare_jid = nick,
+        jid = nick,
+        get_presence = function()
+            return setmetatable({ nick = name }, Presence)
+        end,
+    }
+end
+
+local room = { jid = 'room@conference.example.com', _data = { meetingId = 'meeting-1' } }
+
+local function join(resource, name)
+    handlers['muc-occupant-joined']({
+        room = room, occupant = occupant(resource, name), origin = nil,
+    })
+end
+
+handlers['muc-room-created']({ room = room })
+join('res-a', 'Ada')
+join('res-b', 'Grace')
+join('res-c', 'Sezen')
+
+-- The room is recreated: the record in memory goes with the old room.
+handlers['muc-room-created']({ room = room })
+
+-- Something that is not a participant arrives, which is what writes last.
+handlers['muc-occupant-left']({ room = room, occupant = occupant('res-c', 'Sezen') })
+"""
+
+
+def test_the_metadata_module_keeps_participants_it_had_already_written(
+    tmp_path: Path,
+) -> None:
+    """The scenario that lost a meeting: the room is recreated, then written to.
+
+    The record lives in memory and goes with the room, so a write after a
+    recreation used to replace a file full of people with an empty one -- and
+    the bridge reads that file minutes later, sees the last write, and mails a
+    meeting with nobody in it.  Run against the module as it shipped before
+    this test existed, the file below comes out with no participants at all.
+    """
+    lua = shutil.which("lua")
+    if lua is None:
+        pytest.skip("lua is not installed; the module cannot be run here")
+
+    module = tmp_path / "mod_audio_bridge_metadata.lua"
+    module.write_text(PROSODY_METADATA_MODULE_LUA, encoding="utf-8")
+    script = tmp_path / "harness.lua"
+    script.write_text(MODULE_HARNESS_LUA, encoding="utf-8")
+    out = tmp_path / "out"
+    out.mkdir()
+
+    result = subprocess.run(
+        [lua, str(script), str(out), str(module)],
+        capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+    written = json.loads((out / "meeting-1.json").read_text(encoding="utf-8"))
+    assert [entry["id"] for entry in written["participants"]] == [
+        "res-a", "res-b", "res-c",
+    ], written
+    assert written["meeting_id"] == "meeting-1"
+
+
+def test_the_metadata_module_merges_before_it_writes() -> None:
+    """The wiring, which the test above would not notice the loss of."""
+    assert "with_written_participants(path, participants_of(room))" in (
+        PROSODY_METADATA_MODULE_LUA
+    )
 
 
 # --------------------------------------------------------------------------

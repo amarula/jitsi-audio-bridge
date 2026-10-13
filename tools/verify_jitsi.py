@@ -1855,6 +1855,11 @@ local NICK_NS = 'http://jabber.org/protocol/nick';
 -- quiet first -- so writing only who is *present* would hand it an empty
 -- room.  Emails arrive in the session's token context rather than in the
 -- presence, and only where the deployment authenticates users.
+--
+-- This table is memory: it does not survive the room being recreated, and a
+-- meeting that is mailed from a record written afterwards would have nobody
+-- in it.  What was already written is therefore merged back in before every
+-- write -- see with_written_participants.
 local known = {};
 
 -- Jicofo, the JVB, Jibri and the transcriber are in the room but are not in
@@ -1913,6 +1918,51 @@ local function participants_of(room)
     return participants;
 end
 
+-- What is already written for this meeting, merged with what is in memory.
+--
+-- The file outlives the in-memory record, and that record is thrown away when
+-- the room is recreated -- which is what happens when the last participant
+-- leaves and something else, Jibri or the focus, touches the room again.  An
+-- empty write would then erase the people the bridge came for: it reads this
+-- file minutes later, sees only the last write, and mails a meeting with
+-- nobody in it.  The name is the meeting id, so nothing from another meeting
+-- can be in the file, and the entry in memory -- the newer one -- wins on
+-- names and addresses.
+local function with_written_participants(path, participants)
+    local by_id = {};
+
+    local handle = io.open(path, 'r');
+    if handle then
+        local raw = handle:read('*a');
+        handle:close();
+        local previous = json.decode(raw);
+        local stored = previous and previous.participants;
+        if type(stored) == 'table' then
+            for _, entry in ipairs(stored) do
+                if type(entry) == 'table' and entry.id then
+                    by_id[entry.id] = entry;
+                end
+            end
+        end
+    end
+
+    for _, entry in ipairs(participants) do
+        by_id[entry.id] = entry;
+    end
+
+    local ids = {};
+    for id in pairs(by_id) do
+        table.insert(ids, id);
+    end
+    table.sort(ids);
+
+    local merged = {};
+    for _, id in ipairs(ids) do
+        table.insert(merged, by_id[id]);
+    end
+    return merged;
+end
+
 local function write_metadata(room)
     local meeting_id = room._data and room._data.meetingId;
     if not meeting_id then
@@ -1922,7 +1972,15 @@ local function write_metadata(room)
         return;
     end
 
-    local participants = participants_of(room);
+    if not lfs.attributes(output_dir, 'mode') then
+        lfs.mkdir(output_dir);
+    end
+
+    -- Written whole and renamed into place: the bridge reads this file while
+    -- the meeting is still running.
+    local path = output_dir .. '/' .. meeting_id .. '.json';
+    local participants = with_written_participants(path, participants_of(room));
+
     local encoded = json.encode({
         room_name = jid.node(room.jid);
         meeting_id = meeting_id;
@@ -1934,13 +1992,6 @@ local function write_metadata(room)
         return;
     end
 
-    if not lfs.attributes(output_dir, 'mode') then
-        lfs.mkdir(output_dir);
-    end
-
-    -- Written whole and renamed into place: the bridge reads this file while
-    -- the meeting is still running.
-    local path = output_dir .. '/' .. meeting_id .. '.json';
     local temporary = path .. '.tmp';
     local handle, err = io.open(temporary, 'w');
     if not handle then

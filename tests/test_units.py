@@ -2513,6 +2513,98 @@ def test_the_upload_command_reports_what_it_did(tmp_path: Path, monkeypatch) -> 
     assert daemon_module.upload_directory_video(tmp_path, config) == 1
 
 
+def test_a_participants_field_that_is_not_a_list_is_reported(
+    tmp_path: Path, caplog
+) -> None:
+    """The module writes {} for an empty record; reading it silently hid why.
+
+    A meeting whose participants arrived as an empty object was mailed with no
+    names, no recipients and a placeholder room, and nothing in the log said
+    so.  Now the log says so.
+    """
+    meeting = tmp_path / "meeting"
+    meeting.mkdir()
+    (meeting / "metadata.json").write_text(
+        json.dumps({"room_name": "Standup", "participants": {}}), encoding="utf-8"
+    )
+
+    with caplog.at_level("WARNING"):
+        info = parse_metadata(meeting)
+
+    assert info["participants"] == [] and info["recipients"] == []
+    assert info["room_name"] == "Standup"
+    assert "not a list" in caplog.text and "dict" in caplog.text
+
+
+def test_a_meeting_with_nobody_takes_the_people_from_jibri(tmp_path: Path) -> None:
+    """The call that lost its participants: our file had the room, Jibri had the people."""
+    config = _s3_config(tmp_path, jibri_dir=tmp_path / "jibri-recordings")
+    # The room, but nobody: what the companion module writes when its record
+    # was emptied before the last write.
+    meeting = _meeting_dir(tmp_path, room="1ff2f1ff-4bab", session="53f025af")
+    (meeting / "metadata.json").write_text(
+        json.dumps(
+            {"room_name": "1ff2f1ff-4bab", "participants": {}, "meeting_id": "53f025af"}
+        ),
+        encoding="utf-8",
+    )
+    recording = _jibri_recording(config.s3.jibri_dir, "1ff2f1ff-4bab", _MEETING_EPOCH)
+    recording.parent.joinpath("metadata.json").write_text(
+        json.dumps(
+            {
+                "meeting_url": "https://jitsi.example.com/1ff2f1ff-4bab",
+                "participants": [
+                    {"user": {"name": "annachiara.gallo"}},
+                    {"user": {"name": "Sezen Tosunoğlu", "email": "sezen@example.com"}},
+                    {"user": {"name": "Patrick Barsanti", "email": "patrick@example.com"}},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    adopted = daemon_module.adopt_jibri_metadata(meeting, config, "1ff2f1ff-4bab")
+
+    assert adopted is not None
+    info = parse_metadata(meeting)
+    assert info["recipients"] == ["patrick@example.com", "sezen@example.com"]
+    assert "Sezen Tosunoğlu (sezen@example.com)" in info["participants"]
+    # The one with a name and no address is not somebody to mail, so it is not
+    # in that list -- but it is still a name the transcript can use.
+    assert info["id_to_name"]["sezen@example.com"] == "Sezen Tosunoğlu"
+    # Jibri's file is left alone: the upload reads it too.
+    assert (recording.parent / "metadata.json").is_file()
+
+
+def test_people_we_already_have_are_not_replaced_by_jibris(tmp_path: Path) -> None:
+    config = _s3_config(tmp_path, jibri_dir=tmp_path / "jibri-recordings")
+    meeting = tmp_path / "recordings" / "ours"
+    meeting.mkdir(parents=True)
+    (meeting / "metadata.json").write_text(
+        json.dumps(
+            {
+                "room_name": "1ff2f1ff-4bab",
+                "participants": [{"user": {"name": "Ada", "email": "ada@example.com"}}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    _jibri_recording(config.s3.jibri_dir, "1ff2f1ff-4bab", _MEETING_EPOCH)
+
+    assert daemon_module.adopt_jibri_metadata(meeting, config, "1ff2f1ff-4bab") is None
+    assert parse_metadata(meeting)["recipients"] == ["ada@example.com"]
+
+
+def test_a_placeholder_room_is_not_matched_against_a_recording(tmp_path: Path) -> None:
+    config = _s3_config(tmp_path, jibri_dir=tmp_path / "jibri-recordings")
+    meeting = tmp_path / "recordings" / "nameless"
+    meeting.mkdir(parents=True)
+    _jibri_recording(config.s3.jibri_dir, "General Meeting", _MEETING_EPOCH)
+
+    assert daemon_module.adopt_jibri_metadata(meeting, config, "General Meeting") is None
+    assert not (meeting / "metadata.json").exists()
+
+
 # --------------------------------------------------------------------------
 # Module isolation
 # --------------------------------------------------------------------------

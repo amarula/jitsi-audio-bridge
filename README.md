@@ -437,6 +437,14 @@ adopts the file written for it, which is how a stock-Jitsi session gets a room
 name, speaker names and, where the deployment authenticates users, recipients.
 Empty disables it.
 
+A session that has the room but *nobody* in it — an empty record, or a control
+frame that carried no participants — falls back to the metadata Jibri writes
+beside its recording, when one can be found for that room and time: the same
+names and addresses, with no Prosody involved. Its participant ids are
+Mattermost's rather than the MUC resources the audio is tagged with, so the
+fallback addresses the mail correctly but does not attribute individual
+speakers; the Prosody module is what does that.
+
 `capture_timeline` writes `timeline.json` for sessions fed by the JVB's
 media export: who spoke when, on the session's own clock. It can only be
 captured while the meeting is running — a meeting recorded with this off can
