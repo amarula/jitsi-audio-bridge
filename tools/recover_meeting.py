@@ -100,11 +100,32 @@ _JICOFO_JOIN = re.compile(
     r"Member joined\s*:(?P<endpoint>[0-9a-zA-Z_-]+)\s+stats-id=(?P<who>\S+)"
 )
 
-#: Where Jicofo writes, and the rotations that may still hold the meeting.
-JICOFO_LOGS = (
-    Path("/var/log/jitsi/jicofo.log"),
-    Path("/var/log/jitsi/jicofo.log.1"),
-)
+#: Where Jicofo writes.  What is read is this file and every rotation of it:
+#: the line that says who arrived is the one this needs, and by the time a
+#: meeting is worth recovering that line can be a rotation or two back --
+#: Jicofo rotates when it restarts as well as by the day, and a deployment
+#: that has been upgraded since the meeting has the meeting in neither of the
+#: two files somebody would look in first.
+JICOFO_LOG = Path("/var/log/jitsi/jicofo.log")
+
+
+def default_jicofo_logs() -> list[Path]:
+    """Every Jicofo log on this host, oldest first.
+
+    Oldest first so that the last line read for a participant is the last one
+    written about them: somebody who disconnected and came back has two, and
+    the identity they came back under is the one that counts.
+    """
+    rotated = sorted(
+        JICOFO_LOG.parent.glob(f"{JICOFO_LOG.name}*"), key=_rotation_order, reverse=True
+    )
+    return rotated or [JICOFO_LOG]
+
+
+def _rotation_order(path: Path) -> int:
+    """0 for the log in use, 1 for the first rotation, and so on upwards."""
+    suffix = path.name[len(JICOFO_LOG.name):].lstrip(".").split(".")[0]
+    return int(suffix) if suffix.isdigit() else 0
 
 
 def _log_lines(path: Path) -> list[str]:
@@ -137,6 +158,36 @@ def endpoints_from_jicofo(log_paths: list[Path], meeting_id: str) -> dict[str, s
             if found:
                 names[found.group("endpoint")] = found.group("who")
     return names
+
+
+def label_samples(meeting_dir: Path, limit: int = 3) -> list[tuple[str, str]]:
+    """What the meeting's files call their speakers, a few of them.
+
+    For the case where none of the labels matched: what the tool knows a
+    person as is not what the file calls them, and the difference between the
+    two is the whole of the problem.  In the order they appear.
+    """
+    samples: list[tuple[str, str]] = []
+    for name in (TRANSCRIPT_NAME, CORRECTED_TRANSCRIPT_NAME, SUMMARY_NAME):
+        path = meeting_dir / name
+        if not path.is_file():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        found: list[str] = []
+        # Both shapes a label comes in: what follows the offset on a line of
+        # the interleaved transcript, and the bracket the summary uses.
+        for line in text.splitlines():
+            match = re.match(r"(?:\[[0-9:.]+\] )?([^:\n]{1,60}): ", line)
+            if match:
+                found.append(match.group(1))
+            found.extend(m.group(0) for m in re.finditer(r"\[[^\]\n]{1,60}\]", line))
+        unique = [label for label in dict.fromkeys(found) if label.strip("[] ")]
+        if unique:
+            samples.append((name, " ".join(unique[:limit])))
+    return samples
 
 
 def previous_labels(mapping: dict[str, str], names: dict[str, str]) -> dict[str, str]:
@@ -202,12 +253,23 @@ def attribute_files(
             changed, count = pattern.subn(who, changed)
             counts.append((name, label, count))
         for previous, endpoint in sorted((replaced or {}).items()):
-            # In the brackets the transcript uses and nowhere else: a meeting
-            # is about work, and somebody dictating their address into it must
-            # not have that address rewritten.
-            pattern = re.compile(rf"\[{re.escape(previous)}\]")
-            changed, count = pattern.subn(f"[{names[endpoint]}]", changed)
+            # Only where a label can be, and nowhere else: a meeting is about
+            # work, and somebody dictating their address into it must not have
+            # that address rewritten.  There are two shapes, and a meeting
+            # written by this daemon has both: the summary and the corrected
+            # transcript put the speaker in brackets -- "[michael@example.com]
+            # detailed the need" -- while the interleaved transcript puts the
+            # offset in them and the speaker after, "\[00:01:30] michael@example.com: text".
+            # Matching only the first is what left a repaired summary beside
+            # an unrepaired transcript.
+            bracket = re.compile(rf"\[{re.escape(previous)}\]")
+            changed, count = bracket.subn(f"[{names[endpoint]}]", changed)
             counts.append((name, previous, count))
+            speaker = re.compile(
+                rf"(?m)^(\[[0-9:.]+\] )?{re.escape(previous)}(?=: )"
+            )
+            changed, speaker_count = speaker.subn(rf"\g<1>{names[endpoint]}", changed)
+            counts.append((name, f"{previous} (as a speaker)", speaker_count))
         if changed == text:
             continue
         if write:
@@ -463,7 +525,8 @@ def recover(
     # written down together.  Jicofo logs an address where the deployment has
     # one.  Looked up once, because it is also the last source of people when
     # neither the metadata nor a recording names any.
-    mapping = endpoints_from_jicofo(jicofo_logs or list(JICOFO_LOGS), meeting.path.name)
+    logs = jicofo_logs or default_jicofo_logs()
+    mapping = endpoints_from_jicofo(logs, meeting.path.name)
 
     if not meeting.has_people and meeting.jibri_metadata is not None:
         found = people_from_jibri(meeting.jibri_metadata)
@@ -564,13 +627,24 @@ def recover(
                 if count:
                     print(f"  {path_name:24}  {label} -> {count} label(s)")
             if not any(count for _, _, count in changed):
+                # Naming what was looked for is no help when the file's labels
+                # look like something else entirely: a corrected transcript is
+                # a model's rendering of the first one, and it keeps them only
+                # roughly.  So show what is actually in there.
                 print("  nothing to rename: no label matches those ids")
+                for name, sample in label_samples(meeting.path):
+                    print(f"  {name:24}  its labels look like: {sample}")
         else:
             print("\n  pass --attribute to name the labels in the transcript and summary")
     elif attribute:
         logger.warning(
-            "no join lines for meeting %s in the Jicofo logs; nothing to attribute",
+            "no join lines for meeting %s in %s; nothing to attribute",
             meeting.path.name,
+            ", ".join(str(path) for path in logs) or "the Jicofo logs",
+        )
+        logger.warning(
+            "if the meeting is in a log that has been rotated away or moved, "
+            "name it with --jicofo-log"
         )
 
     link: VideoLink | None = None

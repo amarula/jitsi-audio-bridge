@@ -868,6 +868,36 @@ def test_a_name_from_the_recording_names_the_labels(tmp_path: Path) -> None:
     ]
 
 
+def test_a_timed_transcript_is_repaired_too(tmp_path: Path) -> None:
+    """The shape the daemon writes when the timeline interleaves a meeting.
+
+    Its labels are not in brackets -- the offset is, and the speaker follows
+    the bracket and a colon.  A meeting attributed once already, to the
+    addresses from the log, has to be repairable in both shapes, or the
+    summary ends up fixed and the transcript does not.
+    """
+    meeting_dir, config, log = _broken_meeting_without_a_recording(tmp_path, JICOFO_LOG)
+    transcript = meeting_dir / "transcript.txt"
+    transcript.write_text(
+        "[00:00:00] sezen@example.com: buongiorno a tutti\n\n"
+        "[00:01:30] patrick@example.com: buongiorno\n\n"
+        # Not a label: mid-line, where somebody said it out loud.
+        "write to me at sezen@example.com: I read it\n",
+        encoding="utf-8",
+    )
+    meeting = recover_meeting.inspect(meeting_dir, config)
+
+    assert recover_meeting.recover(
+        meeting, config, write=True, attribute=True, jicofo_logs=[log]
+    ) == 0
+
+    assert transcript.read_text(encoding="utf-8") == (
+        "[00:00:00] sezen: buongiorno a tutti\n\n"
+        "[00:01:30] patrick: buongiorno\n\n"
+        "write to me at sezen@example.com: I read it\n"
+    )
+
+
 def test_a_second_attribution_replaces_what_the_first_one_wrote(tmp_path: Path) -> None:
     """A meeting attributed twice: the endpoint ids are gone by then.
 
