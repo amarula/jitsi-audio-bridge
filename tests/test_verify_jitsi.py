@@ -800,9 +800,16 @@ end
 
 local room = { jid = 'room@conference.example.com', _data = { meetingId = 'meeting-1' } }
 
-local function join(resource, name)
+-- The event carries the session of whoever joined, as the origin: that is
+-- where the token context hangs, and so where the module reads the name and
+-- the address from.
+local function join(resource, name, context_user)
+    local origin = nil
+    if context_user then
+        origin = { jitsi_meet_context_user = context_user };
+    end
     handlers['muc-occupant-joined']({
-        room = room, occupant = occupant(resource, name), origin = nil,
+        room = room, occupant = occupant(resource, name), origin = origin,
     })
 end
 
@@ -852,6 +859,60 @@ def test_the_metadata_module_keeps_participants_it_had_already_written(
         "res-a", "res-b", "res-c",
     ], written
     assert written["meeting_id"] == "meeting-1"
+
+
+#: A deployment that authenticates its users has no name in the presence --
+#: Jitsi's own profile keeps none -- and the display name is in the token,
+#: which is where the recording's metadata gets it from too.
+MODULE_HARNESS_LUA_TOKEN_NAMES = MODULE_HARNESS_LUA.replace(
+    """handlers['muc-room-created']({ room = room })
+join('res-a', 'Ada')
+join('res-b', 'Grace')
+join('res-c', 'Sezen')""",
+    """handlers['muc-room-created']({ room = room })
+join('res-a', nil, { name = 'Michael Trimarchi', email = 'michael@example.com' })
+join('res-b', 'Grace', { email = 'grace@example.com' })""",
+).replace("""-- The room is recreated: the record in memory goes with the old room.
+handlers['muc-room-created']({ room = room })
+
+-- Something that is not a participant arrives, which is what writes last.
+handlers['muc-occupant-left']({ room = room, occupant = occupant('res-c', 'Sezen') })""", "")
+
+
+def test_the_metadata_module_takes_the_name_from_the_token(
+    tmp_path: Path,
+) -> None:
+    """The name is where the deployment keeps it, which is not always the room.
+
+    A token deployment puts the display name in the context the session
+    carries -- the same place the address is, and the same record the
+    recording's metadata is written from -- while the presence may carry none
+    at all.  Read from the presence alone, such a meeting comes out with
+    addresses and no names.
+    """
+    lua = shutil.which("lua")
+    if lua is None:
+        pytest.skip("lua is not installed; the module cannot be run here")
+
+    module = tmp_path / "mod_audio_bridge_metadata.lua"
+    module.write_text(PROSODY_METADATA_MODULE_LUA, encoding="utf-8")
+    script = tmp_path / "harness.lua"
+    script.write_text(MODULE_HARNESS_LUA_TOKEN_NAMES, encoding="utf-8")
+    out = tmp_path / "out"
+    out.mkdir()
+
+    result = subprocess.run(
+        [lua, str(script), str(out), str(module)],
+        capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+    written = json.loads((out / "meeting-1.json").read_text(encoding="utf-8"))
+    entries = {entry["id"]: entry for entry in written["participants"]}
+    assert entries["res-a"]["name"] == "Michael Trimarchi"
+    assert entries["res-a"]["email"] == "michael@example.com"
+    # The room's own name still wins where the room has one.
+    assert entries["res-b"]["name"] == "Grace"
 
 
 def test_the_metadata_module_merges_before_it_writes() -> None:

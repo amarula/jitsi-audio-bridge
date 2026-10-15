@@ -325,7 +325,16 @@ room a session belongs to: the session directory is named after the meeting ID
 that `muc_meeting_id` generates and Jicofo substitutes into `{{MEETING_ID}}`.
 
 So one more module writes what it knows under that ID, and the bridge adopts
-it when a session has no metadata of its own. Create
+it when a session has no metadata of its own.
+
+The names and the addresses come from two places, and which one has them
+depends on the deployment: the room's presence carries the display name
+somebody is using for this call (XEP-0172), and the session's token context
+carries what the deployment itself records about them — the name and the
+address Mattermost put in the token, which is what a recording's own metadata
+is written from. The module reads both, and prefers what the room says.
+
+Create
 `mod_audio_bridge_metadata.lua` beside the other module:
 
 ```lua
@@ -357,8 +366,11 @@ local NICK_NS = 'http://jabber.org/protocol/nick';
 -- Everyone the room has seen, by room and then by participant id.  The bridge
 -- reads this file long after the meeting -- it waits for the session to go
 -- quiet first -- so writing only who is *present* would hand it an empty
--- room.  Emails arrive in the session's token context rather than in the
--- presence, and only where the deployment authenticates users.
+-- room.  Names and addresses arrive in two different places: the name, where
+-- the room has one, is in the presence under XEP-0172, and both the name and
+-- the address are in the session's token context -- where the deployment
+-- authenticates its users -- which is the record the recording's own metadata
+-- is built from too.
 --
 -- This table is memory: it does not survive the room being recreated, and a
 -- meeting that is mailed from a record written afterwards would have nobody
@@ -397,7 +409,11 @@ local function remember(room, occupant, session)
     end
 
     local entry = store[id] or {};
-    entry.name = display_name(occupant) or entry.name;
+    -- The name the room carries comes first: it is the one somebody chose or
+    -- the client set for this call.  What the token says is the deployment's
+    -- own record of who they are -- Mattermost puts the display name there --
+    -- and it is the same place the address comes from, a few lines down.
+    entry.name = display_name(occupant) or (user and user.name) or entry.name;
     entry.email = (user and user.email) or entry.email;
     store[id] = entry;
 end
