@@ -20,7 +20,7 @@ from __future__ import annotations
 import configparser
 import logging
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -332,32 +332,8 @@ class Config:
     smtp: SmtpConfig
     s3: S3Config
     mail: MailConfig
-    #: What the people are called, by the address they authenticate as or the
-    #: participant id they appear under.  A deployment that authenticates its
-    #: users gives the bridge an address and nothing else -- no name in
-    #: Jicofo's log, none beside the recording -- and this is where the name
-    #: comes from instead.  Keys are lower-cased, the way the configuration
-    #: file is read.
-    names: dict[str, str] = field(default_factory=dict)
     #: The file the values came from, or ``None`` if only defaults applied.
     source: Path | None = None
-
-
-def _names(parser: configparser.ConfigParser) -> dict[str, str]:
-    """The ``[names]`` section: who the people are, by address or id.
-
-    Read as a whole rather than key by key, because the keys are the people:
-    ``michael@example.com = Michael Trimarchi``.  configparser lower-cases
-    option names, which is what makes the addresses match whatever case the
-    log, the metadata and the recordings happen to spell them in.
-    """
-    if not parser.has_section("names"):
-        return {}
-    return {
-        key.strip(): value.strip()
-        for key, value in parser.items("names")
-        if key.strip() and value.strip()
-    }
 
 
 def _env_override(section: str, key: str) -> str | None:
@@ -556,7 +532,6 @@ def load_config(path: str | os.PathLike[str] | None = None) -> Config:
             link_expiry_seconds=resolver.number("s3", "link_expiry_seconds", minimum=0.0),
             link_endpoint=resolver.text("s3", "link_endpoint"),
         ),
-        names=_names(parser),
         mail=MailConfig(
             html=resolver.boolean("mail", "html"),
             # Empty means "use the packaged stylesheet", so an absent path is

@@ -62,6 +62,7 @@ from jitsi_audio_bridge.audio import (
     CORRECTED_TRANSCRIPT_NAME,
     METADATA_FILENAME,
     TIMELINE_FILENAME,
+    name_from_address,
     parse_metadata,
     parse_metadata_document,
 )
@@ -152,7 +153,7 @@ def previous_labels(mapping: dict[str, str], names: dict[str, str]) -> dict[str,
     """
     replaced: dict[str, str] = {}
     for endpoint, who in mapping.items():
-        for previous in (who, display_name_of(who)):
+        for previous in (who, name_from_address(who)):
             if previous and previous != names[endpoint]:
                 replaced.setdefault(previous, endpoint)
     return replaced
@@ -315,53 +316,48 @@ def people_from_jibri(jibri_metadata: Path) -> dict | None:
     return _as_metadata(raw)
 
 
-def display_name_of(identity: str) -> str:
-    """What to call somebody the only thing known about is an address.
-
-    A transcript label is read, and ``michael@example.com`` is not something
-    anybody is called.  The deployment's own identity is all that is known
-    when neither the companion module nor a recording wrote a display name --
-    Jicofo logs the address a participant authenticated as and nothing else --
-    and the address and the endpoint id still travel together in the metadata,
-    which is what puts them back on the right speaker.
-
-    A label is not an address to send mail to: the mail keeps using ``email``.
-    """
-    local, at, _domain = identity.partition("@")
-    return local if at and local else identity
-
-
-def names_for_labels(
-    meeting: Meeting, mapping: dict[str, str], stated: dict[str, str] | None = None
-) -> tuple[dict[str, str], set[str]]:
+def names_for_labels(meeting: Meeting, mapping: dict[str, str]) -> tuple[dict[str, str], set[str]]:
     """What each endpoint is called, and which of them have no name at all.
 
-    Every source that holds a name is asked: the meeting's own metadata, the
-    recording's -- which is where the names are when the deployment
-    authenticates its users, since Jibri writes what Mattermost told it -- and
-    then the ``[names]`` section, for a deployment whose identities are
-    addresses and which has nowhere else to say who somebody is.  What the
+    Every source that holds a name is asked: the meeting's own metadata, and
+    the recording's, which is where the names are when the deployment
+    authenticates its users -- Jibri writes what Mattermost told it.  What the
     meeting already says wins, because a name recovered earlier was recovered
     from a source that knew more.
 
-    The second half of the answer is the point of the function: somebody whose
-    name no source knows is somebody whose label will be their address, and
-    that is worth saying before the transcript is rewritten rather than after.
+    A name that is only the address shortened is not one of those: it is what
+    a reader is given when nothing knows better, and anything that does know
+    better is preferred to it.  The second half of the answer is the point of
+    the function -- somebody no source names is somebody whose label is their
+    address, and that is worth saying before the transcript is rewritten
+    rather than after.
     """
     known = dict(parse_metadata(meeting.path)["id_to_name"])
+    recorded: dict[str, str] = {}
     if meeting.jibri_metadata is not None:
         found = people_from_jibri(meeting.jibri_metadata) or {}
-        for key, name in found.get("id_to_name", {}).items():
-            known.setdefault(key, name)
+        recorded = found.get("id_to_name", {})
 
     names: dict[str, str] = {}
     invented: set[str] = set()
     for endpoint, who in mapping.items():
-        name = known.get(who) or known.get(endpoint) or (stated or {}).get(who.lower())
-        if name:
-            names[endpoint] = name
+        shortened = name_from_address(who)
+        better = [
+            candidate
+            for candidate in (
+                known.get(who),
+                known.get(endpoint),
+                recorded.get(who),
+                recorded.get(endpoint),
+            )
+            if candidate and candidate not in (who, shortened)
+        ]
+        if better:
+            names[endpoint] = better[0]
         else:
-            names[endpoint] = display_name_of(who)
+            # Nothing anywhere calls this person anything: what the address
+            # says, which is what the deployment itself calls them.
+            names[endpoint] = shortened
             invented.add(endpoint)
     return names, invented
 
@@ -541,7 +537,7 @@ def recover(
         logger.warning("no recipients: the mail would go to the fallback address")
 
     if mapping:
-        names, unnamed = names_for_labels(meeting, mapping, config.names)
+        names, unnamed = names_for_labels(meeting, mapping)
         print("\nendpoint id   who Jicofo saw       (this is what the labels are named after)")
         for endpoint, who in sorted(mapping.items()):
             note = ""

@@ -66,7 +66,6 @@ and emails the result.
 | Ollama | Any HTTP endpoint accepting the `/api/generate` request shape |
 | SMTP | Any relay |
 | S3 | Optional: any S3-compatible endpoint, and Jibri's recordings directory readable — see [`[s3]`](#s3) |
-| Names | Naming the speakers a deployment only knows by address — `[names]` in `config.ini` |
 
 ffmpeg is **not** required. Audio is decoded in-process through libopus, which
 is both faster and less fragile than piping packets to a subprocess.
@@ -937,8 +936,10 @@ those are the labels that will be their address.
 
 Where a name comes from, in order: the meeting's own metadata, the recording's
 metadata (`--jibri-metadata PATH`, for a recording the search does not find),
-the `[names]` section, and only then the address itself, shortened to the part
-before the `@`. `--attribute` can be run again after any of them changes: what
+and then the address itself, shortened to the part before the `@`. That last
+one is the common case, not the exception: a deployment that authenticates its
+users has an address for everybody and a display name for nobody, and the part
+before the `@` is what that person is called throughout it. `--attribute` can be run again after any of them changes: what
 an earlier run wrote is a label too, and is replaced — in the brackets the
 transcript uses, so an address somebody dictates into the meeting is left as
 they said it.

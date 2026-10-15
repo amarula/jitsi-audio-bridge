@@ -599,38 +599,6 @@ def _transcribe_turns(
     return lines, lost
 
 
-def speaker_names(metadata: dict[str, Any], config: Config) -> dict[str, str]:
-    """What to call each speaker: what the meeting knows, and what is stated.
-
-    A deployment that authenticates its users by address gives the bridge the
-    address and nothing else -- Jicofo's log has no display name in it, and a
-    recording's metadata may not be there at all -- so the ``[names]`` section
-    is where the person's name comes from.  It is joined to the participant id,
-    which is what the recordings are named after, and to the address itself,
-    for the deployments that name a recording after one.
-
-    Nothing is invented: an id or address the configuration says nothing about
-    keeps whatever the metadata named it, which is the file's own name when
-    that is nothing.
-    """
-    names = dict(metadata.get("id_to_name") or {})
-    stated = config.names
-    if not stated:
-        return names
-    for participant_id, address in (metadata.get("id_to_address") or {}).items():
-        name = stated.get(address.lower())
-        if name:
-            names.setdefault(participant_id, name)
-            names.setdefault(address, name)
-    # And the deployments that name a recording after the address: somebody
-    # with no id anywhere is still one of the meeting's recipients.
-    for address in metadata.get("recipients") or []:
-        name = stated.get(address.lower())
-        if name:
-            names.setdefault(address, name)
-    return names
-
-
 def transcribe_recordings(
     participant_files: Sequence[Path],
     metadata: dict[str, Any],
@@ -645,9 +613,6 @@ def transcribe_recordings(
     """
     interleave = config.transcript.interleave and timeline is not None
     allowance = MAX_TURNS_PER_FILE
-    #: The label each speaker's lines carry, in the transcript and so in the
-    #: summary written from it.
-    labels = speaker_names(metadata, config)
     if interleave and timeline is not None:
         speakers = [participant_id_from_path(path) for path in participant_files]
         wanted = sum(len(timeline.turns_for(participant_id or "")) for participant_id in speakers)
@@ -671,7 +636,7 @@ def transcribe_recordings(
     retry: list[tuple[str, Any, Path]] = []
     try:
         for recording in participant_files:
-            speaker = attribute_speaker(recording, labels)
+            speaker = attribute_speaker(recording, metadata["id_to_name"])
             turns: Sequence[Any] = []
             if interleave and timeline is not None:
                 turns = timeline.turns_for(participant_id_from_path(recording) or "")

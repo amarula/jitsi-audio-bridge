@@ -599,8 +599,20 @@ def empty_metadata() -> dict[str, Any]:
         "recipients": [],
         "participants": [],
         "id_to_name": {},
-        "id_to_address": {},
     }
+
+
+def name_from_address(identity: str) -> str:
+    """What to call somebody the only thing known about is an address.
+
+    A deployment that authenticates its users has the address they
+    authenticated as and no display name anywhere: not in Jicofo's log, not in
+    the profile Jitsi keeps, not in what the room passes on.  A transcript
+    label is read, and ``michael@example.com`` is not what anybody is called --
+    the address is, though, the identity that person uses everywhere else.
+    """
+    local, at, _domain = identity.partition("@")
+    return local if at and local else identity
 
 
 def parse_metadata_document(meta: dict[str, Any]) -> dict[str, Any]:
@@ -614,10 +626,6 @@ def parse_metadata_document(meta: dict[str, Any]) -> dict[str, Any]:
 
     recipients: list[str] = []
     id_to_name: dict[str, str] = {}
-    #: Which participant id belongs to which address.  The join a deployment
-    #: that authenticates its users needs: the id is what the recordings are
-    #: named after and the address is all that is known about the person.
-    id_to_address: dict[str, str] = {}
     seen_participants: set[str] = set()
 
     # An empty table in Lua encodes as {} rather than [] -- the companion
@@ -655,10 +663,17 @@ def parse_metadata_document(meta: dict[str, Any]) -> dict[str, Any]:
                 recipients.append(clean)
             # Attribute by email too: a recording is often named after the
             # address rather than the opaque participant id.
+            # An address and no name is what a deployment that authenticates
+            # its users has for everybody.  The label a reader ends up with is
+            # what the address says they are called, not the address: this is
+            # the name no other source in the deployment has.
+            label = name or name_from_address(clean)
             if name:
                 id_to_name[clean] = name
+            else:
+                id_to_name.setdefault(clean, label)
             if isinstance(participant_id, str) and participant_id:
-                id_to_address[participant_id] = clean
+                id_to_name.setdefault(participant_id, label)
             _add_participant(info["participants"], seen_participants, name, clean)
 
         if isinstance(participant_id, str) and participant_id and name:
@@ -679,7 +694,6 @@ def parse_metadata_document(meta: dict[str, Any]) -> dict[str, Any]:
 
     info["recipients"] = sorted(recipients)
     info["id_to_name"] = id_to_name
-    info["id_to_address"] = id_to_address
     return info
 
 

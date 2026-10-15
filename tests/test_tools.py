@@ -801,9 +801,9 @@ def test_an_address_is_not_a_name_in_a_transcript(tmp_path: Path) -> None:
     which is what a transcript label must not become.  The address stays in
     the metadata, which is what the mail uses.
     """
-    assert recover_meeting.display_name_of("michael@amarulasolutions.com") == "michael"
-    assert recover_meeting.display_name_of("annachiara.gallo") == "annachiara.gallo"
-    assert recover_meeting.display_name_of("") == ""
+    assert recover_meeting.name_from_address("michael@amarulasolutions.com") == "michael"
+    assert recover_meeting.name_from_address("annachiara.gallo") == "annachiara.gallo"
+    assert recover_meeting.name_from_address("") == ""
 
     meeting_dir, config, log = _broken_meeting_without_a_recording(tmp_path, JICOFO_LOG)
     transcript = _labelled_transcript(meeting_dir)
@@ -922,36 +922,6 @@ def _jibri_metadata_file(root: Path, document: dict) -> Path:
     path.write_text(json.dumps(document), encoding="utf-8")
     (directory / "1ff2f1ff-4bab_2026-10-13-09-47-21.mp4").write_bytes(b"\x00" * 64)
     return path
-
-
-def test_a_name_the_configuration_states_is_used(tmp_path: Path) -> None:
-    """The last source, and the only one some deployments have.
-
-    Where the identities are the addresses people authenticate as and no
-    recording is left to take names from, the operator says who they are --
-    once, in [names] -- and every recovery and every transcript uses it.
-    """
-    from dataclasses import replace
-
-    meeting_dir, config, log = _broken_meeting_without_a_recording(tmp_path, JICOFO_LOG)
-    transcript = _labelled_transcript(meeting_dir)
-    config = replace(
-        config,
-        names={
-            "michael@amarulasolutions.com": "Michael Trimarchi",
-            "sezen@example.com": "Sezen Tosunoğlu",
-        },
-    )
-    meeting = recover_meeting.inspect(meeting_dir, config)
-
-    assert recover_meeting.recover(
-        meeting, config, write=True, attribute=True, jicofo_logs=[log]
-    ) == 0
-
-    named = transcript.read_text(encoding="utf-8")
-    assert "[Sezen Tosunoğlu]: buongiorno a tutti" in named
-    # Nothing stated about this one, so the address is shortened instead.
-    assert "[patrick]: buongiorno" in named
 
 
 def test_the_recording_can_be_named_when_the_search_misses_it(
