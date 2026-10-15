@@ -66,7 +66,7 @@ from jitsi_audio_bridge.daemon import (
     write_metadata,
 )
 from jitsi_audio_bridge.mailer import send_meeting_email
-from jitsi_audio_bridge.s3_upload import find_meeting_metadata, upload_meeting_video
+from jitsi_audio_bridge.s3_upload import VideoLink, find_meeting_metadata, prepare_video
 from jitsi_audio_bridge.timeline import SessionTimeline
 
 logger = logging.getLogger("tools.recover_meeting")
@@ -475,9 +475,15 @@ def recover(
             meeting.path.name,
         )
 
+    link: VideoLink | None = None
     if video and config.s3.enabled:
         print("\nrecording:")
-        upload_meeting_video(meeting.path, config, wait=False)
+        # The same upload the daemon does before a mail, for the same reason:
+        # a link is only worth putting in the mail if it works when the mail
+        # is read.  The recording is already finished here, so the wait is
+        # only there for the case where it is not.
+        link = prepare_video(meeting.path, config, wait_seconds=config.s3.link_wait_seconds)
+        print(f"  {'uploaded     ' + link.url if link else 'not uploaded; see the log'}")
     elif video:
         logger.warning("[s3] endpoint and bucket are unset; nothing to upload")
 
@@ -496,6 +502,8 @@ def recover(
             config.smtp,
             started_at=meeting.started_at,
             language=language,
+            video_url=link.url if link else None,
+            video_until=link.expires_at if link else None,
         )
         print("  sent" if sent else "  not sent; see the log")
         return 0 if sent else 1

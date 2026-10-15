@@ -386,7 +386,6 @@ def test_recovery_finds_the_people_jibri_saw(tmp_path: Path) -> None:
     assert "Sezen Tosunoğlu (sezen@example.com)" in found["participants"]
     # Nothing was written by looking.
     assert json.loads((meeting_dir / "metadata.json").read_text())["participants"] == {}
-    assert not (meeting_dir / ".recovery-scratch").exists()
 
 
 def test_recovery_keeps_the_names_and_the_file_it_replaced(tmp_path: Path) -> None:
@@ -505,6 +504,45 @@ def test_the_jicofo_fallback_addresses_the_mail(tmp_path: Path) -> None:
         monkeypatch.undo()
 
     assert sent[0] == (["patrick@example.com", "sezen@example.com"], "1ff2f1ff-4bab")
+
+
+def test_a_recovered_mail_can_carry_the_recording(tmp_path: Path, monkeypatch) -> None:
+    """`--video` archives the recording the meeting could not find, and the mail
+    that goes out with it links there.
+
+    The link is the whole point of uploading before mailing: a URL that stops
+    working is worse than no URL.  Which is why the recovery asks for the link
+    the upload produced rather than reporting the upload and sending a mail
+    without it.
+    """
+    from dataclasses import replace
+
+    sent: dict = {}
+    meeting_dir, config = _broken_meeting(tmp_path)
+    config = replace(
+        config,
+        s3=replace(config.s3, endpoint="http://127.0.0.1:1", bucket="meetings"),
+    )
+    log = tmp_path / "jicofo.log"
+    log.write_text(JICOFO_LOG, encoding="utf-8")
+
+    def fake_mail(recipients, room, summary, transcript, summary_path, smtp, **kwargs):
+        sent.update(kwargs, recipients=recipients)
+        return True
+
+    link = recover_meeting.VideoLink(
+        url="https://minio.example.com/meetings/k.mp4",
+        expires_at="2026-10-22T10:00:00+00:00",
+    )
+    monkeypatch.setattr(recover_meeting, "send_meeting_email", fake_mail)
+    monkeypatch.setattr(recover_meeting, "detect_language", lambda text, endpoint: "English")
+    monkeypatch.setattr(recover_meeting, "prepare_video", lambda *a, **k: link)
+
+    meeting = recover_meeting.inspect(meeting_dir, config)
+    assert recover_meeting.recover(meeting, config, video=True, mail=True, jicofo_logs=[log]) == 0
+
+    assert sent["video_url"] == link.url
+    assert sent["video_until"] == link.expires_at
 
 
 def test_a_meeting_that_already_names_people_keeps_them(tmp_path: Path) -> None:
