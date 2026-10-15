@@ -2690,6 +2690,127 @@ def test_people_we_already_have_are_not_replaced_by_jibris(tmp_path: Path) -> No
     assert parse_metadata(meeting)["recipients"] == ["ada@example.com"]
 
 
+def test_the_endpoints_the_room_never_named_are_named_from_the_log(
+    tmp_path: Path,
+) -> None:
+    """The two id spaces meet in Jicofo's log, and only there.
+
+    The recordings are named after the endpoint ids; the people the meeting
+    took from the recording are named by the ids Mattermost gave them.  So a
+    meeting whose own metadata was emptied -- the module's record does not
+    survive the room being recreated -- has people and speakers that cannot
+    find each other, unless something joins them.
+    """
+    meeting = tmp_path / "recordings" / "53f025af-6544-43da-965a-801494ebad1a"
+    meeting.mkdir(parents=True)
+    # The audio, named after the endpoint id -- which is the whole difficulty.
+    (meeting / "participant-76e96806-a0.wav").write_bytes(b"\x00" * 16)
+    log = tmp_path / "jicofo.log"
+    log.write_text(
+        "Jicofo 2026-10-13 09:47:01.100 INFO: [227] [room=1ff2f1ff@conference.x "
+        "meeting_id=53f025af-6544-43da-965a-801494ebad1a] "
+        "JitsiMeetConferenceImpl.onMemberJoined#873: Member joined:76e96806 "
+        "stats-id=michael@amarulasolutions.com region=null\n"
+        # Another meeting, whose endpoints must not leak in.
+        "Jicofo 2026-10-13 10:00:00.000 INFO: [228] [room=other@conference.x "
+        "meeting_id=deadbeef] JitsiMeetConferenceImpl.onMemberJoined#873: "
+        "Member joined:abc12345 stats-id=someone@example.com region=null\n",
+        encoding="utf-8",
+    )
+    metadata = {
+        "id_to_name": {"michael@amarulasolutions.com": "Michael Trimarchi"},
+        "recipients": ["michael@amarulasolutions.com"],
+    }
+
+    assert daemon_module.attribute_from_jicofo(meeting, metadata, logs=[log]) == 1
+    labels = metadata["id_to_name"]
+    # A name already known for that address is the name.
+    assert labels["76e96806"] == "Michael Trimarchi"
+    assert attribute_speaker(
+        meeting / "participant-76e96806-a0.wav", labels
+    ) == "Michael Trimarchi"
+    assert "abc12345" not in labels
+
+    # An address nobody put a name to is the address shortened, and a
+    # meeting with no log lines at all is left exactly as it was.
+    empty_log = tmp_path / "nothing.log"
+    empty_log.write_text("nothing here\n", encoding="utf-8")
+    other = {"id_to_name": {}, "recipients": []}
+    assert daemon_module.attribute_from_jicofo(meeting, other, logs=[log]) == 1
+    assert other["id_to_name"]["76e96806"] == "michael"
+    assert daemon_module.attribute_from_jicofo(meeting, other, logs=[empty_log]) == 0
+
+    # And a meeting whose room named its speakers is left alone: the log is
+    # not read at all, which is what the empty one is here to prove.
+    settled = {"id_to_name": {"76e96806": "Sezen Tosunoğlu"}, "recipients": []}
+    assert daemon_module.attribute_from_jicofo(meeting, settled, logs=[empty_log]) == 0
+    assert settled["id_to_name"] == {"76e96806": "Sezen Tosunoğlu"}
+
+
+def test_a_recorded_meeting_is_named_without_being_recovered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The whole of it, in the order the daemon runs it, recovery not involved.
+
+    The room wrote nobody -- the module's record is memory, and the room was
+    recreated -- so the people come from the recording's metadata, which knows
+    them by the ids Mattermost gave them.  The labels are made from the
+    endpoint ids the audio is named after.  Jicofo's log is where the two
+    meet, and a meeting that used to be mailed with nobody in it and had to be
+    recovered by hand comes out of post-processing named.
+    """
+    session = "53f025af-6544-43da-965a-801494ebad1a"
+    config = _s3_config(tmp_path, jibri_dir=tmp_path / "jibri-recordings")
+    meeting = _meeting_dir(tmp_path, room="1ff2f1ff-4bab", session=session)
+    (meeting / "metadata.json").write_text(
+        json.dumps({"room_name": "1ff2f1ff-4bab", "participants": {}, "meeting_id": session}),
+        encoding="utf-8",
+    )
+    (meeting / "participant-76e96806-a0.wav").write_bytes(b"\x00" * 16)
+
+    recording = _jibri_recording(config.s3.jibri_dir, "1ff2f1ff-4bab", _MEETING_EPOCH)
+    recording.parent.joinpath("metadata.json").write_text(
+        json.dumps({
+            "meeting_url": "https://jitsi.example.com/1ff2f1ff-4bab",
+            "participants": [
+                {"user": {"id": "mm-1", "name": "Sezen Tosunoğlu",
+                          "email": "sezen@example.com"}},
+            ],
+        }),
+        encoding="utf-8",
+    )
+    log = tmp_path / "jicofo.log"
+    log.write_text(
+        f"Jicofo 2026-10-13 09:47:01.100 INFO: [227] [room=1ff2f1ff@conference.x "
+        f"meeting_id={session}] JitsiMeetConferenceImpl.onMemberJoined#873: "
+        f"Member joined:76e96806 stats-id=sezen@example.com region=null\n",
+        encoding="utf-8",
+    )
+    # The daemon holds the function, not the module, so that is what is
+    # patched -- and where this deployment's logs are is a host's business.
+    monkeypatch.setattr(daemon_module, "default_logs", lambda: [log])
+
+    seen: dict = {}
+
+    def transcribe(files, metadata, timeline, config):
+        seen.update(metadata)
+        return [(None, attribute_speaker(files[0], metadata["id_to_name"]), "buongiorno")]
+
+    monkeypatch.setattr(daemon_module, "transcribe_recordings", transcribe)
+    monkeypatch.setattr(daemon_module, "detect_language", lambda text, endpoint: "English")
+    monkeypatch.setattr(daemon_module, "correct_transcript", lambda text, endpoint, **kw: text)
+    monkeypatch.setattr(daemon_module, "generate_summary", lambda *a, **kw: "## Punti")
+    monkeypatch.setattr(daemon_module, "send_meeting_email", lambda *a, **kw: True)
+    monkeypatch.setattr(daemon_module.VideoJob, "start", classmethod(lambda cls, *a: None))
+
+    assert daemon_module.process_completed_session(meeting, config) is True
+
+    # The people the mail is addressed to, from the recording.
+    assert seen["recipients"] == ["sezen@example.com"]
+    # And the label a reader gets: the name, joined through the log.
+    assert seen["id_to_name"]["76e96806"] == "Sezen Tosunoğlu"
+
+
 def test_a_placeholder_room_is_not_matched_against_a_recording(tmp_path: Path) -> None:
     config = _s3_config(tmp_path, jibri_dir=tmp_path / "jibri-recordings")
     meeting = tmp_path / "recordings" / "nameless"

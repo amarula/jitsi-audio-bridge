@@ -9,6 +9,14 @@ Type=simple
 User=jitsi-bridge
 Group=jitsi-bridge
 
+# Jicofo's log is root:adm, and it is where the endpoint ids the recordings
+# are named after meet the addresses the deployment authenticated.  A meeting
+# whose room was recreated arrives without that link -- the Prosody module's
+# record is memory -- so the daemon reads it, when it can, to name the
+# speakers.  Without this the daemon says it cannot read the file and labels
+# the transcript by endpoint id; nothing else changes.
+SupplementaryGroups=adm
+
 # ProtectHome=yes below hides /home, so the virtualenv must not live there.
 WorkingDirectory=/opt/jitsi-audio-bridge
 ExecStart=/opt/jitsi-audio-bridge/.venv/bin/jitsi-audio-bridge --config /etc/jitsi-audio-bridge/config.ini

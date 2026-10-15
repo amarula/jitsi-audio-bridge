@@ -944,6 +944,19 @@ an earlier run wrote is a label too, and is replaced — in the brackets the
 transcript uses, so an address somebody dictates into the meeting is left as
 they said it.
 
+The daemon does the same join by itself, for every meeting it records: what
+the recording's metadata knows about the people is joined to the endpoint ids
+the audio is named after through Jicofo's log, before the transcript is
+written. A room that did name its speakers never opens the log at all, and
+one that did not gets the label the address says — the recovery tool is for
+meetings already past that point, or whose transcript was written before this
+existed.
+
+Reading that log is the one thing the service needs from outside its own
+tree: Jicofo writes it `root:adm`, so the shipped unit adds the group
+(`SupplementaryGroups=adm`). Without it the daemon says it cannot read the
+file, the transcript keeps its endpoint ids, and nothing else changes.
+
 One thing it cannot do is a meeting whose transcript is missing: that needs
 `jitsi-audio-bridge --process-dir`, which costs what it costs. And when the
 Jicofo log has rotated past a meeting, there is nothing left to attribute it

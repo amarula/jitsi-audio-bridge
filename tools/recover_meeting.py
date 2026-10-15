@@ -47,7 +47,6 @@ transcript is missing as well cannot be recovered by this tool: that is what
 from __future__ import annotations
 
 import argparse
-import gzip
 import json
 import logging
 import re
@@ -72,6 +71,7 @@ from jitsi_audio_bridge.daemon import (
     session_started_at,
     write_metadata,
 )
+from jitsi_audio_bridge.jicofo import default_logs, endpoints_from_jicofo
 from jitsi_audio_bridge.mailer import send_meeting_email
 from jitsi_audio_bridge.s3_upload import VideoLink, find_meeting_metadata, prepare_video
 from jitsi_audio_bridge.timeline import SessionTimeline
@@ -84,81 +84,6 @@ BACKUP_NAME = METADATA_FILENAME + ".before-recovery"
 
 SUMMARY_NAME = "summary.md"
 TRANSCRIPT_NAME = "transcript.txt"
-
-#: Jicofo logs every participant arriving, with the id the bridge's audio is
-#: tagged with and the identity the deployment gave them:
-#:
-#:     [room=... meeting_id=53f025af-...] JitsiMeetConferenceImpl.onMemberJoined:
-#:         Member joined:76e96806 stats-id=sezen@amarulasolutions.com ...
-#:
-#: The first is the endpoint id, which is what ``participant-76e96806-a0.wav``
-#: is named after; the second is an address where the deployment has one, and
-#: whatever the token called them otherwise.  This is the only place the two
-#: are written down together -- the Prosody module is the other, and it lives
-#: in memory -- so it is what a meeting whose participants were lost has left.
-_JICOFO_JOIN = re.compile(
-    r"Member joined\s*:(?P<endpoint>[0-9a-zA-Z_-]+)\s+stats-id=(?P<who>\S+)"
-)
-
-#: Where Jicofo writes.  What is read is this file and every rotation of it:
-#: the line that says who arrived is the one this needs, and by the time a
-#: meeting is worth recovering that line can be a rotation or two back --
-#: Jicofo rotates when it restarts as well as by the day, and a deployment
-#: that has been upgraded since the meeting has the meeting in neither of the
-#: two files somebody would look in first.
-JICOFO_LOG = Path("/var/log/jitsi/jicofo.log")
-
-
-def default_jicofo_logs() -> list[Path]:
-    """Every Jicofo log on this host, oldest first.
-
-    Oldest first so that the last line read for a participant is the last one
-    written about them: somebody who disconnected and came back has two, and
-    the identity they came back under is the one that counts.
-    """
-    rotated = sorted(
-        JICOFO_LOG.parent.glob(f"{JICOFO_LOG.name}*"), key=_rotation_order, reverse=True
-    )
-    return rotated or [JICOFO_LOG]
-
-
-def _rotation_order(path: Path) -> int:
-    """0 for the log in use, 1 for the first rotation, and so on upwards."""
-    suffix = path.name[len(JICOFO_LOG.name):].lstrip(".").split(".")[0]
-    return int(suffix) if suffix.isdigit() else 0
-
-
-def _log_lines(path: Path) -> list[str]:
-    """A log file's lines, rotated-and-compressed ones included."""
-    try:
-        if path.suffix == ".gz":
-            with gzip.open(path, "rt", encoding="utf-8", errors="replace") as handle:
-                return handle.readlines()
-        return path.read_text(encoding="utf-8", errors="replace").splitlines()
-    except OSError as exc:
-        logger.warning("cannot read %s: %s", path, exc)
-        return []
-
-
-def endpoints_from_jicofo(log_paths: list[Path], meeting_id: str) -> dict[str, str]:
-    """Endpoint id -> the identity Jicofo logged for it, for one meeting.
-
-    Scoped by the meeting id, which is on the same line as the join, so a log
-    holding a week of meetings yields this one's participants and nobody
-    else's.  Later lines win, which is what a participant who reconnected
-    wants: the last identity under which they were in the call.
-    """
-    names: dict[str, str] = {}
-    marker = f"meeting_id={meeting_id}"
-    for path in log_paths:
-        for line in _log_lines(path):
-            if marker not in line:
-                continue
-            found = _JICOFO_JOIN.search(line)
-            if found:
-                names[found.group("endpoint")] = found.group("who")
-    return names
-
 
 def label_samples(meeting_dir: Path, limit: int = 3) -> list[tuple[str, str]]:
     """What the meeting's files call their speakers, a few of them.
@@ -525,7 +450,7 @@ def recover(
     # written down together.  Jicofo logs an address where the deployment has
     # one.  Looked up once, because it is also the last source of people when
     # neither the metadata nor a recording names any.
-    logs = jicofo_logs or default_jicofo_logs()
+    logs = jicofo_logs or default_logs()
     mapping = endpoints_from_jicofo(logs, meeting.path.name)
 
     if not meeting.has_people and meeting.jibri_metadata is not None:

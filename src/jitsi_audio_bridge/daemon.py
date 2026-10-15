@@ -70,11 +70,13 @@ from .audio import (
     document_names_somebody,
     extract_audio_track,
     metadata_names_somebody,
+    name_from_address,
     parse_metadata,
     participant_id_from_path,
     slice_wav,
 )
 from .config import Config, ConfigError, load_config
+from .jicofo import default_logs, endpoints_from_jicofo
 from .mailer import send_meeting_email
 from .s3_upload import (
     VideoLink,
@@ -434,6 +436,57 @@ def adopt_session_metadata(meeting_dir: Path, source_dir: Path | None) -> Path |
     return target
 
 
+def attribute_from_jicofo(
+    meeting_dir: Path,
+    metadata: dict[str, Any],
+    logs: Sequence[Path] | None = None,
+) -> int:
+    """Name the speakers whose endpoint ids the meeting says nothing about.
+
+    The audio arrives under endpoint ids -- that is what ``participant-76e96806-a0.wav``
+    is named after, and so what the transcript's labels are made of -- and the
+    Prosody module is what attaches a person to one.  Its record is memory, so
+    a meeting whose room was recreated arrives with nobody in it; the people
+    are then taken from the recording's metadata, which names them by the ids
+    Mattermost gave them, and by addresses that no recording is named after.
+    The two id spaces meet in Jicofo's log and nowhere else.
+
+    Nothing is invented: an endpoint takes the name the meeting already has
+    for the identity, and the address shortened when it has none -- which for
+    a deployment that authenticates its users, and keeps no display names, is
+    what that person is called everywhere else in it.
+
+    Returns how many speakers it named, and changes nothing outside *metadata*.
+    """
+    known = metadata.setdefault("id_to_name", {})
+    # Only for the recordings that would otherwise be labelled by their own
+    # file name.  A meeting whose room did say who was in it has none of
+    # those, and never opens the log.
+    unnamed = [
+        path
+        for path in discover_audio(meeting_dir)[0]
+        if attribute_speaker(path, known) == path.stem
+    ]
+    if not unnamed:
+        return 0
+
+    people = endpoints_from_jicofo(logs or default_logs(), meeting_dir.name)
+    named = 0
+    for endpoint, identity in people.items():
+        if endpoint in known:
+            continue
+        known[endpoint] = known.get(identity) or name_from_address(identity)
+        named += 1
+    if named:
+        logger.info(
+            "named %d speaker(s) of %s from the Jicofo log "
+            "(the room's own metadata had no id for them)",
+            named,
+            meeting_dir.name,
+        )
+    return named
+
+
 def adopt_jibri_metadata(meeting_dir: Path, config: Config, room_name: str) -> Path | None:
     """Take the meeting's people from Jibri when our own metadata has none.
 
@@ -765,6 +818,9 @@ def process_completed_session(meeting_dir: Path, config: Config) -> bool:
         meeting_dir, config, metadata["room_name"]
     ):
         metadata = parse_metadata(meeting_dir)
+    # The people are settled, and the labels are not: whatever named them may
+    # have named them by an id the recordings do not use.
+    attribute_from_jicofo(meeting_dir, metadata)
 
     participant_files, master_file = discover_audio(meeting_dir)
     extracted: Path | None = None
