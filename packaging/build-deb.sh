@@ -15,6 +15,15 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# Reading the source tree's own metadata, whoever owns it.  A build in a
+# container copies the tree in as root, which leaves the checkout owned by the
+# user outside it -- git refuses a repository whose owner is not the one
+# asking, and every value read this way would silently fall back to a
+# placeholder: the changelog would say "release" and the maintainer "Unknown".
+git_read() {
+    git -c safe.directory='*' -C "$ROOT" "$@"
+}
 OUT_DIR="${1:-$ROOT/dist}"
 PKG=jitsi-audio-bridge
 CONF_DIR=/etc/jitsi-audio-bridge
@@ -37,7 +46,7 @@ fi
 DEB_VERSION="$VERSION-1"
 ARCH="$(dpkg --print-architecture)"
 PYTHON_MINOR="$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
-MAINTAINER="${DEB_MAINTAINER:-$(git -C "$ROOT" config user.name 2>/dev/null || echo Unknown) <$(git -C "$ROOT" config user.email 2>/dev/null || echo root@localhost)>}"
+MAINTAINER="${DEB_MAINTAINER:-$(git_read config user.name 2>/dev/null || echo Unknown) <$(git_read config user.email 2>/dev/null || echo root@localhost)>}"
 
 STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT
@@ -167,7 +176,7 @@ render "$ROOT/packaging/deb/control.in" > "$PKGROOT/DEBIAN/control"
 # tag.  The version is the one in the source, so the two cannot disagree.
 {
     printf '%s (%s) unstable; urgency=medium\n\n' "$PKG" "$DEB_VERSION"
-    printf '  * Built from the %s source tree.\n' "$(git -C "$ROOT" describe --always --dirty 2>/dev/null || echo 'release')"
+    printf '  * Built from the %s source tree.\n' "$(git_read describe --always --dirty 2>/dev/null || echo 'release')"
     printf '\n -- %s  %s\n' "$MAINTAINER" "$(date -R)"
 } | gzip -9n > "$PKGROOT/usr/share/doc/$PKG/changelog.Debian.gz"
 chmod 0644 "$PKGROOT/usr/share/doc/$PKG/changelog.Debian.gz"

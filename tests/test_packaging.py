@@ -147,6 +147,21 @@ def test_the_unit_lands_where_modern_systemd_reads_it() -> None:
     assert 'chmod -R u=rwX,go=rX "$PKGROOT"' in builder
 
 
+def test_the_build_reads_the_source_tree_whatever_owns_it() -> None:
+    """A container build copies the tree in as root; git trusts no owner.
+
+    Every value the changelog and the control file carry comes from the
+    checkout, and a refused repository turns all of them into a placeholder
+    without failing anything -- which is how a package gets built with no
+    maintainer on it.
+    """
+    builder = (ROOT / "packaging" / "build-deb.sh").read_text(encoding="utf-8")
+    assert "git -C" not in builder, "a git call that a root build would have refused"
+    assert "safe.directory" in builder
+    for read in ("config user.name", "config user.email", "describe"):
+        assert read in builder, f"the build no longer reads {read}"
+
+
 def test_the_build_ships_the_changelog_and_the_lintian_overrides() -> None:
     """Policy wants a changelog; lintian wants to be told what is deliberate."""
     builder = (ROOT / "packaging" / "build-deb.sh").read_text(encoding="utf-8")
