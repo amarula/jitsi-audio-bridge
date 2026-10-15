@@ -893,13 +893,17 @@ def _mailed_body(monkeypatch, **kwargs: object) -> tuple[str, object]:
 def test_the_mail_carries_the_recording_link_and_until_when(
     monkeypatch,
 ) -> None:
+    # Relative for the same reason as below: a fixed date stops being a date
+    # the day the calendar reaches it, and this one is asserted on.
+    until = datetime.now(UTC) + timedelta(days=7)
     body, message = _mailed_body(
         monkeypatch,
         language="english",
         video_url=_LONG_LINK,
-        video_until="2026-10-15T10:11:00+00:00",
+        video_until=until.isoformat(timespec="seconds"),
     )
-    assert "Recording (available until 2026-10-15):" in body
+    day = until.astimezone().strftime("%Y-%m-%d")
+    assert f"Recording (available until {day}):" in body
     assert _LONG_LINK in body
     # The URL is whole once decoded — but not in the raw message, which is
     # quoted-printable from here on: the line is soft-wrapped with "=\r\n" and
@@ -910,13 +914,17 @@ def test_the_mail_carries_the_recording_link_and_until_when(
 
 
 def test_the_link_is_written_in_the_meetings_language(monkeypatch) -> None:
+    # Relative, not a fixed date: a week away is a date, and the same date
+    # written down would render as a time once the calendar reached it.
+    until = datetime.now(UTC) + timedelta(days=7)
     body, _ = _mailed_body(
         monkeypatch,
         language="italian",
         video_url="https://minio.example.com/b/k.mp4",
-        video_until="2026-10-15T10:11:00+00:00",
+        video_until=until.isoformat(timespec="seconds"),
     )
-    assert "Registrazione (disponibile fino al 2026-10-15):" in body
+    day = until.astimezone().strftime("%Y-%m-%d")
+    assert f"Registrazione (disponibile fino al {day}):" in body
 
 
 def test_a_meeting_with_no_recording_says_nothing_about_one(monkeypatch) -> None:
@@ -2628,3 +2636,99 @@ def test_only_the_config_module_reads_files_or_the_environment() -> None:
                 offenders.append(f"{module.name}: {needle}")
 
     assert not offenders, "configuration is leaking outside config.py: " + ", ".join(offenders)
+
+
+def test_a_document_that_names_nobody_does_not_replace_people(tmp_path: Path) -> None:
+    """What the companion module does when the room is recreated and its
+    in-memory record is gone: it writes what it knows now, which is nobody.
+
+    Nothing legitimate empties a meeting that had people in it, and this is
+    the write the bridge reads minutes later -- so it is refused, and the file
+    it would have erased is still there.
+    """
+    meeting = tmp_path / "recordings" / "abcd"
+    meeting.mkdir(parents=True)
+    write_metadata(meeting, json.dumps({
+        "room_name": "Weekly-Planning",
+        "participants": [{"id": "76e96806", "name": "Sezen", "email": "s@example.com"}],
+    }))
+
+    for nobody in (
+        {"participants": {}},                       # the module's empty table
+        {"participants": []},
+        {"room_name": "Weekly-Planning"},           # a room, nobody in it
+        {"participants": [{"id": "76e96806"}]},     # an id is not a person
+    ):
+        assert not write_metadata(meeting, json.dumps(nobody)), nobody
+
+    info = parse_metadata(meeting)
+    assert info["recipients"] == ["s@example.com"]
+    assert info["id_to_name"]["76e96806"] == "Sezen"
+
+
+def test_people_can_still_arrive_and_an_empty_meeting_is_still_written(
+    tmp_path: Path,
+) -> None:
+    """The guard is one-way: it refuses nobody-over-somebody and nothing else."""
+    meeting = tmp_path / "recordings" / "abcd"
+    meeting.mkdir(parents=True)
+
+    # Somebody over nobody, over a file that is not there at all.
+    assert write_metadata(meeting, json.dumps({"participants": [{"id": "a", "name": "Ada"}]}))
+    assert not write_metadata(meeting, json.dumps({"participants": {}}))
+    # More people over fewer.
+    write_metadata(meeting, json.dumps({
+        "participants": [{"id": "a", "name": "Ada"}, {"id": "b", "name": "Bob"}],
+    }))
+    assert parse_metadata(meeting)["id_to_name"] == {"a": "Ada", "b": "Bob"}
+
+    empty = tmp_path / "recordings" / "efgh"
+    empty.mkdir(parents=True)
+    assert write_metadata(empty, json.dumps({"room_name": "Nobody came"}))
+    assert parse_metadata(empty)["participants"] == []
+
+
+def test_a_dropped_document_naming_nobody_still_names_the_room(tmp_path: Path) -> None:
+    """Adopted for the room, not for the people.
+
+    The room name is what a recording is matched against, so refusing this
+    document outright would cost the meeting its video as well as its people;
+    the daemon takes it and then goes looking for a recording that knows who
+    was there.
+    """
+    drop = tmp_path / "drop"
+    drop.mkdir()
+    session = tmp_path / "abc-123"
+    session.mkdir()
+    (drop / "abc-123.json").write_text(json.dumps({
+        "room_name": "1ff2f1ff-4bab",
+        "meeting_id": "53f025af",
+        "participants": {},
+    }))
+
+    assert adopt_session_metadata(session, drop) == session / "metadata.json"
+    info = parse_metadata(session)
+    assert info["room_name"] == "1ff2f1ff-4bab"
+    assert info["participants"] == []
+    assert info["recipients"] == []
+
+
+def test_a_recording_that_names_nobody_is_not_taken(tmp_path: Path) -> None:
+    """And it is not reported as a recovery, because it is not one."""
+    config = _s3_config(tmp_path, jibri_dir=tmp_path / "jibri-recordings")
+    meeting = _meeting_dir(tmp_path, room="1ff2f1ff-4bab", session="53f025af")
+    (meeting / "metadata.json").write_text(
+        json.dumps({"room_name": "1ff2f1ff-4bab", "participants": {}}), encoding="utf-8"
+    )
+    recording = _jibri_recording(config.s3.jibri_dir, "1ff2f1ff-4bab", _MEETING_EPOCH)
+    recording.parent.joinpath("metadata.json").write_text(
+        json.dumps({
+            "meeting_url": "https://jitsi.example.com/1ff2f1ff-4bab",
+            "participants": [{"user": {}}, {"user": {"id": "   "}}],
+        }),
+        encoding="utf-8",
+    )
+    before = (meeting / "metadata.json").read_text(encoding="utf-8")
+
+    assert daemon_module.adopt_jibri_metadata(meeting, config, "1ff2f1ff-4bab") is None
+    assert (meeting / "metadata.json").read_text(encoding="utf-8") == before

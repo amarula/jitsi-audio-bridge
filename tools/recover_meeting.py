@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import argparse
 import gzip
+import json
 import logging
 import re
 import shutil
@@ -56,6 +57,7 @@ from jitsi_audio_bridge.audio import (
     METADATA_FILENAME,
     TIMELINE_FILENAME,
     parse_metadata,
+    parse_metadata_document,
 )
 from jitsi_audio_bridge.config import Config, ConfigError, load_config
 from jitsi_audio_bridge.daemon import session_started_at, write_metadata
@@ -239,7 +241,25 @@ def inspect(meeting_dir: Path, config: Config) -> Meeting:
     return meeting
 
 
-def people_from_jibri(jibri_metadata: Path, meeting_dir: Path) -> dict | None:
+def _as_metadata(raw: str) -> dict | None:
+    """Read a metadata document the way the daemon reads its own.
+
+    The document is looked at before it is written anywhere, so that what a
+    recovery would put in the meeting directory can be judged first -- and
+    refused, if it names nobody.
+    """
+    try:
+        document = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        logger.error("the metadata is not readable: %s", exc)
+        return None
+    if not isinstance(document, dict):
+        logger.error("the metadata is not a JSON object: %.60r", raw)
+        return None
+    return parse_metadata_document(document)
+
+
+def people_from_jibri(jibri_metadata: Path) -> dict | None:
     """Jibri's metadata as this daemon would read it, or ``None``.
 
     Parsed the way the daemon parses its own, so that what a recovery reports
@@ -251,19 +271,56 @@ def people_from_jibri(jibri_metadata: Path, meeting_dir: Path) -> dict | None:
         logger.error("cannot read %s: %s", jibri_metadata, exc)
         return None
 
-    # parse_metadata reads a file, so this reads the same content through the
-    # same code path by way of a temporary directory rather than a second
-    # implementation of the participant parsing.
-    scratch = meeting_dir / ".recovery-scratch"
-    try:
-        scratch.mkdir(parents=True, exist_ok=True)
-        (scratch / METADATA_FILENAME).write_text(raw, encoding="utf-8")
-        return parse_metadata(scratch)
-    except OSError as exc:
-        logger.error("cannot read what Jibri wrote: %s", exc)
-        return None
-    finally:
-        shutil.rmtree(scratch, ignore_errors=True)
+    return _as_metadata(raw)
+
+
+def metadata_from_jicofo(mapping: dict[str, str], room_name: str, meeting_id: str) -> str:
+    """The metadata document the people Jicofo saw amount to.
+
+    Jicofo's log is the only place the two id spaces are written down
+    together: the endpoint id the audio is tagged with -- which is what the
+    transcript's labels are built from -- and the identity the deployment gave
+    that endpoint.  Where the deployment authenticates users, that identity is
+    the address the mail has to reach, and it is what is left when the
+    companion module wrote nobody and no recording can be found to take names
+    from.
+
+    The join line carries no display name, so the identity stands in for one:
+    this invents nothing Jitsi did not say.  Written in the shape the module
+    writes, which is the shape the daemon reads, with the endpoint as the
+    participant id so that an attribution later has the ids it matches labels
+    against.
+    """
+    document = {
+        "room_name": room_name,
+        "meeting_id": meeting_id,
+        "source": "jicofo_attribution",
+        "participants": [
+            _jicofo_participant(endpoint, who)
+            for endpoint, who in sorted(mapping.items())
+        ],
+    }
+    return json.dumps(document)
+
+
+def _jicofo_participant(endpoint: str, identity: str) -> dict[str, str]:
+    """One participant, in the fields the daemon actually reads.
+
+    A deployment that authenticates users gives Jicofo an address, and that
+    goes in ``email``, because it is what the mail has to reach.  One that
+    does not -- or a user with no address of their own -- gives it a name, and
+    a name is only kept from a participant that has one beside an id, so the
+    endpoint id goes with it in ``name``.
+
+    The distinction is the whole difference between a metadata document that
+    names somebody and one that names nobody.  A name written into ``email``
+    reads as a participant with neither an address nor a name: the daemon
+    drops it, and the meeting is mailed as though nobody had been in it --
+    which is the failure this fallback exists to repair.
+    """
+    if "@" in identity:
+        return {"id": endpoint, "email": identity}
+    return {"id": endpoint, "name": identity}
 
 
 def report(meeting: Meeting) -> None:
@@ -314,8 +371,14 @@ def recover(
     participants = meeting.participants
     recipients = meeting.recipients
 
+    # Who each recording belongs to, from the only place the two id spaces are
+    # written down together.  Jicofo logs an address where the deployment has
+    # one.  Looked up once, because it is also the last source of people when
+    # neither the metadata nor a recording names any.
+    mapping = endpoints_from_jicofo(jicofo_logs or list(JICOFO_LOGS), meeting.path.name)
+
     if not meeting.has_people and meeting.jibri_metadata is not None:
-        found = people_from_jibri(meeting.jibri_metadata, meeting.path)
+        found = people_from_jibri(meeting.jibri_metadata)
         if found is None:
             return 1
         participants, recipients = found["participants"], found["recipients"]
@@ -340,6 +403,39 @@ def recover(
                 if not written:
                     return 1
                 print(f"  wrote       {METADATA_FILENAME}")
+    elif not meeting.has_people and mapping:
+        # No recording to take names from, but Jicofo saw who was in the call.
+        # An address and an endpoint id are enough to address the mail and to
+        # match the labels; a display name is the one thing this cannot give.
+        document = metadata_from_jicofo(mapping, info["room_name"], meeting.path.name)
+        found = _as_metadata(document)
+        if found is None:
+            return 1
+        participants, recipients = found["participants"], found["recipients"]
+        if not participants and not recipients:
+            # What was built reads as nobody -- which is what this whole
+            # recovery exists to repair, and must not be the thing that
+            # writes it.  The meeting is left exactly as it was.
+            logger.warning(
+                "Jicofo logged %d participant(s) for %s but the document they amount "
+                "to names nobody; leaving %s as it is",
+                len(mapping),
+                meeting.path.name,
+                METADATA_FILENAME,
+            )
+        else:
+            print("\nrecovered from the Jicofo log:")
+            print(f"  people      {', '.join(participants) or '(nobody with an address)'}")
+            print(f"  recipients  {', '.join(recipients) or '(nobody with an address)'}")
+            if write:
+                backup = meeting.path / BACKUP_NAME
+                current = meeting.path / METADATA_FILENAME
+                if current.is_file() and not backup.exists():
+                    shutil.copy2(current, backup)
+                    print(f"  kept        {backup.name}")
+                if not write_metadata(meeting.path, document):
+                    return 1
+                print(f"  wrote       {METADATA_FILENAME}")
     elif not meeting.has_people:
         logger.warning(
             "the meeting names nobody, and no recording of it was found to take "
@@ -350,11 +446,6 @@ def recover(
     if not recipients:
         logger.warning("no recipients: the mail would go to the fallback address")
 
-    # Who each recording belongs to, from the only place the two id spaces are
-    # written down together.  Jicofo logs an address where the deployment has
-    # one, and the name is then read out of the metadata that was just
-    # recovered -- which is why this runs after it.
-    mapping = endpoints_from_jicofo(jicofo_logs or list(JICOFO_LOGS), meeting.path.name)
     if mapping:
         known = parse_metadata(meeting.path)["id_to_name"]
         names = {endpoint: known.get(who, who) for endpoint, who in mapping.items()}

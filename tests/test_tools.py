@@ -19,7 +19,7 @@ from pathlib import Path
 
 import pytest
 
-from jitsi_audio_bridge.audio import OpusDecoder, OpusEncoder, OpusError
+from jitsi_audio_bridge.audio import OpusDecoder, OpusEncoder, OpusError, parse_metadata
 from tools import recover_meeting
 from tools.send_meeting import (
     DEFAULT_RATE,
@@ -381,7 +381,7 @@ def test_recovery_finds_the_people_jibri_saw(tmp_path: Path) -> None:
     assert meeting.jibri_metadata is not None
     assert meeting.recording is not None and meeting.recording.suffix == ".mp4"
 
-    found = recover_meeting.people_from_jibri(meeting.jibri_metadata, meeting_dir)
+    found = recover_meeting.people_from_jibri(meeting.jibri_metadata)
     assert found["recipients"] == ["sezen@example.com"]
     assert "Sezen Tosunoğlu (sezen@example.com)" in found["participants"]
     # Nothing was written by looking.
@@ -449,6 +449,92 @@ def test_recovery_without_a_recording_leaves_the_meeting_alone(tmp_path: Path) -
     assert meeting.jibri_metadata is None and meeting.recording is None
     assert recover_meeting.recover(meeting, config, write=True) == 0
     assert json.loads((meeting_dir / "metadata.json").read_text())["participants"] == {}
+
+
+def _broken_meeting_without_a_recording(tmp_path: Path, log_text: str):
+    """A meeting that lost its people, with no recording to take them from."""
+    meeting_dir, config = _broken_meeting(tmp_path)
+    for path in (config.s3.jibri_dir).rglob("*"):
+        if path.is_file():
+            path.unlink()
+    log = tmp_path / "jicofo.log"
+    log.write_text(log_text, encoding="utf-8")
+    return meeting_dir, config, log
+
+
+def test_recovery_falls_back_to_the_people_jicofo_saw(tmp_path: Path) -> None:
+    """No module, no recording -- but Jicofo logged who was in the call."""
+    meeting_dir, config, log = _broken_meeting_without_a_recording(tmp_path, JICOFO_LOG)
+    meeting = recover_meeting.inspect(meeting_dir, config)
+
+    assert recover_meeting.recover(meeting, config, write=True, jicofo_logs=[log]) == 0
+
+    written = json.loads((meeting_dir / "metadata.json").read_text(encoding="utf-8"))
+    assert written["source"] == "jicofo_attribution"
+    assert written["room_name"] == "1ff2f1ff-4bab"
+    assert [entry["email"] for entry in written["participants"]] == [
+        "sezen@example.com",
+        "patrick@example.com",
+    ]
+    # The endpoint is kept as the participant id: that is what the transcript's
+    # labels are built from, so an attribution still has something to match.
+    assert [entry["id"] for entry in written["participants"]] == ["76e96806", "e53be326"]
+
+    backup = meeting_dir / recover_meeting.BACKUP_NAME
+    assert json.loads(backup.read_text(encoding="utf-8"))["participants"] == {}
+
+
+def test_the_jicofo_fallback_addresses_the_mail(tmp_path: Path) -> None:
+    """The addresses are the whole point: the mail reaches the people."""
+    sent: list = []
+    meeting_dir, config, log = _broken_meeting_without_a_recording(tmp_path, JICOFO_LOG)
+
+    def fake_mail(recipients, room, summary, transcript, summary_path, smtp, **kwargs):
+        sent.append((recipients, room))
+        return True
+
+    meeting = recover_meeting.inspect(meeting_dir, config)
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        monkeypatch.setattr(recover_meeting, "send_meeting_email", fake_mail)
+        monkeypatch.setattr(
+            recover_meeting, "detect_language", lambda text, endpoint: "English"
+        )
+        assert recover_meeting.recover(meeting, config, mail=True, jicofo_logs=[log]) == 0
+    finally:
+        monkeypatch.undo()
+
+    assert sent[0] == (["patrick@example.com", "sezen@example.com"], "1ff2f1ff-4bab")
+
+
+def test_a_meeting_that_already_names_people_keeps_them(tmp_path: Path) -> None:
+    """Jicofo is the last resort, not the first: a recording's names win."""
+    meeting_dir, config = _broken_meeting(tmp_path)
+    log = tmp_path / "jicofo.log"
+    log.write_text(JICOFO_LOG, encoding="utf-8")
+    meeting = recover_meeting.inspect(meeting_dir, config)
+
+    assert recover_meeting.recover(meeting, config, write=True, jicofo_logs=[log]) == 0
+
+    written = json.loads((meeting_dir / "metadata.json").read_text(encoding="utf-8"))
+    assert [entry["user"].get("email") for entry in written["participants"]] == [
+        None,
+        "sezen@example.com",
+    ]
+
+
+def assert_metadata_names_somebody(meeting_dir: Path, written: str) -> None:
+    """The invariant the recovery has to keep: nobody is not a recovery.
+
+    A metadata.json the daemon reads as an empty meeting is exactly the state
+    these tools exist to get out of, so whatever is written has to leave at
+    least one person in it -- an address to mail, or a name to attribute.
+    """
+    assert isinstance(json.loads(written), dict), written
+    info = parse_metadata(meeting_dir)
+    assert info["recipients"] or info["id_to_name"], (
+        f"the metadata names nobody: {written}"
+    )
 
 
 def test_the_recent_meetings_list_is_newest_first(tmp_path: Path) -> None:
@@ -587,3 +673,80 @@ def test_a_compressed_log_reads_too(tmp_path: Path) -> None:
         "76e96806": "sezen@example.com",
         "e53be326": "patrick@example.com",
     }
+
+
+#: Jicofo's identity for a participant, without an address: a deployment that
+#: does not authenticate users has only this.
+JICOFO_LOG_NAMES_ONLY = (
+    "Jicofo 2026-10-13 09:47:01.100 INFO: [227] "
+    "[room=1ff2f1ff@conference.example.com meeting_id=53f025af] "
+    "JitsiMeetConferenceImpl.onMemberJoined#873: Member joined:27edee51 "
+    "stats-id=annachiara.gallo region=null\n"
+)
+
+
+def test_a_name_without_an_address_is_still_a_name(tmp_path: Path) -> None:
+    """What Jicofo calls somebody is a name, not an address to send mail to.
+
+    Written into the address field it would read as a participant with neither
+    an address nor a name -- the daemon drops those -- and the recovery would
+    have written a metadata document naming nobody, which is the failure it
+    exists to repair.
+    """
+    meeting_dir, config, log = _broken_meeting_without_a_recording(
+        tmp_path, JICOFO_LOG_NAMES_ONLY
+    )
+    meeting = recover_meeting.inspect(meeting_dir, config)
+
+    assert recover_meeting.recover(meeting, config, write=True, jicofo_logs=[log]) == 0
+
+    written = (meeting_dir / "metadata.json").read_text(encoding="utf-8")
+    assert "annachiara.gallo" in written
+    assert_metadata_names_somebody(meeting_dir, written)
+
+
+def test_whatever_is_written_names_somebody(tmp_path: Path) -> None:
+    """The invariant: a written metadata.json never reads as an empty meeting."""
+    meeting_dir, config, log = _broken_meeting_without_a_recording(tmp_path, JICOFO_LOG)
+    meeting = recover_meeting.inspect(meeting_dir, config)
+
+    assert recover_meeting.recover(meeting, config, write=True, jicofo_logs=[log]) == 0
+
+    written = (meeting_dir / "metadata.json").read_text(encoding="utf-8")
+    assert_metadata_names_somebody(meeting_dir, written)
+    # Which is to say: the addresses are there for the mail.  The join line
+    # carries no display name, so the endpoint ids map to the addresses rather
+    # than to names -- which is what the attribution substitutes anyway.
+    info = parse_metadata(meeting_dir)
+    assert info["recipients"] == ["patrick@example.com", "sezen@example.com"]
+    endpoints = {
+        entry["id"] for entry in json.loads(written)["participants"]
+    }
+    assert endpoints == {"76e96806", "e53be326"}, written
+
+
+def test_a_document_that_names_nobody_is_not_written(tmp_path: Path, monkeypatch) -> None:
+    """The guard, for the day something upstream starts producing empty names."""
+    meeting_dir, config, log = _broken_meeting_without_a_recording(tmp_path, JICOFO_LOG)
+    before = (meeting_dir / "metadata.json").read_text(encoding="utf-8")
+    meeting = recover_meeting.inspect(meeting_dir, config)
+    monkeypatch.setattr(
+        recover_meeting,
+        "metadata_from_jicofo",
+        lambda mapping, room, meeting_id: json.dumps(
+            {"room_name": room, "meeting_id": meeting_id, "participants": []}
+        ),
+    )
+
+    assert recover_meeting.recover(meeting, config, write=True, jicofo_logs=[log]) == 0
+
+    assert (meeting_dir / "metadata.json").read_text(encoding="utf-8") == before
+    assert not (meeting_dir / recover_meeting.BACKUP_NAME).exists()
+
+
+def test_a_jibri_metadata_that_is_not_an_object_is_refused(tmp_path: Path) -> None:
+    """A recording's metadata is read, not believed: it is another program's file."""
+    for raw in ("not json at all", "[1, 2]", '"a string"', "null"):
+        path = tmp_path / "metadata.json"
+        path.write_text(raw, encoding="utf-8")
+        assert recover_meeting.people_from_jibri(path) is None, raw

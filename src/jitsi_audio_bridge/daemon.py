@@ -67,7 +67,9 @@ from .audio import (
     OpusParticipantRecorder,
     attribute_speaker,
     discover_audio,
+    document_names_somebody,
     extract_audio_track,
+    metadata_names_somebody,
     parse_metadata,
     participant_id_from_path,
     slice_wav,
@@ -285,12 +287,25 @@ def extract_media_json_vad(event: dict[str, Any]) -> bool | None:
     return vad if isinstance(vad, bool) else None
 
 
+def _names_somebody_on_disk(target: Path) -> bool:
+    """Whether the metadata already stored for a meeting names anybody."""
+    try:
+        return metadata_names_somebody(target.read_text(encoding="utf-8"))
+    except OSError:
+        return False
+
+
 def write_metadata(meeting_dir: Path, raw: str) -> bool:
     """Store a control frame as ``metadata.json``, atomically.
 
     Written to a temporary file and renamed into place so that a reader — or
     the post-processing step of a concurrent session — never observes a
     truncated document.
+
+    Returns whether it was stored.  A frame that is not a JSON object, one
+    that cannot be written, and one that would replace a meeting's people with
+    nobody are all refused the same way: the caller has nothing to do about
+    any of them, and the file that was there stays as it is.
     """
     try:
         data = json.loads(raw)
@@ -303,6 +318,18 @@ def write_metadata(meeting_dir: Path, raw: str) -> bool:
         return False
 
     target = meeting_dir / METADATA_FILENAME
+    if not document_names_somebody(data) and _names_somebody_on_disk(target):
+        # A sender that has lost the meeting -- the companion module's record
+        # is memory, and memory does not survive the room being recreated --
+        # writes what it knows now, which is nobody.  Nothing legitimate
+        # empties a meeting that had people in it, and what would be read
+        # minutes later is this write: the meeting would be mailed with no
+        # names, no recipients, and a recording nothing can be attributed to.
+        logger.warning(
+            "refusing to replace %s with a document that names nobody", target
+        )
+        return False
+
     temporary: str | None = None
     try:
         # mkstemp is inside the guard too: a meeting directory that cannot be
@@ -415,6 +442,16 @@ def adopt_jibri_metadata(meeting_dir: Path, config: Config, room_name: str) -> P
         raw = source.read_text(encoding="utf-8")
     except OSError as exc:
         logger.warning("cannot read %s: %s", source, exc)
+        return None
+
+    if not metadata_names_somebody(raw):
+        # The room is known already -- that is how a recording was matched at
+        # all -- so a document that names nobody adds nothing to this meeting,
+        # and taking it would report a recovery that did not happen.
+        logger.warning(
+            "Jibri's metadata for %s names nobody either; leaving ours alone",
+            source.parent.name,
+        )
         return None
 
     if not write_metadata(meeting_dir, raw):

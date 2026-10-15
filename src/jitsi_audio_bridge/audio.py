@@ -574,28 +574,41 @@ def parse_metadata(meeting_dir: str | Path) -> dict[str, Any]:
     display name so that a recording can be attributed by either.
     """
     metadata_path = Path(meeting_dir) / METADATA_FILENAME
-    info: dict[str, Any] = {
-        "room_name": DEFAULT_ROOM_NAME,
-        "recipients": [],
-        "participants": [],
-        "id_to_name": {},
-    }
-
     if not metadata_path.exists():
         logger.warning("no %s in %s; using defaults", METADATA_FILENAME, meeting_dir)
-        return info
+        return empty_metadata()
 
     try:
         with metadata_path.open("r", encoding="utf-8") as handle:
             meta = json.load(handle)
     except (OSError, json.JSONDecodeError) as exc:
         logger.warning("cannot read %s: %s", metadata_path, exc)
-        return info
+        return empty_metadata()
 
     if not isinstance(meta, dict):
         logger.warning("%s is not a JSON object; using defaults", METADATA_FILENAME)
-        return info
+        return empty_metadata()
 
+    return parse_metadata_document(meta)
+
+
+def empty_metadata() -> dict[str, Any]:
+    """What a meeting with no readable metadata amounts to."""
+    return {
+        "room_name": DEFAULT_ROOM_NAME,
+        "recipients": [],
+        "participants": [],
+        "id_to_name": {},
+    }
+
+
+def parse_metadata_document(meta: dict[str, Any]) -> dict[str, Any]:
+    """Read a metadata *document*, rather than the file it is stored in.
+
+    The same reading as :func:`parse_metadata`, for the callers that hold the
+    text and need to know what it would amount to before writing it anywhere.
+    """
+    info = empty_metadata()
     info["room_name"] = room_name_from_metadata(meta) or info["room_name"]
 
     recipients: list[str] = []
@@ -660,6 +673,29 @@ def parse_metadata(meeting_dir: str | Path) -> dict[str, Any]:
     info["recipients"] = sorted(recipients)
     info["id_to_name"] = id_to_name
     return info
+
+
+def document_names_somebody(document: Any) -> bool:
+    """Whether a metadata document gives the meeting a person at all.
+
+    A document that names nobody -- no address to mail, no name to attribute a
+    recording with -- is what a meeting looks like after it went wrong.  The
+    daemon asks this before it lets one replace a file that names somebody, so
+    that the shape of the failure is never something it writes itself.
+    """
+    if not isinstance(document, dict):
+        return False
+    info = parse_metadata_document(document)
+    return bool(info["participants"] or info["recipients"])
+
+
+def metadata_names_somebody(raw: str) -> bool:
+    """The same question, asked of a document still in its text form."""
+    try:
+        document = json.loads(raw)
+    except json.JSONDecodeError:
+        return False
+    return document_names_somebody(document)
 
 
 def discover_audio(meeting_dir: str | Path) -> tuple[list[Path], Path | None]:
