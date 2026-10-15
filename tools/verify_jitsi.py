@@ -2305,6 +2305,112 @@ def missing_room_metadata_plugins(
     return None
 
 
+#: The optional module that writes the room's names and addresses for the
+#: bridge.  The package does not install it: the file belongs to the Jitsi
+#: installation, and where it goes depends on how that was installed -- a
+#: distribution package puts modules under /usr/share/jitsi-meet, a source
+#: build keeps them in its own tree -- so a package that guessed would either
+#: conflict with the file's owner or write a module Prosody never loads.
+#: What the package carries is the text, and this tool, which runs on the host
+#: and can put it where the configuration says modules are read from.
+METADATA_PLUGIN = "mod_audio_bridge_metadata.lua"
+
+
+def metadata_module_gaps(text: str) -> list[str]:
+    """What an installed copy is too old to do, said as the fix says it."""
+    gaps: list[str] = []
+    if "with_written_participants" not in text:
+        gaps.append(
+            "it does not merge what it had already written, so the write that "
+            "follows the room being recreated erases the meeting's people -- the "
+            "module's record is memory, and the bridge reads the file minutes later"
+        )
+    if "user.name" not in text:
+        gaps.append(
+            "it does not read the display name from the token context, so a "
+            "deployment that keeps no name in the room (Mattermost puts it in the "
+            "token instead) writes none"
+        )
+    return gaps
+
+
+def check_metadata_module(
+    plugin_dirs: Sequence[Path], read: Callable[[Path], str | None]
+) -> Check:
+    """Whether the room-metadata module on this host is the one shipped here.
+
+    A stale copy is worse than an absent one: it is installed and enabled, so
+    the deployment looks complete, and every meeting it writes is written the
+    old way.
+    """
+    installed = [
+        (Path(directory) / METADATA_PLUGIN, read(Path(directory) / METADATA_PLUGIN))
+        for directory in plugin_dirs
+    ]
+    present = [(path, body) for path, body in installed if body is not None]
+    if not present:
+        return Check(
+            "prosody.metadata_module", Status.SKIP,
+            f"the optional {METADATA_PLUGIN} is not installed",
+            fix=(
+                "optional: without it the bridge has no names or addresses for a "
+                "stock-Jitsi session; see docs/jitsi-integration.md section 5, or "
+                "run --fix on a host that has an older copy"
+            ),
+        )
+
+    gaps: list[str] = []
+    stale: list[Path] = []
+    for path, body in present:
+        found = metadata_module_gaps(body or "")
+        if found or (body or "").strip() != PROSODY_METADATA_MODULE_LUA.strip():
+            stale.append(path)
+            gaps.extend(found)
+    if not stale:
+        return Check(
+            "prosody.metadata_module", Status.PASS,
+            f"{METADATA_PLUGIN} is the one this version ships ({present[0][0]})",
+        )
+    detail = "\n".join(f"- {gap}" for gap in dict.fromkeys(gaps))
+    if not detail:
+        detail = "- it differs from the one this version ships"
+    return Check(
+        "prosody.metadata_module", Status.FAIL,
+        f"{METADATA_PLUGIN} on this host is not the one this version ships: "
+        + ", ".join(str(path) for path in stale),
+        fix="run --fix, then install the .new it writes (and restart prosody)",
+        detail=detail,
+    )
+
+
+def propose_metadata_module(
+    plugin_dirs: Sequence[Path], read: Callable[[Path], str | None]
+) -> Proposal | None:
+    """The shipped module text, as a ``.new`` beside the one in use."""
+    installed = [
+        Path(directory) / METADATA_PLUGIN
+        for directory in plugin_dirs
+        if read(Path(directory) / METADATA_PLUGIN) is not None
+    ]
+    target = installed[0] if installed else None
+    if target is None:
+        return None
+    return Proposal(
+        check_id="prosody.metadata_module",
+        summary=f"{METADATA_PLUGIN} as this version ships it",
+        target=target,
+        new_text=PROSODY_METADATA_MODULE_LUA,
+        unit="prosody",
+        notes=(
+            "the file belongs to the Jitsi installation, so it is proposed rather "
+            "than replaced: review it, then move it over the one in use",
+            "it must be enabled on the MUC component (modules_enabled), with "
+            "audio_bridge_metadata_dir set to the bridge's "
+            "[storage] session_metadata_dir",
+        ),
+    )
+
+
 def propose_prosody_fixes(
     deployment: Deployment,
     plugin_dirs: Sequence[Path],
@@ -2913,6 +3019,7 @@ def run_config_section(deployment: Deployment, args: argparse.Namespace) -> Sect
     section.checks.extend(
         check_prosody(deployment, deployment.domain, plugin_dirs, _read)
     )
+    section.checks.append(check_metadata_module(plugin_dirs, _read))
     section.checks.extend(check_meet_config(deployment))
     section.checks.extend(check_jvb(deployment))
     section.checks.extend(check_recording(deployment))
@@ -2940,6 +3047,10 @@ def run_fix_section(
         "prosody.features_identity",
     }:
         proposals.extend(propose_prosody_fixes(deployment, plugin_dirs))
+    if "prosody.metadata_module" in actionable:
+        proposed = propose_metadata_module(plugin_dirs, _read)
+        if proposed is not None:
+            proposals.append(proposed)
     if "meet.transcription.enabled" in actionable:
         proposals.extend(propose_meet_fix(deployment))
 

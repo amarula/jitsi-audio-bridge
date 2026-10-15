@@ -42,6 +42,7 @@ from tools.verify_jitsi import (
     append_to_file_text,
     check_jicofo,
     check_meet_config,
+    check_metadata_module,
     check_prosody,
     check_recording,
     check_recording_archive,
@@ -72,6 +73,7 @@ from tools.verify_jitsi import (
     parse_hocon,
     propose_jicofo_fix,
     propose_meet_fix,
+    propose_metadata_module,
     propose_prosody_fixes,
     strip_js_comments,
     write_proposal,
@@ -920,6 +922,58 @@ def test_the_metadata_module_merges_before_it_writes() -> None:
     assert "with_written_participants(path, participants_of(room))" in (
         PROSODY_METADATA_MODULE_LUA
     )
+
+
+def test_a_stale_metadata_module_is_named_and_proposed(tmp_path: Path) -> None:
+    """The file the package cannot install, and the tool that can.
+
+    A stale copy reads as installed: the deployment looks complete and every
+    meeting is written the old way -- with a record that is lost when the room
+    is recreated, and no name for a deployment that keeps none in the room.
+    """
+    plugins = tmp_path / "prosody-plugins"
+    plugins.mkdir()
+    installed = plugins / "mod_audio_bridge_metadata.lua"
+    installed.write_text(
+        "-- mod_audio_bridge_metadata.lua\n"
+        "local function remember(room, occupant)\n"
+        "    entry.name = display_name(occupant) or entry.name;\n"
+        "    entry.email = (user and user.email) or entry.email;\n"
+        "end\n",
+        encoding="utf-8",
+    )
+    read = _reader({installed: installed.read_text(encoding="utf-8")})
+
+    check = check_metadata_module([plugins], read)
+    assert check.status is Status.FAIL
+    assert str(installed) in check.summary
+    # Said in terms of what the old copy does, not that it is merely different.
+    assert "recreated" in check.detail
+    assert "token context" in check.detail
+
+    proposal = propose_metadata_module([plugins], read)
+    assert proposal is not None and proposal.target == installed
+    assert proposal.new_text == PROSODY_METADATA_MODULE_LUA
+    assert proposal.unit == "prosody"
+
+
+def test_the_shipped_metadata_module_passes_and_absence_is_not_a_failure(
+    tmp_path: Path,
+) -> None:
+    plugins = tmp_path / "prosody-plugins"
+    plugins.mkdir()
+    shipped = plugins / "mod_audio_bridge_metadata.lua"
+    shipped.write_text(PROSODY_METADATA_MODULE_LUA, encoding="utf-8")
+    read = _reader({shipped: PROSODY_METADATA_MODULE_LUA})
+
+    assert check_metadata_module([plugins], read).status is Status.PASS
+
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    absent = check_metadata_module([empty], lambda path: None)
+    # Optional, so its absence is not a failure -- and --fix proposes nothing.
+    assert absent.status is Status.SKIP
+    assert propose_metadata_module([empty], lambda path: None) is None
 
 
 # --------------------------------------------------------------------------

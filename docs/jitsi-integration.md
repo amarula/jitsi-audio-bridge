@@ -337,6 +337,11 @@ is written from. The module reads both, and prefers what the room says.
 Create
 `mod_audio_bridge_metadata.lua` beside the other module:
 
+An older copy is worth replacing rather than keeping, and
+`jitsi-audio-bridge-verify --fix` does the copying: it writes this text as
+`mod_audio_bridge_metadata.lua.new` beside the installed file, which is then
+reviewed and moved over it.
+
 ```lua
 -- mod_audio_bridge_metadata.lua
 -- Gives the audio bridge what stock Jitsi's media export does not carry: the
@@ -860,6 +865,14 @@ It proposes, each only when its check failed:
   VirtualHost's `modules_enabled`, not the MUC's.
 - **jitsi-meet** — the client config with `transcription: { enabled: true }`
   inserted; a commented-out sample block is left as it is and a live one added.
+- **The room-metadata module of §5** — when a copy is installed but is not the
+  one this version ships, `mod_audio_bridge_metadata.lua.new` beside it, with
+  the text below. A stale copy is the one case worth proposing an *optional*
+  module for: it is installed and enabled, so the deployment looks complete,
+  and every meeting it writes is written the old way. The file belongs to the
+  Jitsi installation — a distribution package and a source build keep it in
+  different places — which is why the package carries the text and this tool,
+  run on the host, is what puts it where Prosody loads modules from.
 
 Each entry prints the commands that follow:
 
