@@ -33,6 +33,12 @@ Examples:
     # Recover it: keep the names, and send the mail that should have gone out.
     python3 -m tools.recover_meeting /srv/recordings/53f025af-... --write --mail
 
+    # The recording's metadata was not found by the search, but it is here:
+    # take the people from it and name the labels in the transcript.
+    python3 -m tools.recover_meeting /srv/recordings/53f025af-... \
+        --jibri-metadata /srv/jibri-recordings/908c74d7/metadata.json \
+        --write --attribute
+
 Nothing here transcodes, transcribes or summarises.  A meeting whose
 transcript is missing as well cannot be recovered by this tool: that is what
 ``jitsi-audio-bridge --process-dir`` is for, and it costs what it costs.
@@ -132,8 +138,32 @@ def endpoints_from_jicofo(log_paths: list[Path], meeting_id: str) -> dict[str, s
     return names
 
 
+def previous_labels(mapping: dict[str, str], names: dict[str, str]) -> dict[str, str]:
+    """Labels an earlier recovery already substituted, back to the endpoint.
+
+    A meeting can be attributed twice -- the first time with what was known
+    then, the second with the names a recording turned out to hold -- and by
+    then the endpoint ids are gone from the transcript: what is in their place
+    is whatever the first run wrote.  So the words that run could have written
+    are labels too, and the second run has to recognise them.
+
+    Only for endpoints whose label this run would change: a label that is
+    already the name stays as it is.
+    """
+    replaced: dict[str, str] = {}
+    for endpoint, who in mapping.items():
+        for previous in (who, display_name_of(who)):
+            if previous and previous != names[endpoint]:
+                replaced.setdefault(previous, endpoint)
+    return replaced
+
+
 def attribute_files(
-    meeting_dir: Path, names: dict[str, str], *, write: bool
+    meeting_dir: Path,
+    names: dict[str, str],
+    *,
+    write: bool,
+    replaced: dict[str, str] | None = None,
 ) -> list[tuple[str, str, int]]:
     """Replace the labels the daemon wrote with the names of the people.
 
@@ -170,6 +200,13 @@ def attribute_files(
             pattern = re.compile(rf"{re.escape(label)}(?:-[0-9a-zA-Z_]+)?")
             changed, count = pattern.subn(who, changed)
             counts.append((name, label, count))
+        for previous, endpoint in sorted((replaced or {}).items()):
+            # In the brackets the transcript uses and nowhere else: a meeting
+            # is about work, and somebody dictating their address into it must
+            # not have that address rewritten.
+            pattern = re.compile(rf"\[{re.escape(previous)}\]")
+            changed, count = pattern.subn(f"[{names[endpoint]}]", changed)
+            counts.append((name, previous, count))
         if changed == text:
             continue
         if write:
@@ -276,6 +313,55 @@ def people_from_jibri(jibri_metadata: Path) -> dict | None:
         return None
 
     return _as_metadata(raw)
+
+
+def display_name_of(identity: str) -> str:
+    """What to call somebody the only thing known about is an address.
+
+    A transcript label is read, and ``michael@example.com`` is not something
+    anybody is called.  The deployment's own identity is all that is known
+    when neither the companion module nor a recording wrote a display name --
+    Jicofo logs the address a participant authenticated as and nothing else --
+    and the address and the endpoint id still travel together in the metadata,
+    which is what puts them back on the right speaker.
+
+    A label is not an address to send mail to: the mail keeps using ``email``.
+    """
+    local, at, _domain = identity.partition("@")
+    return local if at and local else identity
+
+
+def names_for_labels(
+    meeting: Meeting, mapping: dict[str, str]
+) -> tuple[dict[str, str], set[str]]:
+    """What each endpoint is called, and which of them have no name at all.
+
+    Every source that holds a name is asked: the meeting's own metadata, and
+    the recording's, which is where the names are when the deployment
+    authenticates its users -- Jibri writes what Mattermost told it.  What the
+    meeting already says wins, because a name recovered earlier was recovered
+    from a source that knew more.
+
+    The second half of the answer is the point of the function: somebody whose
+    name no source knows is somebody whose label will be their address, and
+    that is worth saying before the transcript is rewritten rather than after.
+    """
+    known = dict(parse_metadata(meeting.path)["id_to_name"])
+    if meeting.jibri_metadata is not None:
+        found = people_from_jibri(meeting.jibri_metadata) or {}
+        for key, name in found.get("id_to_name", {}).items():
+            known.setdefault(key, name)
+
+    names: dict[str, str] = {}
+    invented: set[str] = set()
+    for endpoint, who in mapping.items():
+        name = known.get(who) or known.get(endpoint)
+        if name:
+            names[endpoint] = name
+        else:
+            names[endpoint] = display_name_of(who)
+            invented.add(endpoint)
+    return names, invented
 
 
 def metadata_from_jicofo(mapping: dict[str, str], room_name: str, meeting_id: str) -> str:
@@ -453,18 +539,32 @@ def recover(
         logger.warning("no recipients: the mail would go to the fallback address")
 
     if mapping:
-        known = parse_metadata(meeting.path)["id_to_name"]
-        names = {endpoint: known.get(who, who) for endpoint, who in mapping.items()}
+        names, unnamed = names_for_labels(meeting, mapping)
         print("\nendpoint id   who Jicofo saw       (this is what the labels are named after)")
-        for endpoint, who in sorted(names.items()):
-            print(f"  {endpoint:12}  {who}")
+        for endpoint, who in sorted(mapping.items()):
+            note = ""
+            if names[endpoint] == who:
+                note = "  (no name anywhere: this is the address)"
+            elif endpoint in unnamed:
+                note = "  (no name anywhere: the address, shortened)"
+            print(f"  {endpoint:12}  {names[endpoint]}{note}")
+        if unnamed and meeting.jibri_metadata is None:
+            print(
+                "\n  No recording was found for this meeting, so the names Jibri\n"
+                "  writes beside one were not available.  If it is on this host,\n"
+                "  point at it with --jibri-metadata and the labels will be names."
+            )
         if attribute:
             print("\nattributing:")
-            changed = attribute_files(meeting.path, names, write=True)
-            for name, label, count in changed:
+            changed = attribute_files(
+                meeting.path,
+                names,
+                write=True,
+                replaced=previous_labels(mapping, names),
+            )
+            for path_name, label, count in changed:
                 if count:
-                    print(f"  {name:24}  {label} -> {names[label.split('participant-', 1)[1]]}"
-                          f"  ({count})")
+                    print(f"  {path_name:24}  {label} -> {count} label(s)")
             if not any(count for _, _, count in changed):
                 print("  nothing to rename: no label matches those ids")
         else:
@@ -569,6 +669,14 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--jibri-metadata",
+        metavar="PATH",
+        help=(
+            "a recording's metadata file to take the people and the display names "
+            "from, when this meeting's recording is not found by the search"
+        ),
+    )
+    parser.add_argument(
         "--jicofo-log",
         action="append",
         metavar="PATH",
@@ -632,6 +740,22 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     meeting = inspect(meeting_dir, config)
+    if args.jibri_metadata is not None:
+        source = Path(args.jibri_metadata)
+        if not source.is_file():
+            logger.error("not a file: %s", source)
+            return 2
+        # Named rather than searched for: a recording the search did not find
+        # still holds the names -- the file is beside it, and both are here.
+        meeting.jibri_metadata = source
+        meeting.recording = next(
+            (
+                path
+                for path in source.parent.iterdir()
+                if path.is_file() and path.name != source.name
+            ),
+            None,
+        )
     report(meeting)
     return recover(
         meeting,

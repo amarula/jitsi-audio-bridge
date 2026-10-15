@@ -782,6 +782,181 @@ def test_a_document_that_names_nobody_is_not_written(tmp_path: Path, monkeypatch
     assert not (meeting_dir / recover_meeting.BACKUP_NAME).exists()
 
 
+def _labelled_transcript(meeting_dir: Path) -> Path:
+    """A transcript whose labels are the endpoints Jicofo logged."""
+    path = meeting_dir / "transcript.txt"
+    path.write_text(
+        "[participant-76e96806-a0]: buongiorno a tutti\n"
+        "[participant-e53be326-a0]: buongiorno\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_an_address_is_not_a_name_in_a_transcript(tmp_path: Path) -> None:
+    """The label a reader sees: the meeting went to a person, not to an inbox.
+
+    Jicofo logs the address a participant authenticated as and nothing else,
+    so a meeting recovered from its log alone has an address per person --
+    which is what a transcript label must not become.  The address stays in
+    the metadata, which is what the mail uses.
+    """
+    assert recover_meeting.display_name_of("michael@amarulasolutions.com") == "michael"
+    assert recover_meeting.display_name_of("annachiara.gallo") == "annachiara.gallo"
+    assert recover_meeting.display_name_of("") == ""
+
+    meeting_dir, config, log = _broken_meeting_without_a_recording(tmp_path, JICOFO_LOG)
+    transcript = _labelled_transcript(meeting_dir)
+    meeting = recover_meeting.inspect(meeting_dir, config)
+    assert recover_meeting.recover(
+        meeting, config, write=True, attribute=True, jicofo_logs=[log]
+    ) == 0
+
+    named = transcript.read_text(encoding="utf-8")
+    assert "[sezen@example.com]" not in named
+    assert "[sezen]: buongiorno a tutti" in named
+    assert "[patrick]: buongiorno" in named
+    # And the mail still has the addresses to send to.
+    assert parse_metadata(meeting_dir)["recipients"] == [
+        "patrick@example.com",
+        "sezen@example.com",
+    ]
+
+
+def test_a_name_from_the_recording_names_the_labels(tmp_path: Path) -> None:
+    """The recording knows what the log does not: what people are called.
+
+    The meeting's metadata is the log's -- an address per person, no names --
+    and it is the only thing the meeting will ever say, because a meeting that
+    names somebody is never rewritten.  The names are in the file beside the
+    recording, so a label is a name and the mail still has the addresses.
+    """
+    meeting_dir, config, log = _broken_meeting_without_a_recording(tmp_path, JICOFO_LOG)
+    transcript = _labelled_transcript(meeting_dir)
+    # What the first recovery wrote: the people, from the log, with no names
+    # in it (the log has none).
+    (meeting_dir / "metadata.json").write_text(
+        recover_meeting.metadata_from_jicofo(
+            {"76e96806": "sezen@example.com", "e53be326": "patrick@example.com"},
+            "1ff2f1ff-4bab",
+            "53f025af",
+        ),
+        encoding="utf-8",
+    )
+    recorded = _jibri_metadata_file(tmp_path, {
+        "meeting_url": "https://jitsi.example.com/1ff2f1ff-4bab",
+        "participants": [
+            {"user": {"name": "Sezen Tosunoğlu", "email": "sezen@example.com"}},
+            {"user": {"name": "Patrick Barsanti", "email": "patrick@example.com"}},
+        ],
+    })
+    meeting = recover_meeting.inspect(meeting_dir, config)
+    meeting.jibri_metadata = recorded
+
+    assert recover_meeting.recover(
+        meeting, config, attribute=True, jicofo_logs=[log]
+    ) == 0
+
+    named = transcript.read_text(encoding="utf-8")
+    assert "[Sezen Tosunoğlu]: buongiorno a tutti" in named
+    assert "[Patrick Barsanti]: buongiorno" in named
+    # The metadata is left as it was: it names people, so nothing rewrites it,
+    # and it is what the mail is addressed from.
+    assert parse_metadata(meeting_dir)["recipients"] == [
+        "patrick@example.com",
+        "sezen@example.com",
+    ]
+
+
+def test_a_second_attribution_replaces_what_the_first_one_wrote(tmp_path: Path) -> None:
+    """A meeting attributed twice: the endpoint ids are gone by then.
+
+    The first run wrote what it had -- the addresses from the log -- and the
+    second has the names from the recording.  What the first run left in the
+    transcript is a label like any other, and it is only replaced in the
+    brackets the transcript uses: an address somebody spoke into the meeting
+    stays as they said it.
+    """
+    meeting_dir, config, log = _broken_meeting_without_a_recording(tmp_path, JICOFO_LOG)
+    transcript = _labelled_transcript(meeting_dir)
+    meeting = recover_meeting.inspect(meeting_dir, config)
+    assert recover_meeting.recover(
+        meeting, config, write=True, attribute=True, jicofo_logs=[log]
+    ) == 0
+    assert "[sezen]" in transcript.read_text(encoding="utf-8")
+    # Said out loud in the meeting, not a label: this must survive.
+    transcript.write_text(
+        transcript.read_text(encoding="utf-8")
+        + "the address is sezen@example.com, write to me\n",
+        encoding="utf-8",
+    )
+
+    recording = _jibri_metadata_file(tmp_path, {
+        "meeting_url": "https://jitsi.example.com/1ff2f1ff-4bab",
+        "participants": [
+            {"user": {"name": "Sezen Tosunoğlu", "email": "sezen@example.com"}},
+            {"user": {"name": "Patrick Barsanti", "email": "patrick@example.com"}},
+        ],
+    })
+    again = recover_meeting.inspect(meeting_dir, config)
+    again.jibri_metadata = recording
+    assert recover_meeting.recover(again, config, attribute=True, jicofo_logs=[log]) == 0
+
+    named = transcript.read_text(encoding="utf-8")
+    assert "[Sezen Tosunoğlu]" in named
+    assert "[sezen@example.com]" not in named
+    assert "the address is sezen@example.com, write to me" in named
+    # The file the first run kept is not overwritten by the second.
+    kept = meeting_dir / "transcript.txt.before-attribution"
+    assert "[participant-" in kept.read_text(encoding="utf-8")
+    # And what the first run wrote is itself replaced, not renamed into
+    # "[Sezen Tosunoğlu]" on top of an address left behind.
+    assert named.count("Sezen") == 1
+
+
+def _jibri_metadata_file(root: Path, document: dict) -> Path:
+    """One recording's metadata, somewhere the search does not look."""
+    directory = root / "elsewhere" / "jibri-session"
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / "metadata.json"
+    path.write_text(json.dumps(document), encoding="utf-8")
+    (directory / "1ff2f1ff-4bab_2026-10-13-09-47-21.mp4").write_bytes(b"\x00" * 64)
+    return path
+
+
+def test_the_recording_can_be_named_when_the_search_misses_it(
+    tmp_path: Path, capsys
+) -> None:
+    """--jibri-metadata, as it is actually used: the recording is on the host,
+    the search did not find it, and the file beside it has the names."""
+    meeting_dir, config, _log = _broken_meeting_without_a_recording(tmp_path, JICOFO_LOG)
+    recorded = _jibri_metadata_file(tmp_path, {
+        "meeting_url": "https://jitsi.example.com/1ff2f1ff-4bab",
+        "participants": [
+            {"user": {"name": "Sezen Tosunoğlu", "email": "sezen@example.com"}},
+            {"user": {"name": "Patrick Barsanti", "email": "patrick@example.com"}},
+        ],
+    })
+    settings = tmp_path / "config.ini"
+    settings.write_text(
+        f"[storage]\nrecordings_dir = {config.storage.recordings_dir}\n", encoding="utf-8"
+    )
+
+    status = recover_meeting.main([
+        str(meeting_dir),
+        "--config", str(settings),
+        "--jibri-metadata", str(recorded),
+        "--write",
+    ])
+
+    assert status == 0
+    assert "Sezen Tosunoğlu" in capsys.readouterr().out
+    assert parse_metadata(meeting_dir)["recipients"] == [
+        "patrick@example.com",
+        "sezen@example.com",
+    ]
+
+
 def test_a_jibri_metadata_that_is_not_an_object_is_refused(tmp_path: Path) -> None:
     """A recording's metadata is read, not believed: it is another program's file."""
     for raw in ("not json at all", "[1, 2]", '"a string"', "null"):
