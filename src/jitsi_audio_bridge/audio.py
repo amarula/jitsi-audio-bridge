@@ -599,6 +599,7 @@ def empty_metadata() -> dict[str, Any]:
         "recipients": [],
         "participants": [],
         "id_to_name": {},
+        "id_to_address": {},
     }
 
 
@@ -613,6 +614,10 @@ def parse_metadata_document(meta: dict[str, Any]) -> dict[str, Any]:
 
     recipients: list[str] = []
     id_to_name: dict[str, str] = {}
+    #: Which participant id belongs to which address.  The join a deployment
+    #: that authenticates its users needs: the id is what the recordings are
+    #: named after and the address is all that is known about the person.
+    id_to_address: dict[str, str] = {}
     seen_participants: set[str] = set()
 
     # An empty table in Lua encodes as {} rather than [] -- the companion
@@ -652,6 +657,8 @@ def parse_metadata_document(meta: dict[str, Any]) -> dict[str, Any]:
             # address rather than the opaque participant id.
             if name:
                 id_to_name[clean] = name
+            if isinstance(participant_id, str) and participant_id:
+                id_to_address[participant_id] = clean
             _add_participant(info["participants"], seen_participants, name, clean)
 
         if isinstance(participant_id, str) and participant_id and name:
@@ -672,6 +679,7 @@ def parse_metadata_document(meta: dict[str, Any]) -> dict[str, Any]:
 
     info["recipients"] = sorted(recipients)
     info["id_to_name"] = id_to_name
+    info["id_to_address"] = id_to_address
     return info
 
 

@@ -332,13 +332,15 @@ def display_name_of(identity: str) -> str:
 
 
 def names_for_labels(
-    meeting: Meeting, mapping: dict[str, str]
+    meeting: Meeting, mapping: dict[str, str], stated: dict[str, str] | None = None
 ) -> tuple[dict[str, str], set[str]]:
     """What each endpoint is called, and which of them have no name at all.
 
-    Every source that holds a name is asked: the meeting's own metadata, and
-    the recording's, which is where the names are when the deployment
-    authenticates its users -- Jibri writes what Mattermost told it.  What the
+    Every source that holds a name is asked: the meeting's own metadata, the
+    recording's -- which is where the names are when the deployment
+    authenticates its users, since Jibri writes what Mattermost told it -- and
+    then the ``[names]`` section, for a deployment whose identities are
+    addresses and which has nowhere else to say who somebody is.  What the
     meeting already says wins, because a name recovered earlier was recovered
     from a source that knew more.
 
@@ -355,7 +357,7 @@ def names_for_labels(
     names: dict[str, str] = {}
     invented: set[str] = set()
     for endpoint, who in mapping.items():
-        name = known.get(who) or known.get(endpoint)
+        name = known.get(who) or known.get(endpoint) or (stated or {}).get(who.lower())
         if name:
             names[endpoint] = name
         else:
@@ -539,7 +541,7 @@ def recover(
         logger.warning("no recipients: the mail would go to the fallback address")
 
     if mapping:
-        names, unnamed = names_for_labels(meeting, mapping)
+        names, unnamed = names_for_labels(meeting, mapping, config.names)
         print("\nendpoint id   who Jicofo saw       (this is what the labels are named after)")
         for endpoint, who in sorted(mapping.items()):
             note = ""

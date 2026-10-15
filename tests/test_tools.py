@@ -924,6 +924,36 @@ def _jibri_metadata_file(root: Path, document: dict) -> Path:
     return path
 
 
+def test_a_name_the_configuration_states_is_used(tmp_path: Path) -> None:
+    """The last source, and the only one some deployments have.
+
+    Where the identities are the addresses people authenticate as and no
+    recording is left to take names from, the operator says who they are --
+    once, in [names] -- and every recovery and every transcript uses it.
+    """
+    from dataclasses import replace
+
+    meeting_dir, config, log = _broken_meeting_without_a_recording(tmp_path, JICOFO_LOG)
+    transcript = _labelled_transcript(meeting_dir)
+    config = replace(
+        config,
+        names={
+            "michael@amarulasolutions.com": "Michael Trimarchi",
+            "sezen@example.com": "Sezen Tosunoğlu",
+        },
+    )
+    meeting = recover_meeting.inspect(meeting_dir, config)
+
+    assert recover_meeting.recover(
+        meeting, config, write=True, attribute=True, jicofo_logs=[log]
+    ) == 0
+
+    named = transcript.read_text(encoding="utf-8")
+    assert "[Sezen Tosunoğlu]: buongiorno a tutti" in named
+    # Nothing stated about this one, so the address is shortened instead.
+    assert "[patrick]: buongiorno" in named
+
+
 def test_the_recording_can_be_named_when_the_search_misses_it(
     tmp_path: Path, capsys
 ) -> None:

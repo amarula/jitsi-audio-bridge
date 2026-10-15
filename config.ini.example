@@ -203,3 +203,16 @@ footer = Generated entirely on-premise on our private Debian infrastructure. No 
 ; How many speaking turns the mail shows before it defers to the attached
 ; transcript. 0 sends no preview at all.
 preview_turns = 10
+
+[names]
+; What the people are called, when nothing else can say.  A deployment that
+; authenticates its users gives the bridge the address they authenticated as
+; and no display name anywhere: Jicofo's log has none, and neither has a
+; meeting whose companion module wrote nobody.  The transcript would then name
+; the speakers by that address.
+;
+; The key is the address (anything the log spells, in any case) or the
+; participant id a recording is named after; the value is the name.
+;
+; michael@amarulasolutions.com = Michael Trimarchi
+; sezen@amarulasolutions.com = Sezen Tosunoğlu

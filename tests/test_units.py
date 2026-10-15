@@ -1080,6 +1080,54 @@ def test_load_config_uses_defaults_when_no_file_is_found(
     assert config.mail.html is True
     assert config.mail.stylesheet is None
     assert config.mail.preview_turns == 10
+    assert config.names == {}
+
+
+def test_the_names_section_says_who_people_are(
+    tmp_path: Path, clean_env: None
+) -> None:
+    """For a deployment whose identities are addresses and nothing else."""
+    path = tmp_path / "config.ini"
+    path.write_text(
+        "[names]\n"
+        "Michael@AmarulaSolutions.com = Michael Trimarchi\n"
+        "sezen@amarulasolutions.com = Sezen Tosunoğlu\n"
+        "\n"
+        "[names.mattermost]\n"          # a value with an @ is not a person
+        "unused@example.com = \n",
+        encoding="utf-8",
+    )
+    config = load_config(path)
+
+    # Keys are addresses, and an address has no case: the section is read the
+    # way configparser reads it, which is lower-cased.
+    assert config.names == {
+        "michael@amarulasolutions.com": "Michael Trimarchi",
+        "sezen@amarulasolutions.com": "Sezen Tosunoğlu",
+    }
+
+
+def test_a_stated_name_names_the_speaker(clean_env: None) -> None:
+    """The join the daemon needs: id to address, address to name."""
+    config = load_config()
+    stated = replace(
+        config, names={"michael@amarulasolutions.com": "Michael Trimarchi"}
+    )
+    metadata = {
+        "id_to_name": {},
+        "id_to_address": {"76e96806": "Michael@AmarulaSolutions.com"},
+    }
+
+    assert daemon_module.speaker_names(metadata, stated) == {
+        "76e96806": "Michael Trimarchi",
+        "Michael@AmarulaSolutions.com": "Michael Trimarchi",
+    }
+    # Nothing said about them, and nothing said at all: the metadata decides,
+    # which is the file's own name when the metadata knows nothing either.
+    assert daemon_module.speaker_names(metadata, config) == {}
+    assert daemon_module.speaker_names(
+        {"id_to_name": {"76e96806": "From the room"}}, stated
+    ) == {"76e96806": "From the room"}
 
 
 def test_the_mail_section_can_rebrand_and_can_be_switched_off(

@@ -66,6 +66,7 @@ and emails the result.
 | Ollama | Any HTTP endpoint accepting the `/api/generate` request shape |
 | SMTP | Any relay |
 | S3 | Optional: any S3-compatible endpoint, and Jibri's recordings directory readable — see [`[s3]`](#s3) |
+| Names | Naming the speakers a deployment only knows by address — `[names]` in `config.ini` |
 
 ffmpeg is **not** required. Audio is decoded in-process through libopus, which
 is both faster and less fragile than piping packets to a subprocess.
@@ -927,11 +928,20 @@ JitsiMeetConferenceImpl.onMemberJoined#873: Member joined:76e96806 stats-id=seze
 
 `--attribute` reads those lines for this meeting — plain or gzipped, and
 scoped by meeting id so another meeting's participants cannot leak in — turns
-each address into the name recovered from Jibri, and renames the labels in the
-transcript, the corrected transcript and the summary. The spoken text is not
-touched, and the files it changes are left beside themselves as
-`*.before-attribution`. Without the flag it prints the mapping and changes
-nothing.
+each address into the name the recording's metadata has for it, and renames
+the labels in the transcript, the corrected transcript and the summary. The
+spoken text is not touched, and the files it changes are left beside
+themselves as `*.before-attribution`. Without the flag it prints the mapping
+and changes nothing — and says which of the people no source names, because
+those are the labels that will be their address.
+
+Where a name comes from, in order: the meeting's own metadata, the recording's
+metadata (`--jibri-metadata PATH`, for a recording the search does not find),
+the `[names]` section, and only then the address itself, shortened to the part
+before the `@`. `--attribute` can be run again after any of them changes: what
+an earlier run wrote is a label too, and is replaced — in the brackets the
+transcript uses, so an address somebody dictates into the meeting is left as
+they said it.
 
 One thing it cannot do is a meeting whose transcript is missing: that needs
 `jitsi-audio-bridge --process-dir`, which costs what it costs. And when the
