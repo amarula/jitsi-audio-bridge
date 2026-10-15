@@ -353,7 +353,7 @@ What happens between pushing the tag and holding a package:
    publishes what was verified, never a separate build of its own.
 3. **version** fails the run if the tag and `__version__` disagree, before
    anything is published. The message names both: `tag v0.2.0 does not match
-   __version__ 0.1.0 (expected v0.1.0)`. Nothing is released, and deleting the
+   __version__ 0.1.1 (expected v0.1.1)`. Nothing is released, and deleting the
    tag (`git push --delete origin v0.2.0`) leaves no trace to clean up.
 4. **release** collects the four `.deb`s that the package jobs produced in that
    same run and creates the release with `gh release create`, using the
