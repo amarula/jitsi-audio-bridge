@@ -287,6 +287,29 @@ def extract_media_json_vad(event: dict[str, Any]) -> bool | None:
     return vad if isinstance(vad, bool) else None
 
 
+def match_directory_owner(target: Path) -> None:
+    """Let what is written for a meeting belong to whoever owns the meeting.
+
+    The file is made by ``mkstemp`` -- 0600, owned by the process that ran the
+    write -- and the recovery tool is normally run with sudo.  A
+    ``metadata.json`` the service cannot read is a meeting the service cannot
+    process: the room name in it is what a recording is matched against, and
+    the participants are what the mail is addressed to.  Nothing to do when
+    the two already agree, which is every write the daemon itself makes.
+
+    Never raises: this is about who owns a file, and the file is already
+    written by the time it is asked.
+    """
+    try:
+        directory = target.parent.stat()
+        written = target.stat()
+        if (written.st_uid, written.st_gid) == (directory.st_uid, directory.st_gid):
+            return
+        os.chown(target, directory.st_uid, directory.st_gid)
+    except OSError as exc:
+        logger.warning("cannot give %s the owner of its directory: %s", target, exc)
+
+
 def _names_somebody_on_disk(target: Path) -> bool:
     """Whether the metadata already stored for a meeting names anybody."""
     try:
@@ -341,6 +364,7 @@ def write_metadata(meeting_dir: Path, raw: str) -> bool:
         with os.fdopen(handle_fd, "w", encoding="utf-8") as handle:
             json.dump(data, handle, ensure_ascii=False)
         os.replace(temporary, target)
+        match_directory_owner(target)
     except OSError as exc:
         logger.error("cannot write %s: %s", target, exc)
         if temporary is not None:

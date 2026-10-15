@@ -60,7 +60,11 @@ from jitsi_audio_bridge.audio import (
     parse_metadata_document,
 )
 from jitsi_audio_bridge.config import Config, ConfigError, load_config
-from jitsi_audio_bridge.daemon import session_started_at, write_metadata
+from jitsi_audio_bridge.daemon import (
+    match_directory_owner,
+    session_started_at,
+    write_metadata,
+)
 from jitsi_audio_bridge.mailer import send_meeting_email
 from jitsi_audio_bridge.s3_upload import find_meeting_metadata, upload_meeting_video
 from jitsi_audio_bridge.timeline import SessionTimeline
@@ -396,6 +400,7 @@ def recover(
                 current = meeting.path / METADATA_FILENAME
                 if current.is_file() and not backup.exists():
                     shutil.copy2(current, backup)
+                    match_directory_owner(backup)
                     print(f"  kept        {backup.name}")
                 written = write_metadata(
                     meeting.path, meeting.jibri_metadata.read_text(encoding="utf-8")
@@ -432,6 +437,7 @@ def recover(
                 current = meeting.path / METADATA_FILENAME
                 if current.is_file() and not backup.exists():
                     shutil.copy2(current, backup)
+                    match_directory_owner(backup)
                     print(f"  kept        {backup.name}")
                 if not write_metadata(meeting.path, document):
                     return 1

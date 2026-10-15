@@ -391,6 +391,26 @@ def test_write_metadata_reports_a_missing_directory(tmp_path: Path) -> None:
     assert not write_metadata(tmp_path / "missing", json.dumps({"room_name": "Standup"}))
 
 
+@pytest.mark.skipif(
+    os.geteuid() != 0, reason="handing a file to another owner takes root"
+)
+def test_metadata_written_for_a_meeting_belongs_to_the_meeting(tmp_path: Path) -> None:
+    """The recovery runs with sudo, and this is the file it writes.
+
+    A metadata.json the service cannot read is a meeting it cannot process --
+    the room name in it is what a recording is matched against -- and the
+    daemon's writes come from mkstemp, which is 0600 and owned by whoever ran
+    it.  So what is written takes the owner of the meeting directory.
+    """
+    meeting = tmp_path / "recordings" / "abcd"
+    meeting.mkdir(parents=True)
+    os.chown(meeting, 1000, 1000)
+
+    assert write_metadata(meeting, json.dumps({"room_name": "Standup"}))
+    stored = (meeting / "metadata.json").stat()
+    assert (stored.st_uid, stored.st_gid) == (1000, 1000)
+
+
 # --------------------------------------------------------------------------
 # Metadata parsing
 # --------------------------------------------------------------------------
