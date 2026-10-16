@@ -947,6 +947,134 @@ def test_the_link_is_written_in_the_meetings_language(monkeypatch) -> None:
     assert f"Registrazione (disponibile fino al {day}):" in body
 
 
+def test_the_language_is_judged_on_the_whole_meeting() -> None:
+    """Not on its first 1500 characters, which is where the artefacts live.
+
+    Speech recognition invents lines over silence -- in languages nobody in
+    the call was speaking -- and a meeting opens with silence.  A call that was
+    90% English, read from its beginning alone, can be judged on the part of
+    it that was not, and the answer is then handed to the correction pass as
+    the language to keep the transcript in.
+    """
+    from jitsi_audio_bridge.ai_client import language_sample
+
+    opening = "[00:00:00] michael: Obrigado. Obrigado.\n" * 40
+    body = "".join(
+        f"[00:00:{minute:02d}] sezen: and this is the English discussion, "
+        f"line {minute} of the meeting\n"
+        for minute in range(60)
+    )
+    sample = language_sample(opening + body)
+
+    assert "English discussion" in sample
+    assert sample.index("English discussion") > len(opening) // 2 or "[...]" in sample
+    # The tags are not what the question is about: they are dropped so the
+    # budget is spent on what was said.
+    assert "[00:00:05]" not in sample and "sezen:" not in sample
+    # Both forms the transcript is rendered in.
+    assert language_sample("[Ada]: hello\n").strip() == "hello"
+
+    # Short enough to be shown whole, and then it is shown whole.
+    small = "[Ada]: buongiorno a tutti\n[Bruno]: buongiorno\n"
+    assert language_sample(small) == "buongiorno a tutti\nbuongiorno"
+
+
+@pytest.mark.parametrize(
+    ("reply", "expected"),
+    [
+        ("Italian", "Italian"),
+        ('"Portuguese"', "Portuguese"),
+        ("English.", "English"),
+        # A sentence is not a language, and this one is the wrong language: the
+        # fallback says so and the meeting is summarised in English.
+        ("The transcript is written in Italian because the speakers", "English"),
+        ("", "English"),
+    ],
+)
+def test_a_language_that_is_a_sentence_is_not_taken(
+    monkeypatch: pytest.MonkeyPatch, reply: str, expected: str
+) -> None:
+    """The answer becomes the language the summary is written in.
+
+    A model that answers with a paragraph has not answered the question, and
+    saying so beats mailing a meeting in a language nobody asked for.  What
+    the prompt asks for -- a word or two -- is kept as it is.
+    """
+    from jitsi_audio_bridge import ai_client
+
+    class Response:
+        status_code = 200
+
+        @staticmethod
+        def raise_for_status() -> None: ...
+
+        @staticmethod
+        def json() -> dict:
+            return {"response": reply}
+
+    monkeypatch.setattr(ai_client.requests, "post", lambda *a, **kw: Response())
+    endpoint = replace(load_config().ollama, model="test")
+    assert ai_client.detect_language("[Ada]: ciao", endpoint) == expected
+
+
+def test_the_language_question_is_asked_with_the_sample(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The wiring: what the model is shown is what language_sample returns.
+
+    Sampling the whole meeting is no use if the question still carries the
+    first 1500 characters -- which is what it carried before, and what the
+    test above cannot see, since it tests the sampling and not the asking.
+    """
+    from jitsi_audio_bridge import ai_client
+
+    seen: dict = {}
+
+    class Response:
+        status_code = 200
+
+        @staticmethod
+        def raise_for_status() -> None: ...
+
+        @staticmethod
+        def json() -> dict:
+            return {"response": "English"}
+
+    def post(url: str, **kwargs: object) -> Response:
+        seen["prompt"] = kwargs["json"]["prompt"]
+        return Response()
+
+    monkeypatch.setattr(ai_client.requests, "post", post)
+    transcript = (
+        "[00:00:00] michael: Obrigado. Obrigado.\n" * 60
+        + "".join(f"[00:01:{minute:02d}] sezen: the English part, line {minute}\n"
+                  for minute in range(59))
+        + "[00:02:00] michael: and the closing words in English\n"
+    )
+    ai_client.detect_language(transcript, replace(load_config().ollama, model="test"))
+
+    assert "the English part, line 30" in seen["prompt"]
+    assert "the closing words in English" in seen["prompt"]
+    # And the speaker tags are not what the question is about.
+    assert "sezen:" not in seen["prompt"]
+
+
+def test_the_correction_pass_is_told_not_to_translate() -> None:
+    """A wrong language must not become a translated meeting.
+
+    The pass is given the language the detector named, and it repairs each
+    line *in that language* -- so an answer that was wrong once turned an
+    English transcript into Portuguese, headings and all.  It now repairs each
+    line in the language it is written in and translates nothing.
+    """
+    from jitsi_audio_bridge.ai_client import build_correction_prompt
+
+    prompt = build_correction_prompt("[Ada]: hello there", "Portuguese")
+    assert "Never translate" in prompt
+    assert "in the language it is written in" in prompt
+    assert "mostly in Portuguese" in prompt
+
+
 def test_a_meeting_with_no_recording_says_nothing_about_one(monkeypatch) -> None:
     body, _ = _mailed_body(monkeypatch, language="english")
     assert "Recording" not in body

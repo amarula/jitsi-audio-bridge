@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import base64
 import logging
+import re
 import threading
 import time
 from pathlib import Path
@@ -28,9 +29,22 @@ from .config import EndpointConfig, OllamaConfig
 
 logger = logging.getLogger(__name__)
 
-#: Only this much of a transcript is sent when asking Ollama for the language;
-#: the answer is stable long before the end of the meeting.
+#: How much of a transcript is shown when asking Ollama for the language, per
+#: slice.  The whole of a short meeting; for a long one, this much from the
+#: start, the middle and the end.
+#:
+#: Only the start was read once, on the reasoning that the answer settles early
+#: -- and the start of a meeting is where speech recognition invents lines over
+#: silence, in languages nobody in the call was speaking.  A meeting that was
+#: 90% English could be judged on the part of it that was not, and the answer
+#: then told the correction pass which language to keep the transcript in.
 _LANGUAGE_SAMPLE_CHARS = 1500
+_LANGUAGE_SAMPLE_SLICES = 3
+
+#: ``[00:00:12] speaker: `` and ``[speaker]: `` -- the tags the transcript is
+#: rendered with, which are not what the question is about.
+_TRANSCRIPT_OFFSET = re.compile(r"^\s*\[\d[\d:.]*\]\s*")
+_TRANSCRIPT_SPEAKER = re.compile(r"^(?:\[[^\]\n]{1,60}\]|[^:\n]{1,60}):\s*")
 
 #: A 5xx answer means the service is there but not serving — restarting,
 #: reloading a model, or waiting for the GPU its model shares — and the same
@@ -174,6 +188,30 @@ def transcribe_audio(wav_path: str | Path, endpoint: EndpointConfig) -> str:
     return (body.get("text") or "").strip()
 
 
+def language_sample(transcript_text: str) -> str:
+    """What to show the model when asking which language a meeting is in.
+
+    The speaker tags are dropped, so the budget is spent on what was said, and
+    a long meeting is sampled from three places rather than from its beginning
+    alone.  Gaps are marked, because three slices read as one text otherwise.
+    """
+    spoken = "\n".join(
+        _TRANSCRIPT_SPEAKER.sub("", _TRANSCRIPT_OFFSET.sub("", line))
+        for line in transcript_text.splitlines()
+    ).strip()
+
+    budget = _LANGUAGE_SAMPLE_CHARS
+    if len(spoken) <= budget * _LANGUAGE_SAMPLE_SLICES:
+        return spoken
+
+    starts = [
+        0,
+        (len(spoken) - budget) // 2,
+        len(spoken) - budget,
+    ]
+    return "\n[...]\n".join(spoken[start:start + budget] for start in starts)
+
+
 def detect_language(transcript_text: str, endpoint: OllamaConfig) -> str:
     """Ask Ollama which language a transcript is written in.
 
@@ -188,12 +226,16 @@ def detect_language(transcript_text: str, endpoint: OllamaConfig) -> str:
     # reproduced exactly, and no source line has to be unreasonably long.
     prompt = (
         "Identify the primary language spoken in the following transcript text.\n"
+        "Judge by the language most of the text is written in. A few lines in "
+        "some other language, or single words in one, are transcription "
+        "artefacts: they are what speech recognition invents over silence, and "
+        "they are not the language of the conversation.\n"
         "Return ONLY the English name of the language "
         "(for example: English, Italian, French, German, Spanish).\n"
         "Do NOT write explanations. Do NOT include quotes or punctuation.\n"
         "\n"
         "Transcript sample:\n"
-        f"{transcript_text[:_LANGUAGE_SAMPLE_CHARS]}\n"
+        f"{language_sample(transcript_text)}\n"
     )
     payload = {
         "model": endpoint.model,
@@ -210,6 +252,17 @@ def detect_language(transcript_text: str, endpoint: OllamaConfig) -> str:
 
     if not detected:
         logger.warning("language detection returned nothing, assuming English")
+        return "English"
+    # A language is a word or two.  Anything else is an answer to a question
+    # the model decided to rewrite -- "the transcript is written in ..." is
+    # still usable, a paragraph is not, and a language that is a sentence
+    # would be handed to the summariser as the one to write the meeting in.
+    if len(detected) > 40 or any(mark in detected for mark in ".\n!?"):
+        logger.warning(
+            "language detection answered %.60r, which is not a language; "
+            "assuming English",
+            detected,
+        )
         return "English"
     logger.info("detected transcript language: %s", detected)
     return detected
@@ -236,6 +289,10 @@ def build_summary_prompt(transcript_text: str, room_name: str, participants: lis
         "\n"
         "STRICT LANGUAGE RULE:\n"
         f"- Target Language: {language.upper()}\n"
+        "- The transcript may contain a few lines or single words in another "
+        "language. Those are transcription artefacts, not something anybody "
+        "said in the meeting: do not write the summary in their language and do "
+        "not report them as discussion.\n"
         f"- Write 100% of the output in {language}.\n"
         "- All section titles, headers, bullet points, and descriptions MUST be in "
         f"{language}.\n"
@@ -292,7 +349,7 @@ def build_correction_prompt(chunk: str, language: str) -> str:
     """
     return (
         "You are editing a meeting transcript for grammar and wording. "
-        f"The transcript is in {language}; keep it in {language}.\n"
+        f"The conversation is mostly in {language}.\n"
         "\n"
         "RULES:\n"
         "- Keep every speaker tag exactly as it is, at the start of its line: "
@@ -304,6 +361,9 @@ def build_correction_prompt(chunk: str, language: str) -> str:
         "- Where the intended word is not clear, leave what is written alone "
         "rather than inventing a replacement.\n"
         "- Do not summarise, do not comment, do not add headings.\n"
+        f"- Repair each line in the language it is written in. Never translate a "
+        f"line, into {language} or out of it; a line in another language is left "
+        "as it is.\n"
         "\n"
         "Reply with the corrected transcript only.\n"
         "\n"
