@@ -796,7 +796,9 @@ class VideoJob:
         return self._link
 
 
-def process_completed_session(meeting_dir: Path, config: Config) -> bool:
+def process_completed_session(
+    meeting_dir: Path, config: Config, *, language: str | None = None
+) -> bool:
     """Transcribe, summarise and email one finished meeting.
 
     Works on either shape of meeting directory: one recording per participant,
@@ -870,8 +872,10 @@ def process_completed_session(meeting_dir: Path, config: Config) -> bool:
 
         # Detected once, then given to both: the summary is written in it and
         # the mail around the summary follows it, so the two read in one
-        # language.
-        language = detect_language(transcript, config.ollama)
+        # language.  A caller that states it -- ``--process-dir --language``
+        # -- is believed instead: a meeting whose language is known is not
+        # worth a guess.
+        language = language or detect_language(transcript, config.ollama)
 
         # An optional pass over the transcript before it is summarised: speech
         # recognition mishears words, and the model that reads the whole
@@ -952,7 +956,9 @@ def process_completed_session(meeting_dir: Path, config: Config) -> bool:
             video.result()
 
 
-def process_directory(meeting_dir: Path, config: Config) -> int:
+def process_directory(
+    meeting_dir: Path, config: Config, *, language: str | None = None
+) -> int:
     """Process one meeting directory that already exists on disk.
 
     The batch counterpart to the WebSocket server, for recordings produced by
@@ -963,7 +969,7 @@ def process_directory(meeting_dir: Path, config: Config) -> int:
         return 2
 
     try:
-        sent = process_completed_session(meeting_dir, config)
+        sent = process_completed_session(meeting_dir, config, language=language)
     except Exception:
         logger.exception("processing failed for %s", meeting_dir)
         return 1
@@ -1481,6 +1487,15 @@ def build_argument_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--language",
+        metavar="NAME",
+        help=(
+            "the language the summary is written in, skipping the detection call "
+            "(English, Italian, ...); with --process-dir, and for a meeting whose "
+            "language the model keeps getting wrong"
+        ),
+    )
+    parser.add_argument(
         "--process-dir",
         metavar="PATH",
         help=(
@@ -1529,7 +1544,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     if args.process_dir is not None:
-        return process_directory(Path(args.process_dir), config)
+        return process_directory(Path(args.process_dir), config, language=args.language)
 
     if args.upload_video is not None:
         return upload_directory_video(Path(args.upload_video), config)

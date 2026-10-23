@@ -194,6 +194,42 @@ def transcribe_audio(wav_path: str | Path, endpoint: EndpointConfig) -> str:
     return (body.get("text") or "").strip()
 
 
+#: Scripts that are the same writing system for this purpose.  A summary is
+#: allowed to use more kana than the meeting did; it is not allowed to arrive
+#: in Chinese characters when the meeting was written in Latin letters.
+_SCRIPT_FAMILY = {
+    "CJK": "cjk",
+    "HIRAGANA": "cjk",
+    "KATAKANA": "cjk",
+    "HANGUL": "cjk",
+    "BOPOMOFO": "cjk",
+}
+
+
+def script_family(script: str | None) -> str | None:
+    """The writing system a script belongs to, coarse enough to compare."""
+    if script is None:
+        return None
+    return _SCRIPT_FAMILY.get(script, script.lower())
+
+
+def came_back_in_another_script(output: str, source: str) -> bool:
+    """Whether a model's answer is written in a different script than its input.
+
+    The last thing that was not checked: a summary or a corrected chunk was
+    taken as written, and a model that answered in Chinese to an English
+    question produced a Chinese mail -- with every other link in the chain
+    saying English.
+    """
+    produced = dominant_script(output)
+    original = dominant_script(source)
+    if produced is None or original is None:
+        return False
+    if produced[1] < _SCRIPT_SHARE_OF_TRUTH or original[1] < _SCRIPT_SHARE_OF_TRUTH:
+        return False
+    return script_family(produced[0]) != script_family(original[0])
+
+
 def language_sample(transcript_text: str) -> str:
     """What to show the model when asking which language a meeting is in.
 
@@ -585,6 +621,18 @@ def correct_transcript(
         if not piece:
             logger.error("correction of chunk %d/%d produced nothing", index, len(chunks))
             return ""
+        if came_back_in_another_script(piece, chunk):
+            # Not a correction: the model answered in another language, and
+            # what it wrote is not what was said.  The raw chunk is, so it is
+            # the one that is kept -- the transcript is never made worse by
+            # this pass.
+            logger.warning(
+                "correction of chunk %d/%d came back in another script; "
+                "keeping that chunk as transcribed",
+                index,
+                len(chunks),
+            )
+            piece = chunk
         corrected.append(piece)
 
     logger.info("corrected %d chunk(s) of the transcript", len(corrected))
@@ -622,4 +670,32 @@ def generate_summary(
     if not isinstance(body, dict):
         logger.error("ollama returned %s, expected a JSON object", type(body).__name__)
         return ""
-    return (body.get("response") or "").strip()
+
+    summary = (body.get("response") or "").strip()
+    if came_back_in_another_script(summary, transcript_text):
+        logger.warning(
+            "the summary came back in another script than the transcript; asking again"
+        )
+        retry = _post_json(
+            endpoint.url,
+            {
+                "model": endpoint.model,
+                "prompt": prompt
+                + "\n\nThe previous attempt was written in the wrong language. "
+                f"Write this summary in {language}, and in no other language.",
+                "stream": False,
+                "options": {"temperature": 0.0},
+            },
+            endpoint,
+        )
+        if isinstance(retry, dict) and (retry.get("response") or "").strip():
+            second = str(retry["response"]).strip()
+            if came_back_in_another_script(second, transcript_text):
+                logger.error(
+                    "the summary is not in %s and the model will not write it so; "
+                    "it is being mailed as it came",
+                    language,
+                )
+            return second
+        logger.error("ollama produced no summary on the second attempt")
+    return summary

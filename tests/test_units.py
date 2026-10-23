@@ -1199,6 +1199,75 @@ def test_an_answer_that_keeps_contradicting_the_letters_falls_back(
     assert ai_client.detect_language(transcript, endpoint) == "English"
 
 
+def test_a_summary_that_comes_back_in_another_script_is_asked_again(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The last unchecked link: what the model hands back.
+
+    The detector says English, the corrector is told not to translate -- and
+    the summariser answers in Chinese anyway.  Nothing looked at the reply, so
+    a Chinese summary of an English meeting went out with every decision in
+    the log reading English.
+    """
+    from jitsi_audio_bridge import ai_client
+
+    replies = iter([
+        "会议讨论了测试流程，主要问题是B帧。",
+        "The meeting discussed the test procedure.",
+    ])
+    prompts: list[str] = []
+
+    class Response:
+        status_code = 200
+
+        @staticmethod
+        def raise_for_status() -> None: ...
+
+        @classmethod
+        def json(cls) -> dict:
+            return {"response": next(replies)}
+
+    def post(url: str, **kwargs: object) -> Response:
+        prompts.append(kwargs["json"]["prompt"])
+        return Response()
+
+    monkeypatch.setattr(ai_client.requests, "post", post)
+    transcript = "[Ada]: we need to test the B frames in the encoder\n" * 20
+
+    summary = ai_client.generate_summary(
+        transcript, "Weekly", ["Ada"], replace(load_config().ollama, model="t"),
+        language="English",
+    )
+
+    assert summary.startswith("The meeting discussed")
+    assert len(prompts) == 2
+    assert "written in the wrong language" in prompts[1]
+
+
+def test_a_corrected_chunk_that_comes_back_translated_is_not_used(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A translation is not a correction, and the raw chunk is what was said."""
+    from jitsi_audio_bridge import ai_client
+
+    monkeypatch.setattr(
+        ai_client.requests,
+        "post",
+        lambda *a, **kw: type("R", (), {
+            "status_code": 200,
+            "raise_for_status": staticmethod(lambda: None),
+            "json": staticmethod(lambda: {"response": "会议讨论了测试流程。"}),
+        })(),
+    )
+    raw = "[Ada]: we need to test the B frames in the encoder\n" * 20
+
+    corrected = ai_client.correct_transcript(
+        raw, replace(load_config().ollama, model="t"), language="English"
+    )
+
+    assert corrected == raw.strip()
+
+
 def test_the_correction_pass_is_told_not_to_translate() -> None:
     """A wrong language must not become a translated meeting.
 
