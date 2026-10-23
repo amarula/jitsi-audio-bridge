@@ -1244,6 +1244,57 @@ def test_a_summary_that_comes_back_in_another_script_is_asked_again(
     assert "written in the wrong language" in prompts[1]
 
 
+def test_a_summary_the_model_will_not_retranslate_is_translated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regenerating in the language is not the only way to get it.
+
+    A model that answers in Chinese however it is asked may still translate
+    into English, which is a different task and the one these models do best.
+    The reply that comes back is the summary the mail carries.
+    """
+    from jitsi_audio_bridge import ai_client
+
+    chinese = "会议讨论了测试流程，主要问题是B帧。"
+    replies = iter([chinese, chinese, "The meeting discussed the test procedure."])
+    prompts: list[str] = []
+
+    class Response:
+        status_code = 200
+
+        @staticmethod
+        def raise_for_status() -> None: ...
+
+        @classmethod
+        def json(cls) -> dict:
+            return {"response": next(replies)}
+
+    def post(url: str, **kwargs: object) -> Response:
+        prompts.append(kwargs["json"]["prompt"])
+        return Response()
+
+    monkeypatch.setattr(ai_client.requests, "post", post)
+    transcript = "[Ada]: we need to test the B frames in the encoder\n" * 20
+
+    summary = ai_client.generate_summary(
+        transcript, "Weekly", ["Ada"], replace(load_config().ollama, model="t"),
+        language="English",
+    )
+
+    assert summary.startswith("The meeting discussed")
+    assert len(prompts) == 3
+    assert prompts[2].startswith("Translate the following text into English")
+    assert chinese in prompts[2]
+
+
+def test_the_summary_prompt_forbids_inventing_content() -> None:
+    """The other half of what went wrong: a summary full of code nobody wrote."""
+    from jitsi_audio_bridge.ai_client import build_summary_prompt
+
+    prompt = build_summary_prompt("[Ada]: hello", "Weekly", ["Ada"], "English")
+    assert "Do not invent examples, code, quotations or decisions" in prompt
+
+
 def test_a_corrected_chunk_that_comes_back_translated_is_not_used(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

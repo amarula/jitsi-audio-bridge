@@ -477,6 +477,11 @@ def build_summary_prompt(transcript_text: str, room_name: str, participants: lis
         "- You MUST attribute discussion points, proposals, and action items directly "
         "to the correct speaker named in the transcript tags.\n"
         "\n"
+        "STRICT CONTENT RULE:\n"
+        "- Report only what the transcript says. Do not invent examples, code, "
+        "quotations or decisions that are not in it, and do not illustrate a "
+        "point with something the speakers did not mention.\n"
+        "\n"
         "STRICT LANGUAGE RULE:\n"
         f"- Target Language: {language.upper()}\n"
         "- The transcript may contain a few lines or single words in another "
@@ -690,12 +695,56 @@ def generate_summary(
         )
         if isinstance(retry, dict) and (retry.get("response") or "").strip():
             second = str(retry["response"]).strip()
-            if came_back_in_another_script(second, transcript_text):
-                logger.error(
-                    "the summary is not in %s and the model will not write it so; "
-                    "it is being mailed as it came",
+            if not came_back_in_another_script(second, transcript_text):
+                return second
+            # A model that will not write in the language it was asked for may
+            # still translate into it: that is a different task, and the one
+            # these models are best at.  The mail is worth the extra call.
+            translated = _translate(endpoint, second, language, expected=transcript_text)
+            if translated:
+                logger.warning(
+                    "the summary was written in another language; the %s it carries "
+                    "is a translation",
                     language,
                 )
+                return translated
+            logger.error(
+                "the summary is not in %s and the model will not write it so; "
+                "it is being mailed as it came",
+                language,
+            )
             return second
         logger.error("ollama produced no summary on the second attempt")
     return summary
+
+
+def _translate(
+    endpoint: OllamaConfig, text: str, language: str, *, expected: str
+) -> str:
+    """The text, in *language* -- or ``""`` if the model would not.
+
+    *expected* is what the language looks like: the transcript, whose script
+    the translation has to be written in.  Comparing the translation with the
+    text being translated would call every translation a failure.
+    """
+    body = _post_json(
+        endpoint.url,
+        {
+            "model": endpoint.model,
+            "prompt": (
+                f"Translate the following text into {language}. "
+                "Keep its structure, its headings and its list items. "
+                "Reply with the translation only, in "
+                f"{language} and in no other language.\n\n{text}"
+            ),
+            "stream": False,
+            "options": {"temperature": 0.0},
+        },
+        endpoint,
+    )
+    if not isinstance(body, dict):
+        return ""
+    translated = str(body.get("response") or "").strip()
+    if not translated or came_back_in_another_script(translated, expected):
+        return ""
+    return translated
