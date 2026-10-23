@@ -831,6 +831,72 @@ def slice_wav(
     return destination_path
 
 
+#: Where speech lives, roughly, and where it does not.  One-pole filters are
+#: enough: the question is whether a slice holds speech or the near-silence
+#: that speech recognition fills with words of its own -- "Thank you",
+#: "Obrigado", "Спасибо" -- not what its spectrum is.
+_VOICE_BAND_LOW_HZ = 300.0
+_VOICE_BAND_HIGH_HZ = 3400.0
+
+
+def voice_band_dbfs(wav_path: str | Path) -> float:
+    """How loud the speech band of a WAV is, in dBFS.  ``-inf`` for silence.
+
+    Speech recognition invents sentences over silence, and the words it
+    invents are always the same ones -- it learned them from subtitles.  A
+    slice that holds no speech is worth neither the request nor the invented
+    sentence in the transcript, so it is measured here before it is sent.
+
+    Only 16-bit PCM is measured; a file in another format reports ``0.0``,
+    which is loud enough that nothing is skipped on the strength of a number
+    this function could not compute.
+    """
+    with wave.open(str(wav_path), "rb") as reader:
+        if reader.getsampwidth() != 2:
+            return 0.0
+        rate = reader.getframerate() or 16000
+        channels = reader.getnchannels() or 1
+        frames = reader.readframes(reader.getnframes())
+
+    samples = array("h")
+    samples.frombytes(frames)
+    if not samples:
+        return float("-inf")
+    if channels > 1:
+        samples = array("h", (
+            sum(samples[index:index + channels]) // channels
+            for index in range(0, len(samples) - channels + 1, channels)
+        ))
+
+    # Two one-pole high-passes then two low-passes: DC and rumble out, hiss
+    # above the band out, and what is left is compared against the threshold.
+    # One pole of each is not enough -- a 50 Hz rumble still reads louder than
+    # a quiet voice through a single one.
+    high = 1.0 / (1.0 + 2.0 * math.pi * _VOICE_BAND_LOW_HZ / rate)
+    low = 1.0 - math.exp(-2.0 * math.pi * _VOICE_BAND_HIGH_HZ / rate)
+    previous_in = 0.0
+    previous_first = 0.0
+    first = 0.0
+    second = 0.0
+    third = 0.0
+    fourth = 0.0
+    total = 0.0
+    for value in samples:
+        current = float(value)
+        first = high * (first + current - previous_in)
+        previous_in = current
+        second = high * (second + first - previous_first)
+        previous_first = first
+        third += low * (second - third)
+        fourth += low * (third - fourth)
+        total += fourth * fourth
+
+    rms = math.sqrt(total / len(samples))
+    if rms <= 0.0:
+        return float("-inf")
+    return 20.0 * math.log10(rms / 32768.0)
+
+
 def attribute_speaker(audio_path: str | Path, id_to_name: dict[str, str]) -> str:
     """Name the speaker a recording belongs to.
 

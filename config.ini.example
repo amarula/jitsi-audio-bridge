@@ -84,6 +84,13 @@ verify_tls = true
 ; transcript.corrected.txt, is what gets summarised and mailed -- and the pass
 ; is skipped, with a warning, if the model cannot produce it.
 correct_transcript = false
+; A turn or a recording quieter than this in the speech band (300-3400 Hz)
+; is not sent to Whisper at all. Speech recognition answers silence with
+; sentences it learned from subtitles -- "Thank you", "Obrigado", "Спасибо" --
+; and those end up in the transcript as things somebody said. Lower it
+; (e.g. -70) if a very quiet room loses real speech; raise it (e.g. -45) if
+; the room hums through the threshold.
+silence_dbfs = -55
 
 [ollama]
 ; /api/generate is accepted and rewritten to /api/chat: these models are

@@ -62,6 +62,11 @@ DEFAULTS: dict[str, dict[str, str]] = {
         "url": "https://whisper.omnia.amarulasolutions.com/transcribe-b64",
         "timeout": "600",
         "verify_tls": "true",
+        # Below this, a recording or a turn holds no speech: speech recognition
+        # answers silence with the sentences it learned from subtitles --
+        # "Thank you", "Obrigado", "Спасибо" -- and they end up in the
+        # transcript as things somebody said.
+        "silence_dbfs": "-55",
     },
     "ollama": {
         "url": "https://ollama.omnia.amarulasolutions.com/api/generate",
@@ -220,6 +225,15 @@ class EndpointConfig:
 
 
 @dataclass(frozen=True)
+class WhisperConfig(EndpointConfig):
+    """The transcription endpoint, and what is not worth asking it."""
+
+    #: A file quieter than this in the speech band is not sent at all: what
+    #: comes back for silence is invented, not transcribed.
+    silence_dbfs: float = -55.0
+
+
+@dataclass(frozen=True)
 class OllamaConfig(EndpointConfig):
     """The Ollama generate endpoint, which additionally needs a model name."""
 
@@ -337,7 +351,7 @@ class Config:
     storage: StorageConfig
     transcript: TranscriptConfig
     ai: AiConfig
-    whisper: EndpointConfig
+    whisper: WhisperConfig
     ollama: OllamaConfig
     smtp: SmtpConfig
     s3: S3Config
@@ -498,10 +512,11 @@ def load_config(path: str | os.PathLike[str] | None = None) -> Config:
             interleave=resolver.boolean("transcript", "interleave"),
             merge_gap_seconds=resolver.number("transcript", "merge_gap_seconds", minimum=0.0),
         ),
-        whisper=EndpointConfig(
+        whisper=WhisperConfig(
             url=resolver.required("whisper", "url"),
             timeout=resolver.number("whisper", "timeout", minimum=0.1),
             verify_tls=resolver.boolean("whisper", "verify_tls"),
+            silence_dbfs=resolver.number("whisper", "silence_dbfs", minimum=-120.0),
         ),
         ollama=OllamaConfig(
             correct_transcript=resolver.boolean("ollama", "correct_transcript"),

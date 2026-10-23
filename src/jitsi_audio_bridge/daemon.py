@@ -74,6 +74,7 @@ from .audio import (
     parse_metadata,
     participant_id_from_path,
     slice_wav,
+    voice_band_dbfs,
 )
 from .config import Config, ConfigError, load_config
 from .jicofo import default_logs, endpoints_from_jicofo
@@ -716,6 +717,7 @@ def _transcribe_turns(
     # that has hung.  A line every tenth turn is enough to tell them apart.
     every = max(1, len(turns) // 10)
     reused = 0
+    silent = 0
     for index, turn in enumerate(turns):
         if index and index % every == 0:
             logger.info(
@@ -736,6 +738,17 @@ def _transcribe_turns(
         except (OpusError, OSError) as exc:
             logger.warning("cannot cut %s at %.3fs: %s", recording.name, turn.offset, exc)
             continue
+        level = voice_band_dbfs(slice_path)
+        if level < config.whisper.silence_dbfs:
+            # Whisper answers silence with a sentence it learned from
+            # subtitles, and it is somebody's name on that line.  Nothing is
+            # lost by not asking: there is no speech here.
+            silent += 1
+            logger.debug(
+                "%s: turn %d is silence (%.0f dBFS); not sending it",
+                speaker, index, level,
+            )
+            continue
         text = transcribe_audio(slice_path, config.whisper)
         if text:
             if cached is not None:
@@ -746,6 +759,13 @@ def _transcribe_turns(
         else:
             logger.warning("no transcript produced for turn %d of %s", index, speaker)
             lost.append((turn, slice_path))
+    if silent:
+        logger.info(
+            "%s: %d of %d turn(s) hold no speech; not sent to Whisper",
+            speaker,
+            silent,
+            len(turns),
+        )
     if reused:
         logger.info(
             "%s: %d of %d turn(s) were already transcribed; not asking again",
@@ -841,6 +861,14 @@ def transcribe_recordings(
                     )
                     pending = [(speaker, turn, slice_path) for turn, slice_path in lost]
 
+            level = voice_band_dbfs(recording)
+            if level < config.whisper.silence_dbfs:
+                logger.info(
+                    "%s holds no speech (%.0f dBFS); not sent to Whisper",
+                    recording.name,
+                    level,
+                )
+                continue
             text = transcribe_audio(recording, config.whisper)
             if text:
                 lines.append((None, speaker, text))

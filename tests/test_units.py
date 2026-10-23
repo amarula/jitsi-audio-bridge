@@ -2248,6 +2248,81 @@ def test_an_interrupted_transcription_resumes_where_it_stopped(
     assert len(asked) == 2
 
 
+def _write_tone(path: Path, freq: float, *, level: float = 0.3, rate: int = 48000) -> None:
+    with wave.open(str(path), "wb") as writer:
+        writer.setnchannels(1)
+        writer.setsampwidth(2)
+        writer.setframerate(rate)
+        writer.writeframes(b"".join(
+            struct.pack("<h", int(level * 32767 * math.sin(2 * math.pi * freq * index / rate)))
+            for index in range(rate)
+        ))
+
+
+def _write_silence(path: Path, *, rate: int = 48000) -> None:
+    with wave.open(str(path), "wb") as writer:
+        writer.setnchannels(1)
+        writer.setsampwidth(2)
+        writer.setframerate(rate)
+        writer.writeframes(b"\x00\x00" * rate)
+
+
+def test_the_voice_band_measures_speech_and_not_what_is_below_it(tmp_path: Path) -> None:
+    """A rumble is not a quiet voice, however loud it is.
+
+    One pole of filtering each way leaves 50 Hz only 15 dB down; two make it
+    a different measurement from speech, which is what the threshold needs.
+    """
+    from jitsi_audio_bridge.audio import voice_band_dbfs
+
+    speech = tmp_path / "speech.wav"
+    rumble = tmp_path / "rumble.wav"
+    silence = tmp_path / "silence.wav"
+    _write_tone(speech, 1000)
+    _write_tone(rumble, 50)
+    _write_silence(silence)
+
+    assert voice_band_dbfs(speech) > -20
+    assert voice_band_dbfs(rumble) < voice_band_dbfs(speech) - 20
+    assert voice_band_dbfs(silence) == float("-inf")
+
+
+def test_a_turn_that_holds_no_speech_is_not_sent_to_whisper(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, clean_env: None
+) -> None:
+    """Whisper answers silence with a sentence it learned from subtitles.
+
+    "Thank you", "Obrigado", "Спасибо" -- and it lands in the transcript with
+    somebody's name on it.  A turn that holds no speech is measured before the
+    request, and skipped; nothing is lost, because there was nothing there.
+    """
+    monkeypatch.setattr(config_module, "SEARCH_PATHS", (tmp_path / "nothing.ini",))
+    config = load_config()
+
+    recording = tmp_path / "participant-alice.wav"
+    _write_silence(recording)
+    timeline = SessionTimeline(
+        started_at="now",
+        duration=1.0,
+        recorded={"alice": 1.0},
+        turns=[Turn("alice", 0.0, 0.4, 0.0, 10)],
+    )
+    asked: list[str] = []
+
+    def transcribe(path: object, endpoint: object) -> str:
+        asked.append(Path(path).name)
+        return "Thank you."
+
+    monkeypatch.setattr(daemon_module, "transcribe_audio", transcribe)
+
+    lines = daemon_module.transcribe_recordings(
+        [recording], {"id_to_name": {"alice": "Alice"}}, timeline, config
+    )
+
+    assert asked == []
+    assert lines == []
+
+
 def test_lost_turns_are_given_a_second_chance(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, clean_env: None
 ) -> None:
