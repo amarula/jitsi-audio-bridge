@@ -39,7 +39,7 @@ import signal
 import tempfile
 import threading
 import time
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -621,12 +621,87 @@ def render_transcript(lines: Sequence[TranscriptLine]) -> str:
 RETRY_PASS_PAUSE_SECONDS = 10.0
 
 
+#: What each of a meeting's turns was transcribed as, beside the meeting.
+#: Transcribing is by far the slowest thing this daemon does -- a 95-minute
+#: meeting is 26 minutes of Whisper requests -- and it is done again from
+#: scratch every time the directory is processed: after the run was
+#: interrupted, or because the summary has to be produced again with another
+#: model.  The slices live in a directory a clean run removes, so the cache is
+#: here instead, keyed by the audio it was made from.
+TRANSCRIPTION_CACHE_NAME = ".transcription-cache.json"
+
+
+def load_transcription_cache(
+    meeting_dir: Path, recordings: Sequence[Path]
+) -> dict[str, str]:
+    """The turns transcribed from this exact audio, by turn key.
+
+    The recording's size and mtime go into the file: audio that has changed
+    since -- a meeting that carried on after the last run -- makes every entry
+    suspect, and the whole cache is dropped rather than trusted.
+    """
+    path = meeting_dir / TRANSCRIPTION_CACHE_NAME
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    if data.get("audio") != _audio_stamp(recordings):
+        logger.info(
+            "the audio has changed since %s was written; transcribing again", path.name
+        )
+        return {}
+    turns = data.get("turns")
+    if not isinstance(turns, dict):
+        return {}
+    return {
+        str(key): str(value) for key, value in turns.items() if isinstance(value, str)
+    }
+
+
+def save_transcription_cache(
+    meeting_dir: Path, recordings: Sequence[Path], turns: dict[str, str]
+) -> None:
+    """Keep the turn transcriptions for the next run.  Never raises."""
+    path = meeting_dir / TRANSCRIPTION_CACHE_NAME
+    temporary = path.with_suffix(".tmp")
+    try:
+        temporary.write_text(
+            json.dumps({"audio": _audio_stamp(recordings), "turns": turns}),
+            encoding="utf-8",
+        )
+        os.replace(temporary, path)
+    except OSError as exc:
+        logger.warning("cannot write %s: %s", path, exc)
+
+
+def _audio_stamp(recordings: Sequence[Path]) -> dict[str, list[float]]:
+    """What the audio looked like, for noticing that it has changed."""
+    stamp: dict[str, list[float]] = {}
+    for path in recordings:
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        stamp[path.name] = [stat.st_size, int(stat.st_mtime)]
+    return stamp
+
+
+def _turn_key(recording: Path, index: int, turn: Any) -> str:
+    """A turn's identity: the recording, where in it, and how much of it."""
+    return f"{recording.name}:{index}:{turn.offset:.3f}:{turn.duration:.3f}"
+
+
 def _transcribe_turns(
     recording: Path,
     speaker: str,
     turns: Sequence[Any],
     turns_dir: Path,
     config: Config,
+    *,
+    cached: dict[str, str] | None = None,
+    remember: Callable[[], None] | None = None,
 ) -> tuple[list[TranscriptLine], list[tuple[Any, Path]]]:
     """Cut one participant's speaking turns out and transcribe them.
 
@@ -640,6 +715,7 @@ def _transcribe_turns(
     # that a batch had started: a run that is working looks exactly like one
     # that has hung.  A line every tenth turn is enough to tell them apart.
     every = max(1, len(turns) // 10)
+    reused = 0
     for index, turn in enumerate(turns):
         if index and index % every == 0:
             logger.info(
@@ -650,6 +726,11 @@ def _transcribe_turns(
                 len(lines),
             )
         slice_path = turns_dir / f"{recording.stem}-{index:04d}.wav"
+        key = _turn_key(recording, index, turn)
+        if cached is not None and key in cached:
+            reused += 1
+            lines.append((turn.start, speaker, cached[key]))
+            continue
         try:
             slice_wav(recording, turn.offset, turn.duration, slice_path)
         except (OpusError, OSError) as exc:
@@ -657,10 +738,21 @@ def _transcribe_turns(
             continue
         text = transcribe_audio(slice_path, config.whisper)
         if text:
+            if cached is not None:
+                cached[key] = text
+            if remember is not None:
+                remember()
             lines.append((turn.start, speaker, text))
         else:
             logger.warning("no transcript produced for turn %d of %s", index, speaker)
             lost.append((turn, slice_path))
+    if reused:
+        logger.info(
+            "%s: %d of %d turn(s) were already transcribed; not asking again",
+            speaker,
+            reused,
+            len(turns),
+        )
     return lines, lost
 
 
@@ -693,7 +785,13 @@ def transcribe_recordings(
                 allowance,
             )
 
-    turns_dir = (participant_files[0].parent if participant_files else Path(".")) / TURN_DIR_NAME
+    meeting_dir = participant_files[0].parent if participant_files else Path(".")
+    cached = load_transcription_cache(meeting_dir, participant_files)
+
+    def remember() -> None:
+        save_transcription_cache(meeting_dir, participant_files, cached)
+
+    turns_dir = meeting_dir / TURN_DIR_NAME
     lines: list[TranscriptLine] = []
     #: Turns whose request failed, kept for a second pass once everything else
     #: has been tried: an intermittent service is usually back by then, and the
@@ -717,7 +815,13 @@ def transcribe_recordings(
             if turns:
                 logger.info("transcribing %d turn(s) of %s", len(turns), speaker)
                 turn_lines, lost = _transcribe_turns(
-                    recording, speaker, turns, turns_dir, config
+                    recording,
+                    speaker,
+                    turns,
+                    turns_dir,
+                    config,
+                    cached=cached,
+                    remember=remember,
                 )
                 if turn_lines:
                     lines.extend(turn_lines)

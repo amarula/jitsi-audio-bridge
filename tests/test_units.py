@@ -2064,6 +2064,62 @@ def test_a_participant_whose_turns_all_failed_is_transcribed_whole(
     assert lines == [(None, "participant-alice", "said something at length")]
 
 
+def test_an_interrupted_transcription_resumes_where_it_stopped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, clean_env: None
+) -> None:
+    """A 26-minute transcription is a long thing to lose to a Ctrl-C.
+
+    The slice for a turn is cut to the same file every run, so the answer for
+    it cannot have changed.  Cached beside the slice, it survives the kill --
+    the slice directory is removed by a clean run, not by a killed one -- and
+    the next run asks only for what is left.
+    """
+    monkeypatch.setattr(config_module, "SEARCH_PATHS", (tmp_path / "nothing.ini",))
+    config = load_config()
+
+    recording = tmp_path / "participant-alice.wav"
+    recorder = OpusParticipantRecorder(recording)
+    for packet in _encode_tone(frames=50):
+        recorder.write_packet(packet)
+    recorder.close()
+
+    timeline = SessionTimeline(
+        started_at="now",
+        duration=1.0,
+        recorded={"alice": 1.0},
+        turns=[Turn("alice", 0.0, 0.4, 0.0, 10), Turn("alice", 0.5, 1.0, 0.4, 10)],
+    )
+    asked: list[str] = []
+
+    def transcribe(path: object, endpoint: object) -> str:
+        asked.append(Path(path).name)
+        return f"text for {Path(path).name}"
+
+    monkeypatch.setattr(daemon_module, "transcribe_audio", transcribe)
+    metadata = {"id_to_name": {"alice": "Alice"}}
+
+    first = daemon_module.transcribe_recordings([recording], metadata, timeline, config)
+    assert len(asked) == 2
+    assert [text for _, _, text in first] == [
+        "text for participant-alice-0000.wav",
+        "text for participant-alice-0001.wav",
+    ]
+
+    # The same meeting again -- the run was killed after the transcription, or
+    # its summary has to be produced again: nothing is asked of Whisper.
+    asked.clear()
+    again = daemon_module.transcribe_recordings([recording], metadata, timeline, config)
+    assert asked == []
+    assert again == first
+
+    # Audio that changed since -- a meeting that carried on after the last run
+    # -- makes every cached turn suspect, and none of it is trusted.
+    os.utime(recording, (recording.stat().st_atime, recording.stat().st_mtime + 60))
+    asked.clear()
+    daemon_module.transcribe_recordings([recording], metadata, timeline, config)
+    assert len(asked) == 2
+
+
 def test_lost_turns_are_given_a_second_chance(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, clean_env: None
 ) -> None:
