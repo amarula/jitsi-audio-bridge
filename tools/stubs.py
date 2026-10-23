@@ -171,13 +171,25 @@ class OllamaStub:
                     WhisperStub._reply(self, 400, {"error": f"bad request: {exc}"})
                     return
 
-                prompt = str(body.get("prompt", ""))
+                # The bridge asks a chat endpoint now: the instructions are
+                # the system message and the text is the user message.  The
+                # generate form is still answered, so this stub says both.
+                chat = isinstance(body.get("messages"), list)
+                if chat:
+                    prompt = str(body["messages"][-1].get("content", ""))
+                else:
+                    prompt = str(body.get("prompt", ""))
                 outer.prompts.append(prompt)
 
                 # The bridge asks the same endpoint two different questions.
                 is_language_probe = LANGUAGE_PROBE_MARKER in prompt
                 response = outer.language if is_language_probe else outer.summary
-                WhisperStub._reply(self, 200, {"response": response})
+                if chat:
+                    WhisperStub._reply(
+                        self, 200, {"message": {"role": "assistant", "content": response}}
+                    )
+                else:
+                    WhisperStub._reply(self, 200, {"response": response})
 
         self._server = HTTPServer(("127.0.0.1", self.port), Handler)
         self._thread: threading.Thread | None = None
