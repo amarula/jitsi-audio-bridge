@@ -1059,6 +1059,100 @@ def test_the_language_question_is_asked_with_the_sample(
     assert "sezen:" not in seen["prompt"]
 
 
+def test_the_language_question_is_told_what_script_the_letters_are_in() -> None:
+    """A fact the answer cannot argue with, counted here rather than guessed.
+
+    Speech recognition writes in the script of the language it thinks it heard,
+    so a transcript with a run of Chinese in it has Chinese characters in it.
+    Counting them says 99% Latin, and a model told that does not answer
+    Chinese.
+    """
+    from jitsi_audio_bridge.ai_client import (
+        build_language_prompt,
+        dominant_script,
+        language_sample,
+    )
+
+    transcript = (
+        "[00:00:00] michael: so the test was with a video test source\n" * 30
+        + "[00:03:00] sezen: 谢谢观看。\n"
+        + "[00:03:05] sezen: 字幕由Amara.org社区提供\n"
+        + "[00:04:00] michael: and then we compare the input and the output\n" * 20
+    )
+    sample = language_sample(transcript)
+    dominant = dominant_script(sample)
+
+    assert dominant is not None
+    assert dominant[0] == "LATIN"
+    assert dominant[1] > 0.99
+
+    prompt = build_language_prompt(sample, dominant)
+    assert "Latin alphabet" in prompt
+    # The share the census counted is stated, not a rounded guess of the test's.
+    assert f"{dominant[1] * 100:.1f}% of its letters" in prompt
+
+    strict = build_language_prompt(sample, dominant, strict=True)
+    assert "NOT written in a language that uses another script" in strict
+
+
+def test_an_answer_the_letters_rule_out_is_asked_again(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The model is wrong once; the counted script gets a second question.
+
+    The transcript is English and one of Whisper's artefacts is Chinese, which
+    is exactly what produced a Chinese summary of an English meeting.  The
+    second question says so in words, and its answer is the one used.
+    """
+    from jitsi_audio_bridge import ai_client
+
+    answers = iter(["Chinese", "English"])
+    prompts: list[str] = []
+
+    class Response:
+        status_code = 200
+
+        @staticmethod
+        def raise_for_status() -> None: ...
+
+        @classmethod
+        def json(cls) -> dict:
+            return {"response": next(answers)}
+
+    def post(url: str, **kwargs: object) -> Response:
+        prompts.append(kwargs["json"]["prompt"])
+        return Response()
+
+    monkeypatch.setattr(ai_client.requests, "post", post)
+    transcript = "[00:00:01] michael: this is the meeting, in English\n" * 40
+
+    endpoint = replace(load_config().ollama, model="t")
+    assert ai_client.detect_language(transcript, endpoint) == "English"
+    assert len(prompts) == 2
+    assert "NOT written in a language that uses another script" in prompts[1]
+
+
+def test_an_answer_that_keeps_contradicting_the_letters_falls_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Twice is enough: the fallback says so rather than mailing Chinese."""
+    from jitsi_audio_bridge import ai_client
+
+    monkeypatch.setattr(
+        ai_client.requests,
+        "post",
+        lambda *a, **kw: type("R", (), {
+            "status_code": 200,
+            "raise_for_status": staticmethod(lambda: None),
+            "json": staticmethod(lambda: {"response": "Chinese"}),
+        })(),
+    )
+    transcript = "[00:00:01] michael: this is the meeting, in English\n" * 40
+
+    endpoint = replace(load_config().ollama, model="t")
+    assert ai_client.detect_language(transcript, endpoint) == "English"
+
+
 def test_the_correction_pass_is_told_not_to_translate() -> None:
     """A wrong language must not become a translated meeting.
 

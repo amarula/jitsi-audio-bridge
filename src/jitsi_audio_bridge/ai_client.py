@@ -21,6 +21,7 @@ import logging
 import re
 import threading
 import time
+import unicodedata
 from pathlib import Path
 
 import requests
@@ -40,6 +41,11 @@ logger = logging.getLogger(__name__)
 #: then told the correction pass which language to keep the transcript in.
 _LANGUAGE_SAMPLE_CHARS = 1500
 _LANGUAGE_SAMPLE_SLICES = 3
+
+#: How much of the letters must be in one script before it is stated to the
+#: model as a fact about the transcript.  Below it the text really is a mix,
+#: and saying so would be the model's job, not this one's.
+_SCRIPT_SHARE_OF_TRUTH = 0.75
 
 #: ``[00:00:12] speaker: `` and ``[speaker]: `` -- the tags the transcript is
 #: rendered with, which are not what the question is about.
@@ -212,6 +218,68 @@ def language_sample(transcript_text: str) -> str:
     return "\n[...]\n".join(spoken[start:start + budget] for start in starts)
 
 
+#: What the language name of a script looks like, for the question that says
+#: which one the transcript is written in.  The prefix is unicodedata's, so a
+#: script that is not listed here is still described, in lower case.
+_SCRIPT_NAMES = {
+    "LATIN": "the Latin alphabet",
+    "CYRILLIC": "the Cyrillic alphabet",
+    "GREEK": "the Greek alphabet",
+    "ARABIC": "the Arabic script",
+    "HEBREW": "the Hebrew script",
+    "DEVANAGARI": "the Devanagari script",
+    "HIRAGANA": "Japanese kana",
+    "KATAKANA": "Japanese kana",
+    "HANGUL": "the Korean alphabet",
+    "CJK": "Chinese characters",
+    "THAI": "the Thai script",
+    "ARMENIAN": "the Armenian script",
+    "GEORGIAN": "the Georgian script",
+}
+
+
+def script_of(char: str) -> str | None:
+    """The script a letter belongs to, from its Unicode name.
+
+    The name is the only reliable way to ask this of a single character without
+    a table of thousands of ranges, and it is what the census below is built
+    from.
+    """
+    if not char.isalpha():
+        return None
+    name = unicodedata.name(char, "")
+    if not name:
+        return None
+    # "CJK UNIFIED IDEOGRAPH-4E2D" has no script word of its own.
+    return name.split(" ", 1)[0]
+
+
+def script_census(text: str) -> dict[str, int]:
+    """How many letters of the text are written in each script."""
+    counts: dict[str, int] = {}
+    for char in text:
+        script = script_of(char)
+        if script is not None:
+            counts[script] = counts.get(script, 0) + 1
+    return counts
+
+
+def dominant_script(text: str) -> tuple[str, float] | None:
+    """The script most of the letters are in, and its share of them.
+
+    ``None`` when there are no letters to count.  Speech recognition writes in
+    the script of the language it *thinks* it heard, so a transcript with a
+    run of Chinese in it is a transcript with Chinese characters in it -- and
+    counting them is the one part of this that cannot be argued with.
+    """
+    counts = script_census(text)
+    total = sum(counts.values())
+    if not total:
+        return None
+    script, count = max(counts.items(), key=lambda item: item[1])
+    return script, count / total
+
+
 def detect_language(transcript_text: str, endpoint: OllamaConfig) -> str:
     """Ask Ollama which language a transcript is written in.
 
@@ -222,33 +290,37 @@ def detect_language(transcript_text: str, endpoint: OllamaConfig) -> str:
     Falls back to English, saying so in the log — unlike a silent default,
     which hides every outage behind a plausible-looking answer.
     """
-    # Explicit newlines rather than a triple-quoted block: the prompt text is
-    # reproduced exactly, and no source line has to be unreasonably long.
-    prompt = (
-        "Identify the primary language spoken in the following transcript text.\n"
-        "Judge by the language most of the text is written in. A few lines in "
-        "some other language, or single words in one, are transcription "
-        "artefacts: they are what speech recognition invents over silence, and "
-        "they are not the language of the conversation.\n"
-        "Return ONLY the English name of the language "
-        "(for example: English, Italian, French, German, Spanish).\n"
-        "Do NOT write explanations. Do NOT include quotes or punctuation.\n"
-        "\n"
-        "Transcript sample:\n"
-        f"{language_sample(transcript_text)}\n"
-    )
-    payload = {
-        "model": endpoint.model,
-        "prompt": prompt,
-        "stream": False,
-        "options": {"temperature": 0.0},
-    }
+    sample = language_sample(transcript_text)
+    census = script_census(sample)
+    dominant = dominant_script(sample)
+    if dominant is not None:
+        logger.info(
+            "transcript scripts: %s",
+            ", ".join(
+                f"{script.lower()} {count * 100 / max(1, sum(census.values())):.0f}%"
+                for script, count in sorted(census.items(), key=lambda item: -item[1])
+            ),
+        )
 
-    body = _post_json(endpoint.url, payload, endpoint)
-    if body is None:
-        logger.warning("language detection failed, assuming English")
-        return "English"
-    detected = str(body.get("response") or "").strip().strip(".").strip('"')
+    prompt = build_language_prompt(sample, dominant)
+    detected = _ask_language(endpoint, prompt)
+    if _contradicts_the_script(detected, dominant):
+        # The letters are a fact and the answer is not: a transcript that is
+        # 99% Latin is not Chinese, however insistently one of its artefacts
+        # is.  Asked once more with that said out loud, then given up on.
+        logger.warning(
+            "the model said %r, which the transcript's script does not allow", detected
+        )
+        detected = _ask_language(
+            endpoint, build_language_prompt(sample, dominant, strict=True)
+        )
+        if _contradicts_the_script(detected, dominant):
+            logger.warning(
+                "the model said %r twice, which the transcript's script does not "
+                "allow; assuming English",
+                detected,
+            )
+            return "English"
 
     if not detected:
         logger.warning("language detection returned nothing, assuming English")
@@ -266,6 +338,88 @@ def detect_language(transcript_text: str, endpoint: OllamaConfig) -> str:
         return "English"
     logger.info("detected transcript language: %s", detected)
     return detected
+
+
+def build_language_prompt(
+    sample: str, dominant: tuple[str, float] | None, *, strict: bool = False
+) -> str:
+    """The question, with what was counted put to the model as a fact.
+
+    ``strict`` is the second attempt, after an answer that the letters do not
+    allow: it names the script and rules the answer out explicitly.
+    """
+    lines = [
+        "Identify the primary language spoken in the following transcript text.",
+        "Judge by the language most of the text is written in. A few lines in "
+        "some other language, or single words in one, are transcription "
+        "artefacts: they are what speech recognition invents over silence, and "
+        "they are not the language of the conversation.",
+    ]
+    if dominant is not None and dominant[1] >= _SCRIPT_SHARE_OF_TRUTH:
+        script = _SCRIPT_NAMES.get(dominant[0], dominant[0].lower())
+        lines.append(
+            f"Most of this text ({dominant[1] * 100:.1f}% of its letters) is written "
+            f"in {script}."
+        )
+        if strict:
+            lines.append(
+                f"The transcript is therefore NOT written in a language that uses "
+                f"another script. {script.capitalize()} is a fact about the text; "
+                f"name the language it is in."
+            )
+    lines.extend(
+        [
+            "Return ONLY the English name of the language "
+            "(for example: English, Italian, French, German, Spanish).",
+            "Do NOT write explanations. Do NOT include quotes or punctuation.",
+            "",
+            "Transcript sample:",
+            sample,
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+#: Languages that cannot be written in the Latin alphabet, so that an answer
+#: naming one of them against a Latin census is visibly wrong.  Only the ones
+#: a transcription artefact is likely to produce are listed; the list decides
+#: whether to ask again, not which language the meeting was in.
+_NOT_LATIN = frozenset(
+    name.lower()
+    for name in (
+        "Chinese", "Mandarin", "Cantonese", "Japanese", "Korean", "Russian",
+        "Ukrainian", "Bulgarian", "Serbian", "Macedonian", "Belarusian",
+        "Arabic", "Persian", "Farsi", "Urdu", "Hebrew", "Hindi", "Bengali",
+        "Tamil", "Telugu", "Thai", "Greek", "Georgian", "Armenian",
+    )
+)
+
+
+def _contradicts_the_script(
+    detected: str, dominant: tuple[str, float] | None
+) -> bool:
+    """Whether an answer names a language the counted script cannot write."""
+    if dominant is None or dominant[0] != "LATIN":
+        return False
+    if dominant[1] < _SCRIPT_SHARE_OF_TRUTH:
+        return False
+    return detected.strip().lower() in _NOT_LATIN
+
+
+def _ask_language(endpoint: OllamaConfig, prompt: str) -> str:
+    """One question, one trimmed answer -- or ``""`` if it could not be asked."""
+    payload = {
+        "model": endpoint.model,
+        "prompt": prompt,
+        "stream": False,
+        "options": {"temperature": 0.0},
+    }
+    body = _post_json(endpoint.url, payload, endpoint)
+    if body is None:
+        logger.warning("language detection failed, assuming English")
+        return ""
+    return str(body.get("response") or "").strip().strip(".").strip('"')
 
 
 def build_summary_prompt(transcript_text: str, room_name: str, participants: list[str],
