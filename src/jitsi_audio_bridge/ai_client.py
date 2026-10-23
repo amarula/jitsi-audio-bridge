@@ -612,6 +612,10 @@ def correct_transcript(
 
     corrected: list[str] = []
     for index, chunk in enumerate(chunks, start=1):
+        if index > 1:
+            # Nine chunks took seven minutes on a real meeting: a line per
+            # chunk is the only way the log shows it moving.
+            logger.info("correcting chunk %d/%d", index, len(chunks))
         payload = {
             "model": endpoint.model,
             "prompt": build_correction_prompt(chunk, language),

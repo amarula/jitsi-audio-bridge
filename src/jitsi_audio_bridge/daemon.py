@@ -636,7 +636,19 @@ def _transcribe_turns(
     """
     lines: list[TranscriptLine] = []
     lost: list[tuple[Any, Path]] = []
+    # A meeting is hundreds of requests, minutes each, and the log said only
+    # that a batch had started: a run that is working looks exactly like one
+    # that has hung.  A line every tenth turn is enough to tell them apart.
+    every = max(1, len(turns) // 10)
     for index, turn in enumerate(turns):
+        if index and index % every == 0:
+            logger.info(
+                "%s: turn %d/%d transcribed (%d line(s) so far)",
+                speaker,
+                index,
+                len(turns),
+                len(lines),
+            )
         slice_path = turns_dir / f"{recording.stem}-{index:04d}.wav"
         try:
             slice_wav(recording, turn.offset, turn.duration, slice_path)
