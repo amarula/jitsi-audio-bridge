@@ -69,6 +69,11 @@ DEFAULTS: dict[str, dict[str, str]] = {
         "timeout": "600",
         "verify_tls": "true",
         "correct_transcript": "false",
+        # Enough for the instructions and a meeting of a couple of hours: at
+        # roughly four characters to the token, 16384 is ~65k characters of
+        # transcript.  Ollama's own default is 2048-4096, which silently keeps
+        # only the beginning of a real meeting.
+        "context": "16384",
     },
     "smtp": {
         "host": "127.0.0.1",
@@ -224,6 +229,11 @@ class OllamaConfig(EndpointConfig):
     #: which is why it is off by default and why the raw transcript is always
     #: kept beside the corrected one.
     correct_transcript: bool = False
+    #: The context window to ask for, in tokens.  Sent as ``num_ctx`` with
+    #: every request: without it Ollama uses its own default, and a long
+    #: transcript is truncated to that -- the summary of a meeting would be
+    #: written from its opening and nothing would say so.
+    context: int = 16384
 
 
 @dataclass(frozen=True)
@@ -495,6 +505,7 @@ def load_config(path: str | os.PathLike[str] | None = None) -> Config:
         ),
         ollama=OllamaConfig(
             correct_transcript=resolver.boolean("ollama", "correct_transcript"),
+            context=resolver.integer("ollama", "context", minimum=512, maximum=1048576),
             url=resolver.required("ollama", "url"),
             timeout=resolver.number("ollama", "timeout", minimum=0.1),
             verify_tls=resolver.boolean("ollama", "verify_tls"),

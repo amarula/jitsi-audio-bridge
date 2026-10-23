@@ -90,6 +90,14 @@ url = https://ollama.omnia.amarulasolutions.com/api/generate
 model = qwen2.5:14b-instruct
 timeout = 600
 verify_tls = true
+; How much of a meeting the model is allowed to read, in tokens. Sent as
+; num_ctx with every request; Ollama's own default is a few thousand tokens,
+; and a transcript longer than that is truncated -- the summary of a long
+; meeting would be written from its opening without saying so.  16384 is
+; roughly 65k characters, a meeting of a couple of hours; it costs VRAM for
+; the KV cache (about 3 GB on a 14B model, 2 GB on an 8B) on top of the
+; weights. Raise it for longer meetings, lower it if the GPU is small.
+context = 16384
 
 [s3]
 ; Copy the meeting's Jibri recording -- the video -- to an S3-compatible

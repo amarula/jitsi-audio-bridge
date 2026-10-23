@@ -108,6 +108,36 @@ def backoff_seconds(attempt: int) -> float:
     return min(_BACKOFF_CEILING_SECONDS, _BACKOFF_BASE_SECONDS * 2 ** (attempt - 2))
 
 
+#: Roughly how many characters of English one token covers.  Used only to
+#: warn that a meeting will not fit the configured context; nothing depends on
+#: the estimate being exact.
+_CHARS_PER_TOKEN = 4
+
+
+def _ollama_options(endpoint: OllamaConfig, temperature: float) -> dict[str, object]:
+    """The sampling options, and the context window the deployment asked for.
+
+    ``num_ctx`` is not sampling: it is how much of the prompt the model is
+    allowed to read.  Left out, Ollama applies its own default -- a few
+    thousand tokens -- and quietly summarises the opening of a meeting.
+    """
+    return {"temperature": temperature, "num_ctx": endpoint.context}
+
+
+def _warn_if_the_meeting_will_not_fit(text: str, endpoint: OllamaConfig) -> None:
+    """Say so when the transcript is longer than the context window."""
+    estimated = len(text) // _CHARS_PER_TOKEN
+    if estimated <= endpoint.context:
+        return
+    logger.warning(
+        "this meeting is about %d tokens, and [ollama] context is %d: the model "
+        "will only see its beginning.  Raise [ollama] context (VRAM permitting) "
+        "or use a smaller model",
+        estimated,
+        endpoint.context,
+    )
+
+
 def _post_json(url: str, payload: dict[str, object], endpoint: EndpointConfig) -> dict | None:
     """POST *payload* and return the JSON object, retrying a 5xx answer.
 
@@ -449,7 +479,7 @@ def _ask_language(endpoint: OllamaConfig, prompt: str) -> str:
         "model": endpoint.model,
         "prompt": prompt,
         "stream": False,
-        "options": {"temperature": 0.0},
+        "options": _ollama_options(endpoint, 0.0),
     }
     body = _post_json(endpoint.url, payload, endpoint)
     if body is None:
@@ -620,7 +650,7 @@ def correct_transcript(
             "model": endpoint.model,
             "prompt": build_correction_prompt(chunk, language),
             "stream": False,
-            "options": {"temperature": 0.1},
+            "options": _ollama_options(endpoint, 0.1),
         }
         body = _post_json(endpoint.url, payload, endpoint)
         if body is None:
@@ -663,12 +693,13 @@ def generate_summary(
     """
     if language is None:
         language = detect_language(transcript_text, endpoint)
+    _warn_if_the_meeting_will_not_fit(transcript_text, endpoint)
     prompt = build_summary_prompt(transcript_text, room_name, participants, language)
     payload = {
         "model": endpoint.model,
         "prompt": prompt,
         "stream": False,
-        "options": {"temperature": 0.1},
+        "options": _ollama_options(endpoint, 0.1),
     }
 
     body = _post_json(endpoint.url, payload, endpoint)
@@ -693,7 +724,7 @@ def generate_summary(
                 + "\n\nThe previous attempt was written in the wrong language. "
                 f"Write this summary in {language}, and in no other language.",
                 "stream": False,
-                "options": {"temperature": 0.0},
+                "options": _ollama_options(endpoint, 0.0),
             },
             endpoint,
         )
@@ -744,7 +775,7 @@ def _translate(
                 f"{language} and in no other language.\n\n{text}"
             ),
             "stream": False,
-            "options": {"temperature": 0.0},
+            "options": _ollama_options(endpoint, 0.0),
         },
         endpoint,
     )

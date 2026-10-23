@@ -1244,6 +1244,54 @@ def test_a_summary_that_comes_back_in_another_script_is_asked_again(
     assert "written in the wrong language" in prompts[1]
 
 
+def test_every_ollama_request_carries_the_context_window(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Without num_ctx, Ollama truncates a meeting to its first few minutes.
+
+    The deployment's [ollama] context is sent with every request, and a
+    transcript longer than it is called out before the summary is asked for --
+    silently summarising the opening of a meeting is the failure this is here
+    to stop.
+    """
+    from jitsi_audio_bridge import ai_client
+
+    seen: list[dict] = []
+
+    class Response:
+        status_code = 200
+
+        @staticmethod
+        def raise_for_status() -> None: ...
+
+        @staticmethod
+        def json() -> dict:
+            return {"response": "English"}
+
+    def post(url: str, **kwargs: object) -> Response:
+        seen.append(kwargs["json"])
+        return Response()
+
+    monkeypatch.setattr(ai_client.requests, "post", post)
+    endpoint = replace(load_config().ollama, model="t", context=4096)
+
+    ai_client.detect_language("[Ada]: hello\n", endpoint)
+    ai_client.generate_summary(
+        "[Ada]: hello there, this is a short meeting\n", "Weekly", ["Ada"], endpoint,
+        language="English",
+    )
+
+    assert all(payload["options"]["num_ctx"] == 4096 for payload in seen), seen
+
+    # Long transcript, small window: the run says so rather than pretending.
+    seen.clear()
+    long_meeting = "[Ada]: and then we discussed the encoder again\n" * 4000
+    assert len(long_meeting) // 4 > 4096
+    with caplog.at_level("WARNING"):
+        ai_client.generate_summary(long_meeting, "Long", ["Ada"], endpoint, language="English")
+    assert any("will only see its beginning" in record.message for record in caplog.records)
+
+
 def test_a_summary_the_model_will_not_retranslate_is_translated(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
