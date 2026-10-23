@@ -1019,7 +1019,14 @@ async def _finalise_later(state: SessionState, config: Config) -> None:
         int(grace),
         sum(state.recorded.values()),
     )
-    await _run_post_processing(state.meeting_dir, config)
+    task = asyncio.current_task()
+    if task is not None:
+        _PROCESSING.add(task)
+    try:
+        await _run_post_processing(state.meeting_dir, config)
+    finally:
+        if task is not None:
+            _PROCESSING.discard(task)
 
 
 async def _run_post_processing(meeting_dir: Path, config: Config) -> None:
@@ -1077,6 +1084,12 @@ _SESSIONS: dict[str, SessionState] = {}
 #: Set when the daemon is shutting down, so a pending grace timer stops
 #: waiting and processes its meeting instead of losing it.
 _SHUTDOWN = asyncio.Event()
+
+#: Post-processing that has started and not finished.  A shutdown waits for
+#: it: a meeting that is half transcribed when the unit stops is a meeting
+#: somebody has to recover by hand, and the unit's TimeoutStopSec is there for
+#: exactly this.
+_PROCESSING: set[asyncio.Task[None]] = set()
 
 
 def _session_state(session_id: str, meeting_dir: Path, config: Config) -> SessionState:
@@ -1417,12 +1430,38 @@ async def serve(config: Config) -> None:
     # A meeting that ended moments ago is still waiting out its grace period;
     # shutting down must not lose it.
     _SHUTDOWN.set()
-    pending = [state.pending for state in _SESSIONS.values() if state.pending is not None]
-    if pending:
-        logger.info("processing %d session(s) that were still waiting", len(pending))
-        await asyncio.gather(*pending, return_exceptions=True)
+    await _drain_processing()
 
     logger.info("shutting down")
+
+
+async def _drain_processing() -> None:
+    """Wait for every meeting this daemon has taken on, until there are none.
+
+    Twice over, because the shutdown can overlap the last connection: a stream
+    ending while this waits schedules its meeting *after* the list was taken,
+    and the process then exited with the transcript half written -- which is
+    what a restart in the middle of a meeting's post-processing looks like in
+    the journal.  Nothing new can be taken on once the server has closed, so
+    this terminates; the unit's TimeoutStopSec is what bounds it.
+    """
+    while True:
+        # A task that has finished is a meeting that is done: waiting on it
+        # again would spin, and the session's own bookkeeping clears it a
+        # moment later anyway.
+        waiting = [
+            state.pending
+            for state in _SESSIONS.values()
+            if state.pending is not None and not state.pending.done()
+        ]
+        running = [task for task in _PROCESSING if not task.done()]
+        if not waiting and not running:
+            return
+        if waiting:
+            logger.info("processing %d session(s) that were still waiting", len(waiting))
+        if running:
+            logger.info("waiting for %d meeting(s) still being processed", len(running))
+        await asyncio.gather(*waiting, *running, return_exceptions=True)
 
 
 def build_argument_parser() -> argparse.ArgumentParser:

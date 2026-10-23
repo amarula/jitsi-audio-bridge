@@ -464,7 +464,7 @@ def load_config(path: str | os.PathLike[str] | None = None) -> Config:
 
     resolver = _Resolver(parser, source)
 
-    return Config(
+    config = Config(
         server=ServerConfig(
             host=resolver.required("server", "host"),
             port=resolver.integer("server", "port", minimum=1, maximum=65535),
@@ -542,3 +542,25 @@ def load_config(path: str | os.PathLike[str] | None = None) -> Config:
         ),
         source=source,
     )
+
+    _quiet_unverified_tls(config)
+    return config
+
+
+def _quiet_unverified_tls(config: Config) -> None:
+    """Stop urllib3 repeating itself when verification is off on purpose.
+
+    ``verify_tls = false`` is a decision the deployment makes in its own file
+    -- a self-signed certificate on the host it talks to -- and urllib3 then
+    warns on *every* request: hundreds of lines per meeting in the journal,
+    against the handful that say what the bridge did and why.  The warning is
+    silenced only when that decision has been taken; a deployment that
+    verifies its certificates still hears about anything unexpected.
+    """
+    if config.whisper.verify_tls and config.ollama.verify_tls:
+        return
+    try:
+        import urllib3
+    except ImportError:  # pragma: no cover - requests depends on it
+        return
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)

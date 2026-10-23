@@ -8,6 +8,7 @@ encoding a tone and decoding it back through the recorder.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import http.server
 import json
@@ -389,6 +390,51 @@ def test_write_metadata_reports_a_missing_directory(tmp_path: Path) -> None:
     # Must not raise: an unwritable directory is a failed write, not a reason
     # to take the connection down.
     assert not write_metadata(tmp_path / "missing", json.dumps({"room_name": "Standup"}))
+
+
+def test_a_shutdown_waits_for_the_meeting_it_has_taken_on() -> None:
+    """The restart that killed a 95-minute meeting, in the journal and here.
+
+    The shutdown took its list of pending grace timers while the last stream
+    was still ending; that stream then scheduled its meeting, the list was
+    already taken, and the process exited with the transcript half written.
+    Draining until there is nothing left is what closes that window.
+    """
+    from jitsi_audio_bridge import daemon as daemon_module
+
+    done: list[str] = []
+
+    async def scenario() -> None:
+        loop = asyncio.get_running_loop()
+
+        async def waiting(name: str) -> None:
+            await asyncio.sleep(0.02)
+            done.append(name)
+
+        def schedule_late() -> None:
+            # What a stream ending as the shutdown begins does.
+            daemon_module._SESSIONS["late"] = _SessionStandIn(
+                pending=asyncio.create_task(waiting("late"))
+            )
+
+        daemon_module._SESSIONS["first"] = _SessionStandIn(
+            pending=asyncio.create_task(waiting("first"))
+        )
+        loop.call_later(0.005, schedule_late)
+        await daemon_module._drain_processing()
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        daemon_module._SESSIONS.clear()
+    assert sorted(done) == ["first", "late"]
+
+
+class _SessionStandIn:
+    """Just enough of a session for the drain to wait on its timer."""
+
+    def __init__(self, pending: object) -> None:
+        self.pending = pending
 
 
 @pytest.mark.skipif(
@@ -1369,6 +1415,33 @@ def test_the_transcript_names_a_speaker_the_deployment_has_no_name_for(
     )
 
     assert lines == [(None, "m", "said something")]
+
+
+@pytest.mark.parametrize(("verify", "quieted"), [(False, True), (True, False)])
+def test_an_unverified_endpoint_does_not_warn_on_every_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, clean_env: None,
+    verify: bool, quieted: bool,
+) -> None:
+    """Hundreds of identical warnings per meeting, from a decision in the file.
+
+    ``verify_tls = false`` is the deployment's own choice; urllib3 then warns
+    on every request, and the journal is unreadable for the lines that say
+    what the bridge did.  The warning is silenced only when the choice has
+    been made -- a deployment that verifies certificates hears everything.
+    """
+    import urllib3
+
+    calls: list = []
+    monkeypatch.setattr(urllib3, "disable_warnings", lambda *a, **kw: calls.append(a))
+    settings = tmp_path / "config.ini"
+    settings.write_text(
+        f"[whisper]\nverify_tls = {str(verify).lower()}\n"
+        f"[ollama]\nverify_tls = {str(verify).lower()}\n",
+        encoding="utf-8",
+    )
+
+    load_config(settings)
+    assert bool(calls) is quieted
 
 
 def test_the_mail_section_can_rebrand_and_can_be_switched_off(
