@@ -26,24 +26,27 @@
    THEME — the block to edit when re-branding.
    -------------------------------------------------------------------------- */
 :root {
-  /* Surfaces */
-  --page-bg:       #0b1420;
-  --card-bg:       #121d2b;
-  --card-border:   #1f3045;
-  --chip-bg:       #182739;
-  --chip-border:   #2a3f57;
-  --rule:          #1f3045;
+  /* Surfaces — the deep purple of the brand (amarulasolutions.com's theme
+     secondary, #351c4d) and its neighbouring shades. */
+  --page-bg:       #190c26;
+  --card-bg:       #2a1640;
+  --card-border:   #43265f;
+  --chip-bg:       #351c4d;
+  --chip-border:   #4d2c6b;
+  --rule:          #43265f;
 
-  /* Type */
+  /* Type — white and a purple-tinted grey, legible on the card */
   --heading:       #ffffff;
-  --text:          #dbe6f2;
-  --text-strong:   #e8eef6;
-  --text-muted:    #9fb0c4;
-  --text-faint:    #7b8fa6;
+  --text:          #e9dff4;
+  --text-strong:   #f6f1fb;
+  --text-muted:    #bfaed2;
+  --text-faint:    #9785ac;
 
-  /* Accents */
-  --accent:        #5aa9ff;
-  --action:        #ffc46b;
+  /* Accents — the brand's gold (#fdcb0e, the site's button colour), and a
+     lighter tint of it for the action items, so the two markers differ on a
+     dark card without leaving the palette. */
+  --accent:        #fdcb0e;
+  --action:        #ffe08a;
 
   /* Fonts — a system stack, so nothing has to be downloaded or unblocked */
   --font:          -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
