@@ -86,6 +86,9 @@ verify_tls = true
 correct_transcript = false
 
 [ollama]
+; /api/generate is accepted and rewritten to /api/chat: these models are
+; chat models, and one long raw prompt is a conversation they answer rather
+; than a task they perform.
 url = https://ollama.omnia.amarulasolutions.com/api/generate
 model = qwen2.5:14b-instruct
 timeout = 600

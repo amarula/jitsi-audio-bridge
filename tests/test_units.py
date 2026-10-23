@@ -1087,7 +1087,7 @@ def test_the_language_question_is_asked_with_the_sample(
             return {"response": "English"}
 
     def post(url: str, **kwargs: object) -> Response:
-        seen["prompt"] = kwargs["json"]["prompt"]
+        seen["prompt"] = kwargs["json"]["messages"][-1]["content"]
         return Response()
 
     monkeypatch.setattr(ai_client.requests, "post", post)
@@ -1166,7 +1166,7 @@ def test_an_answer_the_letters_rule_out_is_asked_again(
             return {"response": next(answers)}
 
     def post(url: str, **kwargs: object) -> Response:
-        prompts.append(kwargs["json"]["prompt"])
+        prompts.append(kwargs["json"]["messages"][-1]["content"])
         return Response()
 
     monkeypatch.setattr(ai_client.requests, "post", post)
@@ -1228,7 +1228,7 @@ def test_a_summary_that_comes_back_in_another_script_is_asked_again(
             return {"response": next(replies)}
 
     def post(url: str, **kwargs: object) -> Response:
-        prompts.append(kwargs["json"]["prompt"])
+        prompts.append(kwargs["json"]["messages"][-1]["content"])
         return Response()
 
     monkeypatch.setattr(ai_client.requests, "post", post)
@@ -1242,6 +1242,55 @@ def test_a_summary_that_comes_back_in_another_script_is_asked_again(
     assert summary.startswith("The meeting discussed")
     assert len(prompts) == 2
     assert "written in the wrong language" in prompts[1]
+
+
+def test_ollama_is_driven_as_a_chat_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    """One raw prompt is a conversation to these models, and they answer it.
+
+    gemma2 answered the summary prompt with "I understand. I will only respond
+    in English from now on. Please provide me with any further questions" --
+    a reply to a person, not a summary.  The chat endpoint with a system
+    message is the form they are trained for; a config still pointing at
+    /api/generate is rewritten to it, and an answer in the old shape is still
+    understood.
+    """
+    from jitsi_audio_bridge import ai_client
+
+    seen: dict = {}
+
+    class Response:
+        status_code = 200
+
+        @staticmethod
+        def raise_for_status() -> None: ...
+
+        @staticmethod
+        def json() -> dict:
+            return {"message": {"role": "assistant", "content": "  English  "}}
+
+    def post(url: str, **kwargs: object) -> Response:
+        seen["url"] = url
+        seen["payload"] = kwargs["json"]
+        return Response()
+
+    monkeypatch.setattr(ai_client.requests, "post", post)
+    endpoint = replace(
+        load_config().ollama, model="t", url="https://ollama.example.com/api/generate"
+    )
+
+    assert ai_client._ask(endpoint, "hello") == "English"
+    assert seen["url"] == "https://ollama.example.com/api/chat"
+    messages = seen["payload"]["messages"]
+    assert [message["role"] for message in messages] == ["system", "user"]
+    assert messages[1]["content"] == "hello"
+    # The system message is what says who is speaking and what a reply is.
+    assert "meeting assistant" in messages[0]["content"]
+    assert seen["payload"]["options"]["num_ctx"] == endpoint.context
+
+    # A URL that is not Ollama's own is used as given.
+    other = replace(endpoint, url="https://proxy.example.com/v1/complete")
+    ai_client._ask(other, "hello")
+    assert seen["url"] == "https://proxy.example.com/v1/complete"
 
 
 def test_a_meeting_too_long_for_the_window_is_summarised_in_parts(
@@ -1271,7 +1320,7 @@ def test_a_meeting_too_long_for_the_window_is_summarised_in_parts(
     def post(url: str, **kwargs: object) -> Response:
         payload = kwargs["json"]
         prompts.append(payload)
-        prompt = payload["prompt"]
+        prompt = payload["messages"][-1]["content"]
         if "taking notes on one part" in prompt or "merging notes" in prompt:
             payload = {"response": "[michael]: notes from one part of the meeting."}
         else:
@@ -1296,8 +1345,9 @@ def test_a_meeting_too_long_for_the_window_is_summarised_in_parts(
 
     assert summary.startswith("## Summary")
     # Several parts, each read on its own, then one summary written from the notes.
-    assert sum("taking notes on one part" in p["prompt"] for p in prompts) > 1
-    final = prompts[-1]["prompt"]
+    user_prompts = [p["messages"][-1]["content"] for p in prompts]
+    assert sum("taking notes on one part" in p for p in user_prompts) > 1
+    final = user_prompts[-1]
     assert "notes from one part of the meeting" in final
     assert "point 150" not in final
     # Every request states the window: without it Ollama truncates them again.
@@ -1348,7 +1398,7 @@ def test_a_summary_the_model_will_not_retranslate_is_translated(
             return {"response": next(replies)}
 
     def post(url: str, **kwargs: object) -> Response:
-        prompts.append(kwargs["json"]["prompt"])
+        prompts.append(kwargs["json"]["messages"][-1]["content"])
         return Response()
 
     monkeypatch.setattr(ai_client.requests, "post", post)

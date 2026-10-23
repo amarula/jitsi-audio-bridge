@@ -213,13 +213,47 @@ def _merge_prompt(notes: str, language: str) -> str:
     )
 
 
-def _ask(endpoint: OllamaConfig, prompt: str, temperature: float = 0.1) -> str:
-    """One Ollama generate call, trimmed.  ``""`` when it produced nothing."""
+#: The framing every request is made with.  These are chat models, and given
+#: one long raw prompt they answer it as a person would: "I understand. I will
+#: only respond in English from now on. Please provide me with any further
+#: questions."  A system message is what tells them who is speaking and what
+#: kind of reply this is.
+_SYSTEM = (
+    "You are a meeting assistant for an on-premise transcription service. "
+    "Follow the instructions in the message exactly. Reply with the requested "
+    "text only: no preamble, no acknowledgement, no questions."
+)
+
+
+def _chat_url(url: str) -> str:
+    """The chat endpoint for this deployment.
+
+    ``[ollama] url`` has always pointed at ``/api/generate``, which takes one
+    raw prompt; ``/api/chat`` takes the same options and a message list, and is
+    the form these models are trained to answer.  Any other URL is used as
+    given, which is also how a proxy that fronts the server keeps working.
+    """
+    trimmed = url.rstrip("/")
+    if trimmed.endswith("/api/generate"):
+        return trimmed[: -len("/api/generate")] + "/api/chat"
+    return url
+
+
+def _ask(
+    endpoint: OllamaConfig,
+    prompt: str,
+    temperature: float = 0.1,
+    system: str | None = None,
+) -> str:
+    """One Ollama chat call, trimmed.  ``""`` when it produced nothing."""
     body = _post_json(
-        endpoint.url,
+        _chat_url(endpoint.url),
         {
             "model": endpoint.model,
-            "prompt": prompt,
+            "messages": [
+                {"role": "system", "content": system or _SYSTEM},
+                {"role": "user", "content": prompt},
+            ],
             "stream": False,
             "options": _ollama_options(endpoint, temperature),
         },
@@ -227,6 +261,10 @@ def _ask(endpoint: OllamaConfig, prompt: str, temperature: float = 0.1) -> str:
     )
     if not isinstance(body, dict):
         return ""
+    message = body.get("message")
+    if isinstance(message, dict) and isinstance(message.get("content"), str):
+        return message["content"].strip()
+    # A server still answering in the generate shape.
     return str(body.get("response") or "").strip()
 
 
@@ -633,17 +671,11 @@ def _contradicts_the_script(
 
 def _ask_language(endpoint: OllamaConfig, prompt: str) -> str:
     """One question, one trimmed answer -- or ``""`` if it could not be asked."""
-    payload = {
-        "model": endpoint.model,
-        "prompt": prompt,
-        "stream": False,
-        "options": _ollama_options(endpoint, 0.0),
-    }
-    body = _post_json(endpoint.url, payload, endpoint)
-    if body is None:
+    answer = _ask(endpoint, prompt, 0.0)
+    if not answer:
         logger.warning("language detection failed, assuming English")
         return ""
-    return str(body.get("response") or "").strip().strip(".").strip('"')
+    return answer.strip(".").strip('"')
 
 
 def build_summary_prompt(transcript_text: str, room_name: str, participants: list[str],
@@ -804,17 +836,7 @@ def correct_transcript(
             # Nine chunks took seven minutes on a real meeting: a line per
             # chunk is the only way the log shows it moving.
             logger.info("correcting chunk %d/%d", index, len(chunks))
-        payload = {
-            "model": endpoint.model,
-            "prompt": build_correction_prompt(chunk, language),
-            "stream": False,
-            "options": _ollama_options(endpoint, 0.1),
-        }
-        body = _post_json(endpoint.url, payload, endpoint)
-        if body is None:
-            logger.error("correction of chunk %d/%d failed", index, len(chunks))
-            return ""
-        piece = str(body.get("response") or "").strip()
+        piece = _ask(endpoint, build_correction_prompt(chunk, language), 0.1)
         if not piece:
             logger.error("correction of chunk %d/%d produced nothing", index, len(chunks))
             return ""
@@ -860,41 +882,23 @@ def generate_summary(
             logger.error("none of the meeting's parts produced notes")
             return ""
     prompt = build_summary_prompt(source, room_name, participants, language)
-    payload = {
-        "model": endpoint.model,
-        "prompt": prompt,
-        "stream": False,
-        "options": _ollama_options(endpoint, 0.1),
-    }
-
-    body = _post_json(endpoint.url, payload, endpoint)
-    if body is None:
+    summary = _ask(endpoint, prompt, 0.1)
+    if not summary:
         logger.error("ollama produced no summary")
         return ""
 
-    if not isinstance(body, dict):
-        logger.error("ollama returned %s, expected a JSON object", type(body).__name__)
-        return ""
-
-    summary = (body.get("response") or "").strip()
     if came_back_in_another_script(summary, source):
         logger.warning(
             "the summary came back in another script than the transcript; asking again"
         )
-        retry = _post_json(
-            endpoint.url,
-            {
-                "model": endpoint.model,
-                "prompt": prompt
-                + "\n\nThe previous attempt was written in the wrong language. "
-                f"Write this summary in {language}, and in no other language.",
-                "stream": False,
-                "options": _ollama_options(endpoint, 0.0),
-            },
+        second = _ask(
             endpoint,
+            prompt
+            + "\n\nThe previous attempt was written in the wrong language. "
+            f"Write this summary in {language}, and in no other language.",
+            0.0,
         )
-        if isinstance(retry, dict) and (retry.get("response") or "").strip():
-            second = str(retry["response"]).strip()
+        if second:
             if not came_back_in_another_script(second, source):
                 return second
             # A model that will not write in the language it was asked for may
@@ -929,24 +933,16 @@ def _translate(
     the translation has to be written in.  Comparing the translation with the
     text being translated would call every translation a failure.
     """
-    body = _post_json(
-        endpoint.url,
-        {
-            "model": endpoint.model,
-            "prompt": (
-                f"Translate the following text into {language}. "
-                "Keep its structure, its headings and its list items. "
-                "Reply with the translation only, in "
-                f"{language} and in no other language.\n\n{text}"
-            ),
-            "stream": False,
-            "options": _ollama_options(endpoint, 0.0),
-        },
+    translated = _ask(
         endpoint,
+        (
+            f"Translate the following text into {language}. "
+            "Keep its structure, its headings and its list items. "
+            "Reply with the translation only, in "
+            f"{language} and in no other language.\n\n{text}"
+        ),
+        0.0,
     )
-    if not isinstance(body, dict):
-        return ""
-    translated = str(body.get("response") or "").strip()
     if not translated or came_back_in_another_script(translated, expected):
         return ""
     return translated
