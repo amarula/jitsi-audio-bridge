@@ -1244,19 +1244,19 @@ def test_a_summary_that_comes_back_in_another_script_is_asked_again(
     assert "written in the wrong language" in prompts[1]
 
 
-def test_every_ollama_request_carries_the_context_window(
+def test_a_meeting_too_long_for_the_window_is_summarised_in_parts(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Without num_ctx, Ollama truncates a meeting to its first few minutes.
+    """A window that holds an hour is not always available.
 
-    The deployment's [ollama] context is sent with every request, and a
-    transcript longer than it is called out before the summary is asked for --
-    silently summarising the opening of a meeting is the failure this is here
-    to stop.
+    Ollama truncates a prompt to its context window, so before this the
+    summary of a long meeting was written from whatever fitted -- its opening
+    -- and nothing said so.  Each part is now read for its notes, and the
+    summary is written from the notes.
     """
     from jitsi_audio_bridge import ai_client
 
-    seen: list[dict] = []
+    prompts: list[dict] = []
 
     class Response:
         status_code = 200
@@ -1266,30 +1266,60 @@ def test_every_ollama_request_carries_the_context_window(
 
         @staticmethod
         def json() -> dict:
-            return {"response": "English"}
+            raise AssertionError("json() is replaced by post()")
 
     def post(url: str, **kwargs: object) -> Response:
-        seen.append(kwargs["json"])
-        return Response()
+        payload = kwargs["json"]
+        prompts.append(payload)
+        prompt = payload["prompt"]
+        if "taking notes on one part" in prompt or "merging notes" in prompt:
+            payload = {"response": "[michael]: notes from one part of the meeting."}
+        else:
+            payload = {"response": "## Summary\n- the encoder was discussed."}
+        response = Response()
+        response_json = staticmethod(lambda: payload)
+        response.json = response_json
+        return response
 
     monkeypatch.setattr(ai_client.requests, "post", post)
     endpoint = replace(load_config().ollama, model="t", context=4096)
-
-    ai_client.detect_language("[Ada]: hello\n", endpoint)
-    ai_client.generate_summary(
-        "[Ada]: hello there, this is a short meeting\n", "Weekly", ["Ada"], endpoint,
-        language="English",
+    transcript = "".join(
+        f"[00:{minute:02d}:00] michael: and then we discussed the encoder again, "
+        f"point {minute}\n"
+        for minute in range(200)
     )
 
-    assert all(payload["options"]["num_ctx"] == 4096 for payload in seen), seen
+    with caplog.at_level("INFO"):
+        summary = ai_client.generate_summary(
+            transcript, "Long", ["michael"], endpoint, language="English"
+        )
 
-    # Long transcript, small window: the run says so rather than pretending.
-    seen.clear()
-    long_meeting = "[Ada]: and then we discussed the encoder again\n" * 4000
-    assert len(long_meeting) // 4 > 4096
+    assert summary.startswith("## Summary")
+    # Several parts, each read on its own, then one summary written from the notes.
+    assert sum("taking notes on one part" in p["prompt"] for p in prompts) > 1
+    final = prompts[-1]["prompt"]
+    assert "notes from one part of the meeting" in final
+    assert "point 150" not in final
+    # Every request states the window: without it Ollama truncates them again.
+    assert all(p["options"]["num_ctx"] == 4096 for p in prompts)
+    assert any("summarising it in" in record.message for record in caplog.records)
+
+
+def test_a_line_too_long_for_the_window_is_cut_and_said_so(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """One utterance longer than a part: there is nothing else to cut it on."""
+    from jitsi_audio_bridge import ai_client
+
+    endpoint = replace(load_config().ollama, model="t", context=512)
+    text = "[michael]: " + "word " * 5000
+
     with caplog.at_level("WARNING"):
-        ai_client.generate_summary(long_meeting, "Long", ["Ada"], endpoint, language="English")
-    assert any("will only see its beginning" in record.message for record in caplog.records)
+        parts = ai_client.split_for_summary(text, endpoint)
+
+    assert len(parts) > 1
+    assert all(len(part) <= 2000 for part in parts)
+    assert any("does not fit the context window" in record.message for record in caplog.records)
 
 
 def test_a_summary_the_model_will_not_retranslate_is_translated(

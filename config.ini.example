@@ -97,6 +97,11 @@ verify_tls = true
 ; roughly 65k characters, a meeting of a couple of hours; it costs VRAM for
 ; the KV cache (about 3 GB on a 14B model, 2 GB on an 8B) on top of the
 ; weights. Raise it for longer meetings, lower it if the GPU is small.
+;
+; A meeting longer than the window is not truncated: it is read in parts, one
+; pass of notes per part, and the summary is written from the notes. A window
+; of 8192 handles a meeting of about an hour in one pass and a whole day in
+; parts.
 context = 16384
 
 [s3]

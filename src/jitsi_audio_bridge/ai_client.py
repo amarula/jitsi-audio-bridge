@@ -124,18 +124,176 @@ def _ollama_options(endpoint: OllamaConfig, temperature: float) -> dict[str, obj
     return {"temperature": temperature, "num_ctx": endpoint.context}
 
 
-def _warn_if_the_meeting_will_not_fit(text: str, endpoint: OllamaConfig) -> None:
-    """Say so when the transcript is longer than the context window."""
-    estimated = len(text) // _CHARS_PER_TOKEN
-    if estimated <= endpoint.context:
-        return
-    logger.warning(
-        "this meeting is about %d tokens, and [ollama] context is %d: the model "
-        "will only see its beginning.  Raise [ollama] context (VRAM permitting) "
-        "or use a smaller model",
-        estimated,
-        endpoint.context,
+#: How much of the context window a transcript may take, leaving the rest for
+#: the instructions and for the answer.
+_PROMPT_SHARE_OF_CONTEXT = 0.6
+
+
+def _fits_the_window(text: str, endpoint: OllamaConfig) -> bool:
+    """Whether this much text fits the context window with room to answer it."""
+    return len(text) // _CHARS_PER_TOKEN <= endpoint.context * _PROMPT_SHARE_OF_CONTEXT
+
+
+def split_for_summary(text: str, endpoint: OllamaConfig) -> list[str]:
+    """The transcript in as few parts as fit the model's window.
+
+    Cut on line boundaries, because a line is one utterance and half of one
+    reads as two people interrupting each other.  A single line longer than
+    the window is cut anyway -- there is nothing else to do with it -- and the
+    cut is reported, since a broken label is what a summary then gets wrong.
+    """
+    budget = max(2000, int(endpoint.context * _PROMPT_SHARE_OF_CONTEXT * _CHARS_PER_TOKEN))
+    if len(text) <= budget:
+        return [text]
+
+    parts: list[str] = []
+    current: list[str] = []
+    size = 0
+    for line in text.splitlines(keepends=True):
+        while len(line) > budget:
+            # One line, longer than a whole part: nothing to cut it on.
+            if current:
+                parts.append("".join(current))
+                current, size = [], 0
+            logger.warning(
+                "a transcript line of %d characters does not fit the context window; "
+                "cutting it",
+                len(line),
+            )
+            parts.append(line[:budget])
+            line = line[budget:]
+        if size + len(line) > budget and current:
+            parts.append("".join(current))
+            current, size = [], 0
+        current.append(line)
+        size += len(line)
+    if current:
+        parts.append("".join(current))
+    return parts
+
+
+def _map_prompt(part: str, language: str) -> str:
+    """Notes on one part of a meeting, to summarise the whole from later."""
+    return (
+        "You are taking notes on one part of a meeting transcript, so that the "
+        "whole meeting can be summarised from the notes of all its parts.\n"
+        "\n"
+        "RULES:\n"
+        "- Keep the speaker names exactly as they appear, on every point: "
+        "[Name]: ...\n"
+        "- Record what was discussed, what was decided, and who agreed to do "
+        "what, with the dates, numbers and names mentioned.\n"
+        "- Report only what is in this part. Do not invent, and do not add "
+        "conclusions of your own.\n"
+        f"- Write the notes in {language}.\n"
+        "\n"
+        "Reply with the notes only.\n"
+        "\n"
+        f"{part}"
     )
+
+
+def _merge_prompt(notes: str, language: str) -> str:
+    """The same, for notes that are themselves too long to summarise at once."""
+    return (
+        "You are merging notes taken from the parts of a meeting, so that the "
+        "whole meeting can be summarised from them.\n"
+        "\n"
+        "RULES:\n"
+        "- Keep the speaker names exactly as they appear, on every point: "
+        "[Name]: ...\n"
+        "- Keep decisions, action items, dates, numbers and names. Drop "
+        "repetition and anything that is not one of those.\n"
+        "- Report only what the notes contain. Do not invent.\n"
+        f"- Write the merged notes in {language}.\n"
+        "\n"
+        "Reply with the merged notes only.\n"
+        "\n"
+        f"{notes}"
+    )
+
+
+def _ask(endpoint: OllamaConfig, prompt: str, temperature: float = 0.1) -> str:
+    """One Ollama generate call, trimmed.  ``""`` when it produced nothing."""
+    body = _post_json(
+        endpoint.url,
+        {
+            "model": endpoint.model,
+            "prompt": prompt,
+            "stream": False,
+            "options": _ollama_options(endpoint, temperature),
+        },
+        endpoint,
+    )
+    if not isinstance(body, dict):
+        return ""
+    return str(body.get("response") or "").strip()
+
+
+def notes_for_the_meeting(
+    transcript_text: str, endpoint: OllamaConfig, language: str
+) -> str:
+    """Summarise a meeting too long for one window: parts first, then the notes.
+
+    A window that holds an hour of speech is not always available, and a
+    summary written from the part of a meeting that fitted is worse than no
+    summary at all.  Each part is read for its own notes -- who said what,
+    what was decided, what was promised -- and the notes of all the parts are
+    what the summary is written from.
+
+    When the notes themselves do not fit -- three hours of meeting -- they are
+    merged in parts by the same rule, and again, until they do.  Never more
+    than a few times: a meeting that will not compress is not made better by
+    the fifth pass.
+    """
+    parts = split_for_summary(transcript_text, endpoint)
+    logger.info(
+        "the transcript does not fit the context window; summarising it in %d part(s)",
+        len(parts),
+    )
+
+    notes: list[str] = []
+    for index, part in enumerate(parts, start=1):
+        logger.info("reading part %d of %d", index, len(parts))
+        note = _ask(endpoint, _map_prompt(part, language))
+        if not note:
+            logger.warning("part %d of %d produced no notes", index, len(parts))
+            continue
+        if came_back_in_another_script(note, part):
+            translated = _translate(endpoint, note, language, expected=part)
+            if translated:
+                note = translated
+            else:
+                logger.warning("part %d of %d was written in another script", index, len(parts))
+        notes.append(note)
+    if not notes:
+        return ""
+
+    merged = "\n\n".join(notes)
+    for depth in range(1, 4):
+        if _fits_the_window(merged, endpoint):
+            return merged
+        pieces = split_for_summary(merged, endpoint)
+        logger.info(
+            "the notes from %d part(s) do not fit either; merging them in %d part(s)",
+            len(notes),
+            len(pieces),
+        )
+        merged_parts: list[str] = []
+        for index, piece in enumerate(pieces, start=1):
+            logger.info("merging part %d of %d (pass %d)", index, len(pieces), depth)
+            merged_piece = _ask(endpoint, _merge_prompt(piece, language))
+            if merged_piece:
+                merged_parts.append(merged_piece)
+        if not merged_parts:
+            return ""
+        notes, merged = merged_parts, "\n\n".join(merged_parts)
+
+    logger.error(
+        "the notes of this meeting still do not fit [ollama] context after three "
+        "merges; the summary is written from what fits"
+    )
+    return merged
 
 
 def _post_json(url: str, payload: dict[str, object], endpoint: EndpointConfig) -> dict | None:
@@ -693,8 +851,15 @@ def generate_summary(
     """
     if language is None:
         language = detect_language(transcript_text, endpoint)
-    _warn_if_the_meeting_will_not_fit(transcript_text, endpoint)
-    prompt = build_summary_prompt(transcript_text, room_name, participants, language)
+    # A meeting that does not fit the window is read in parts first, and the
+    # summary is written from the notes of the parts.
+    source = transcript_text
+    if not _fits_the_window(source, endpoint):
+        source = notes_for_the_meeting(source, endpoint, language)
+        if not source:
+            logger.error("none of the meeting's parts produced notes")
+            return ""
+    prompt = build_summary_prompt(source, room_name, participants, language)
     payload = {
         "model": endpoint.model,
         "prompt": prompt,
@@ -712,7 +877,7 @@ def generate_summary(
         return ""
 
     summary = (body.get("response") or "").strip()
-    if came_back_in_another_script(summary, transcript_text):
+    if came_back_in_another_script(summary, source):
         logger.warning(
             "the summary came back in another script than the transcript; asking again"
         )
@@ -730,12 +895,12 @@ def generate_summary(
         )
         if isinstance(retry, dict) and (retry.get("response") or "").strip():
             second = str(retry["response"]).strip()
-            if not came_back_in_another_script(second, transcript_text):
+            if not came_back_in_another_script(second, source):
                 return second
             # A model that will not write in the language it was asked for may
             # still translate into it: that is a different task, and the one
             # these models are best at.  The mail is worth the extra call.
-            translated = _translate(endpoint, second, language, expected=transcript_text)
+            translated = _translate(endpoint, second, language, expected=source)
             if translated:
                 logger.warning(
                     "the summary was written in another language; the %s it carries "
