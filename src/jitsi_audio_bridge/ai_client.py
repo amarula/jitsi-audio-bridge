@@ -709,9 +709,11 @@ def generate_summary(
                 )
                 return translated
             logger.error(
-                "the summary is not in %s and the model will not write it so; "
-                "it is being mailed as it came",
+                "the summary is not in %s and %s will not write it so, even as a "
+                "translation; it is being mailed as it came -- the model is the "
+                "thing to change",
                 language,
+                endpoint.model,
             )
             return second
         logger.error("ollama produced no summary on the second attempt")
