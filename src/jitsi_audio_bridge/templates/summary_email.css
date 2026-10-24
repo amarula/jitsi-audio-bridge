@@ -26,27 +26,27 @@
    THEME — the block to edit when re-branding.
    -------------------------------------------------------------------------- */
 :root {
-  /* Surfaces — the deep purple of the brand (amarulasolutions.com's theme
-     secondary, #351c4d) and its neighbouring shades. */
-  --page-bg:       #190c26;
-  --card-bg:       #2a1640;
-  --card-border:   #43265f;
-  --chip-bg:       #351c4d;
-  --chip-border:   #4d2c6b;
-  --rule:          #43265f;
+  /* Surfaces — the palette of amarulasolutions.com as its own stylesheet
+     states it: warm off-white page, white card, warm border. */
+  --page-bg:       #faf7f4;
+  --card-bg:       #ffffff;
+  --card-border:   #eee9e3;
+  --chip-bg:       #f5f0ea;
+  --chip-border:   #e7ded5;
+  --rule:          #eee9e3;
 
-  /* Type — white and a purple-tinted grey, legible on the card */
-  --heading:       #ffffff;
-  --text:          #e9dff4;
-  --text-strong:   #f6f1fb;
-  --text-muted:    #bfaed2;
-  --text-faint:    #9785ac;
+  /* Type — the site's body text and heading colours */
+  --heading:       #212529;
+  --text:          #554948;
+  --text-strong:   #212529;
+  --text-muted:    #7a6c6a;
+  --text-faint:    #7f726e;
 
-  /* Accents — the brand's gold (#fdcb0e, the site's button colour), and a
-     lighter tint of it for the action items, so the two markers differ on a
-     dark card without leaving the palette. */
-  --accent:        #fdcb0e;
-  --action:        #ffe08a;
+  /* Accents — the site's orange-red, darkened for small text on white so it
+     stays legible; the brand gold is too light to read as text there, so the
+     action marker uses a dark shade of it instead. */
+  --accent:        #a92e09;
+  --action:        #8a5a00;
 
   /* Fonts — a system stack, so nothing has to be downloaded or unblocked */
   --font:          -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
