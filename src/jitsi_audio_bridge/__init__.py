@@ -22,6 +22,6 @@ Module layout:
     that knows about asyncio.
 """
 
-__version__ = "0.1.13"
+__version__ = "0.1.14"
 
 __all__ = ["__version__"]
