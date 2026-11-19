@@ -715,7 +715,7 @@ speaks). **The JVB never sends binary frames on this socket.**
 | `media` | JVB → service | One Opus packet: `tag`, `chunk`, `timestamp`, `payload` (base64), optional `audioLevel` / `vad` |
 | `ping` | JVB → service | Keepalive; the service must answer `{"event":"pong","id":<same id>}` |
 | `session-end` | JVB → service | The JVB is closing the connection |
-| `sources` | JVB → service | Exported/requested source names; only for connects that declare them (translation), not plain transcription |
+| `sources` | JVB → service | The exporter's `exports` and requested-language `requests` lists, announced on every connect since the translation feature landed (Jicofo sends `requests` even for plain transcription) |
 | `stop` | service → JVB | Part of the format, but only ever sent *to* the bridge (a translation peer bracketing a talk): the JVB does not emit it. Do not wait for one |
 | `transcription-result` | service → JVB | Optional; results to inject into the meeting. A record-only receiver never sends this |
 
@@ -913,6 +913,48 @@ From the bridge's side, in order of what proves what:
    socket; if the connect never appears, the JVB cannot reach the bridge or the
    room metadata never satisfied the two-flag condition.
 
+### The JVB announces events but exports no audio
+
+**Symptom.** A whole call ends with `0 frames` while the closing line shows
+`info=1`, pings, `sources=2` and possibly `start=1` — the handshake worked and
+nobody received a single Opus packet. This can perfectly mimic a meeting
+nobody unmuted; on a healthy bridge, a muted call produces the same counts.
+
+**Cause.** Jicofo signals requested text-translation languages on the
+transcriber connect (`<requests><request name="en"/></requests>`), even when
+only transcription is enabled. From `jitsi-videobridge` **2.3.358** onwards,
+a connect that carries language requests is treated as a translator and
+exports only the sources in its `exports` list — which Jicofo leaves empty.
+The result is no exported audio at all. Version 2.3.318 exported regardless
+(`114k frames` observed from the same Jicofo), so the change is on the JVB
+side.
+
+**Confirmation.** The JVB's INFO log shows `Exporter.update: Updating
+exports=[] requests=[en]` followed by `Sending sources: exports=[]
+requests=[en]`. At teardown, when Jicofo clears the requests, the exporter
+produces its only `MediaEvent`s of the call — dropped because the socket is
+closing:
+
+```
+Exporter.initSerializer$lambda$0#252: Not connected, cannot send event:
+  MediaEvent(sequenceNumber=2, media=Media(tag=…, chunk=…, …, audioLevel=…, vad=true))
+```
+
+Since 0.1.17 the daemon itself warns when a session ends this way on a
+bridge version of 2.3.358 or later, naming the cause.
+
+**Remedy.** Pin the JVB back and hold it:
+
+```bash
+sudo apt-get install --allow-downgrades -y jitsi-videobridge2=2.3-318-gbf271b11f-1
+sudo apt-mark hold jitsi-videobridge2
+```
+
+When a newer build appears (`apt-cache madison jitsi-videobridge2`), test one
+call with the hold lifted; re-hold if the frames are still zero. Do not
+downgrade Jicofo — it has been sending the language request since at least
+`1.0-1205`, and older JBVs ignore it.
+
 The simulator speaks both framings: `python3 -m tools.send_meeting --protocol
 media-json` emits `info`, `start` and `media` events, pings as it streams,
 reports how many pongs came back, then sends `session-end`. The smoke test
@@ -928,3 +970,12 @@ Upstream sources inspected on 2026-10-03 (current master at the time):
 - `jitsi/jitsi-videobridge` — `Exporter.kt` (`info`/`sources`/ping lifecycle, reconnect backoff), `MediaJsonSerializer.kt` (start/media shapes, payload is the RTP payload), `jvb/src/main/resources/reference.conf` (`videobridge.exporter.*` defaults).
 - `jitsi/jicoco` — `jicoco-mediajson/…/MediaJson.kt` — the wire format and its string-encoded fields.
 - `jitsi/jitsi-meet` — `mod_muc_meeting_id.lua` (the meeting id is a generated UUID), transcription room-metadata writes.
+
+Upstream changes relevant to the export regression, inspected on 2026-11-19:
+
+- `jitsi/jitsi-videobridge` — *export only listed sources to connects that
+  inject audio*: a connect carrying `requests` exports only its listed
+  `exports`; transcriber connects are assumed to carry no requests.
+- `jitsi/jicofo` — *Signal the requested text-translation languages to the
+  bridge* (#1312): the transcriber connect's `requests` list carries language
+  codes, including for plain transcription.

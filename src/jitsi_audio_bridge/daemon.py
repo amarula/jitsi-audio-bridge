@@ -39,7 +39,7 @@ import signal
 import tempfile
 import threading
 import time
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -108,6 +108,32 @@ MEDIA_JSON_MEDIA = "media"
 MEDIA_JSON_PING = "ping"
 MEDIA_JSON_START = "start"
 MEDIA_JSON_SESSION_END = "session-end"
+
+#: Every ``event`` value this receiver acts on or knowingly ignores.  An event
+#: outside this set leaves the session alive, but it is a candidate for what a
+#: Jitsi upgrade looks like from here — a renamed or reshaped event — so the
+#: first of each kind is reported rather than only traced at debug level.  A
+#: receiver that silently ignored everything looked exactly like a bridge that
+#: sent nothing: "0 frames, 0 malformed" for a whole meeting.  The passive
+#: events are documented parts of the protocol with no meaning for a recorder,
+#: not news, and must not raise that warning.
+_KNOWN_MEDIA_JSON_KINDS = frozenset(
+    {
+        MEDIA_JSON_MEDIA,
+        MEDIA_JSON_PING,
+        MEDIA_JSON_START,
+        MEDIA_JSON_SESSION_END,
+        "info",
+        "sources",
+        "stop",
+        "transcription-result",
+    }
+)
+
+#: An event name that can be printed verbatim in the census.  Anything else —
+#: it comes straight off the wire — is rendered with ``repr`` so a crafted name
+#: cannot forge a log line.
+_CENSUS_SAFE_NAME = re.compile(r"[A-Za-z0-9_.-]{1,40}")
 
 #: How many meetings may be transcribed and summarised at once.  Whisper and
 #: Ollama are the bottleneck; unbounded fan-out would just queue inside them.
@@ -274,6 +300,44 @@ def describe_media_json_start(event: dict[str, Any]) -> str:
         f"{media_format.get('sampleRate', '?')} Hz, "
         f"{media_format.get('channels', '?')} ch)"
     )
+
+
+def describe_event_census(census: Mapping[str, int], limit: int = 8) -> str:
+    """Render a session's event counts for the closing log line.
+
+    This is what makes the difference between "the bridge sent nothing" and
+    "the bridge sent something this receiver does not understand" visible
+    without a packet capture.  Names come off the wire: only a plain
+    identifier is printed verbatim, and at most *limit* kinds are named, so
+    neither a crafted name nor a peer inventing kinds without bound can take
+    over the log.
+    """
+    parts = []
+    for kind, count in sorted(census.items())[:limit]:
+        name = kind if _CENSUS_SAFE_NAME.fullmatch(kind) else repr(kind)
+        parts.append(f"{name}={count}")
+    hidden = len(census) - limit
+    if hidden > 0:
+        parts.append(f"{hidden} more kind(s)")
+    return ", ".join(parts)
+
+
+def _version_at_least(version: str | None, wanted: tuple[int, int, int]) -> bool:
+    """Whether a bridge version like ``2.3.358-gf8efaa72c`` is at least *wanted*.
+
+    Only the ``major.minor.build`` prefix is compared; a string that does not
+    carry one is unknown, and unknown is never blamed for anything.
+    """
+    if not version:
+        return False
+    numbers = version.split("-", 1)[0].split(".")
+    if len(numbers) < 3:
+        return False
+    try:
+        actual = tuple(int(number) for number in numbers[:3])
+    except ValueError:
+        return False
+    return actual >= wanted
 
 
 def extract_media_json_vad(event: dict[str, Any]) -> bool | None:
@@ -1359,6 +1423,15 @@ async def handle_jvb_stream(websocket: Any, config: Config) -> None:
     source_tags: dict[str, str] = {}
     frames = 0
     malformed = 0
+    #: Every media-json event kind that arrived, and how often.  Reported on
+    #: the closing line so that a session that recorded nothing says whether
+    #: anything arrived at all, and in what shape.
+    event_kinds: dict[str, int] = {}
+    #: The exporter's requested languages, as announced in its ``sources``
+    #: event, and the JVB version from ``info`` — together they name a known
+    #: incompatibility when a whole call goes unanswered (see the closing log).
+    announced_requests: list[str] = []
+    bridge_version: str | None = None
 
     try:
         async for message in websocket:
@@ -1379,6 +1452,8 @@ async def handle_jvb_stream(websocket: Any, config: Config) -> None:
                         message,
                     )
                     continue
+
+                event_kinds[kind] = event_kinds.get(kind, 0) + 1
 
                 if kind == MEDIA_JSON_PING:
                     pong = build_media_json_pong(event)
@@ -1404,12 +1479,39 @@ async def handle_jvb_stream(websocket: Any, config: Config) -> None:
 
                 if kind != MEDIA_JSON_MEDIA:
                     if kind == "info":
+                        version = event.get("version")
+                        bridge_version = version if isinstance(version, str) else None
                         logger.info(
                             "session %s: bridge %s %s (region %s)",
                             session_id,
                             event.get("application", "?"),
                             event.get("version", "?"),
                             event.get("region", "?"),
+                        )
+                    elif kind == "sources":
+                        # Jicofo now sends language requests on every
+                        # transcriber connect, so this event arrives even for
+                        # plain transcription.  It names what the exporter
+                        # intends to export and which languages were asked
+                        # for — the place an "announced two, started one"
+                        # mismatch is visible.
+                        requests = event.get("requests")
+                        if isinstance(requests, list) and not announced_requests:
+                            announced_requests = [
+                                request for request in requests if isinstance(request, str)
+                            ]
+                        logger.info(
+                            "session %s: exporter announced sources: %.240r",
+                            session_id,
+                            message,
+                        )
+                    elif kind not in _KNOWN_MEDIA_JSON_KINDS and event_kinds[kind] == 1:
+                        logger.warning(
+                            "session %s: unknown media-json event %r ignored; if a "
+                            "call records nothing while events arrive, this is "
+                            "what a newer protocol looks like from here",
+                            session_id,
+                            kind,
                         )
                     else:
                         logger.debug("session %s: ignoring %s event", session_id, kind)
@@ -1479,12 +1581,13 @@ async def handle_jvb_stream(websocket: Any, config: Config) -> None:
 
         logger.info(
             "session %s: connection finished: %d frames, %d malformed, %d participant(s); "
-            "audio so far: %.1fs",
+            "audio so far: %.1fs%s",
             session_id,
             frames,
             malformed,
             len(recorders),
             sum(state.recorded.values()),
+            f"; events: {describe_event_census(event_kinds)}" if event_kinds else "",
         )
 
         if config.storage.capture_timeline and state.saw_media_json and state.recorded:
@@ -1514,6 +1617,24 @@ async def handle_jvb_stream(websocket: Any, config: Config) -> None:
             _schedule_finalisation(state, config)
         else:
             logger.info("session %s: no audio captured yet", session_id)
+            # This whole-call failure has one known cause, and without being
+            # named it is indistinguishable from a meeting nobody spoke in:
+            # JVB >= 2.3.358 treats a transcriber connect carrying language
+            # requests as a translator and exports only its (empty) export
+            # list.  A muted call on an older JVB looks the same, which is why
+            # the version from the info event is part of the condition.
+            if announced_requests and _version_at_least(bridge_version, (2, 3, 358)):
+                logger.warning(
+                    "session %s: jitsi-videobridge %s announced language request(s) "
+                    "%s and exported no audio; known with jitsi-videobridge >= "
+                    "2.3.358, where a transcriber connect carrying language "
+                    "requests is treated as a translator and exports only its "
+                    "(empty) export list.  Pin jitsi-videobridge2 to 2.3-318 or "
+                    "test a newer release.",
+                    session_id,
+                    bridge_version,
+                    ", ".join(announced_requests[:4]),
+                )
 
 
 def check_storage(config: Config) -> None:

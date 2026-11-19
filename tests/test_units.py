@@ -297,6 +297,207 @@ def test_describe_media_json_start_tolerates_a_sparse_event(event: dict[str, obj
     assert "?" in describe_media_json_start(event)
 
 
+def test_describe_event_census_names_every_kind_that_arrived() -> None:
+    census = {"media": 1543, "ping": 61, "start": 1}
+    assert daemon_module.describe_event_census(census) == "media=1543, ping=61, start=1"
+
+
+def test_describe_event_census_cannot_be_grown_or_forged_by_the_peer() -> None:
+    # Event names come straight off the wire: a newline in one must not be
+    # able to forge a log line, and a peer inventing kinds without bound must
+    # not be able to decide how long the line is.
+    census = {"bad\nname": 1, **{f"kind{i}": 1 for i in range(20)}}
+    rendered = daemon_module.describe_event_census(census)
+    assert "\n" not in rendered
+    assert "more kind(s)" in rendered
+    assert rendered.count("=") == 8
+
+
+class _FakeJvbSocket:
+    """Just enough of a WebSocket for one session's worth of text frames."""
+
+    def __init__(self, messages: list[str], session_id: str = "test-session") -> None:
+        self.messages = messages
+        self.request = type("Request", (), {"path": f"/transcribe?sessionId={session_id}"})
+        self.remote_address = ("127.0.0.1", 5000)
+        self.sent: list[str] = []
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if not self.messages:
+            raise StopAsyncIteration
+        return self.messages.pop(0)
+
+    async def send(self, message: str) -> None:
+        self.sent.append(message)
+
+
+def _run_session(tmp_path: Path, messages: list[str]) -> _FakeJvbSocket:
+    config = replace(
+        load_config(),
+        storage=replace(
+            load_config().storage,
+            recordings_dir=tmp_path,
+            session_metadata_dir=None,
+            capture_timeline=False,
+        ),
+    )
+    socket = _FakeJvbSocket(messages)
+
+    async def scenario() -> None:
+        await daemon_module.handle_jvb_stream(socket, config)
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        daemon_module._SESSIONS.clear()
+    return socket
+
+
+def test_an_unknown_media_json_event_is_reported_not_silently_swallowed(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The shape of the failure this exists for: a meeting that records
+    nothing, and a log that cannot say whether anything arrived at all.
+
+    A newer Jitsi renaming or reshaping an event is one plausible cause of a
+    call that records nothing after an upgrade; it must be distinguishable
+    from a bridge that sent nothing, without a packet capture.
+    """
+    with caplog.at_level("INFO"):
+        _run_session(
+            tmp_path,
+            [
+                json.dumps({"event": "media-json-v2", "media": {}}),
+                json.dumps({"event": "media-json-v2", "media": {}}),
+            ],
+        )
+
+    warnings = [
+        record for record in caplog.records
+        if record.levelname == "WARNING" and "unknown media-json event" in record.message
+    ]
+    assert len(warnings) == 1, "reported once per kind, not once per event"
+    assert "media-json-v2" in warnings[0].message
+
+    closing = [
+        record.message for record in caplog.records if "connection finished" in record.message
+    ]
+    assert len(closing) == 1
+    assert "events: media-json-v2=2" in closing[0]
+
+
+def test_documented_passive_events_are_not_mistaken_for_a_new_protocol(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """``sources``, ``stop`` and ``transcription-result`` are the protocol's own
+    events, known and deliberately ignored — they must be in the census and
+    must not raise the warning meant for events nobody here has seen."""
+    with caplog.at_level("INFO"):
+        _run_session(
+            tmp_path,
+            [
+                json.dumps({"event": "info", "application": "jitsi-videobridge"}),
+                json.dumps({"event": "sources", "sources": ["a", "b"]}),
+                json.dumps({"event": "stop", "stop": {"tag": "a"}}),
+                json.dumps({"event": "transcription-result"}),
+            ],
+        )
+
+    assert not [
+        record for record in caplog.records
+        if record.levelname == "WARNING" and "unknown media-json event" in record.message
+    ]
+    # The announced source list is logged: it is where an "announced two,
+    # started one" mismatch becomes visible without a packet capture.
+    assert any("exporter announced sources" in record.message for record in caplog.records)
+
+    closing = [
+        record.message for record in caplog.records if "connection finished" in record.message
+    ]
+    assert len(closing) == 1
+    assert (
+        "events: info=1, sources=1, stop=1, transcription-result=1" in closing[0]
+    )
+
+
+@pytest.mark.parametrize(
+    ("version", "wanted"),
+    [
+        ("2.3.358-gf8efaa72c", True),
+        ("2.3.359", True),
+        ("2.4.0", True),
+        ("2.3.318-gbf271b11f", False),
+        ("2.3", False),
+        ("nonsense", False),
+        (None, False),
+    ],
+)
+def test_version_at_least(version: str | None, wanted: bool) -> None:
+    assert daemon_module._version_at_least(version, (2, 3, 358)) is wanted
+
+
+def test_a_whole_call_of_silence_on_a_filtering_jvb_names_the_known_cause(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The 84-minute call: events arrived, media never did, nothing said why.
+
+    Numbers alone read like a meeting nobody spoke in — the warning must name
+    the cause and the way out.
+    """
+    with caplog.at_level("INFO"):
+        _run_session(
+            tmp_path,
+            [
+                json.dumps({"event": "sources", "exports": [], "requests": ["en"]}),
+                json.dumps(
+                    {
+                        "event": "info",
+                        "application": "jitsi-videobridge",
+                        "version": "2.3.358-gf8efaa72c",
+                    }
+                ),
+            ],
+        )
+
+    warnings = [
+        record.message for record in caplog.records
+        if record.levelname == "WARNING" and "exported no audio" in record.message
+    ]
+    assert len(warnings) == 1
+    assert "2.3.358" in warnings[0]
+    assert "Pin jitsi-videobridge2" in warnings[0]
+
+
+def test_a_muted_call_on_an_older_jvb_is_not_blamed_on_the_filtering_bug(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The same wire signature occurs on a healthy JVB when nobody unmutes:
+    sources announced with a language request, zero media.  Only the version
+    distinguishes them, so the warning must not fire for 2.3.318."""
+    with caplog.at_level("INFO"):
+        _run_session(
+            tmp_path,
+            [
+                json.dumps({"event": "sources", "exports": [], "requests": ["en"]}),
+                json.dumps(
+                    {
+                        "event": "info",
+                        "application": "jitsi-videobridge",
+                        "version": "2.3.318-gbf271b11f",
+                    }
+                ),
+            ],
+        )
+
+    assert not [
+        record for record in caplog.records
+        if record.levelname == "WARNING" and "exported no audio" in record.message
+    ]
+
+
 # --------------------------------------------------------------------------
 # Control frames
 # --------------------------------------------------------------------------
